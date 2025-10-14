@@ -1,15 +1,14 @@
 # Databricks / PySpark
 # Universal ERD & Data Model Generator (Unity Catalog–first)
 # Author: Joshua Williamson
-# Version: 1.9.2 (Best-of-Both Merge)
+# Version: 1.9.3 (UC-safe outputs + timezone fix + best-of-both)
 # ------------------------------------------------------------------------------------
-# This version merges Code 2's robustness with targeted wins from Code 1:
-# - Stable value-overlap cache key using df._jdf.toString() with fallback to id(df)
-# - Configurable truncation (MD_TRUNCATE_TYPE_CHARS) and Mermaid column cap (MERMAID_MAX_COLUMNS)
-# - Configurable datetime support threshold (DATETIME_SUPPORT_MIN)
-# - Per-get widget fallback (always try dbutils.widgets.get even if widget creation failed)
-# - Optional VERBOSE_LOGS to control console chatter
-# - All Code 2 hardening: XML-escaped GraphML, regex/param validation, overflow guards, etc.
+# This version:
+# - Prefers Unity Catalog Volumes for outputs (no DBFS default). Files are written only if:
+#     (a) USE_UC_VOLUME_OUTPUT=true and UC_VOLUME_PATH is provided, or
+#     (b) OUTPUT_BASE is explicitly set to a valid absolute path (e.g., /Volumes/... or /dbfs/...)
+# - Adds SESSION_TIMEZONE widget + safe setter; fixes "Invalid_conf_value ... timeZone=unknown".
+# - Retains 1.9.2 hardening and “best-of-both” improvements (stable overlap cache key, config caps, etc.).
 # ------------------------------------------------------------------------------------
 
 from pyspark.sql import functions as F
@@ -19,15 +18,13 @@ import sys, json, re, datetime, math, itertools, uuid, os, csv, html
 from typing import Dict, Any, List, Tuple, Optional
 
 # =========================
-# WIDGETS + PLACEHOLDERS (ROBUST)
+# WIDGETS + PLACEHOLDERS
 # =========================
 def _mk_widget(name, default, desc):
-    """Create widget with proper error handling"""
     try:
         dbutils.widgets.text(name, default, desc)
         return True
     except NameError:
-        # dbutils not available (testing or jobs environment)
         return False
     except Exception as e:
         print(f"Warning: Could not create widget '{name}': {e}")
@@ -38,7 +35,6 @@ _default_schema  = "default"
 _default_db      = "default"
 _run_id = datetime.datetime.utcnow().strftime("run_%Y%m%d_%H%M%S_") + str(uuid.uuid4())[:8]
 
-# Try to create widgets; even if creation fails, _get_env will still try reading
 widgets_created_any = False
 widgets_created_any |= _mk_widget("CATALOG", _default_catalog, "UC Catalog")
 widgets_created_any |= _mk_widget("SCHEMA" , _default_schema,  "UC Schema")
@@ -64,16 +60,17 @@ widgets_created_any |= _mk_widget("TOP_PK_CANDIDATES", "6", "Top-N cols for comp
 widgets_created_any |= _mk_widget("MAX_COMPOSITE_K", "3", "Max PK composite size (1-4)")
 widgets_created_any |= _mk_widget("MAX_TABLES", "10000", "Safety cap on tables in a run")
 
+# UC-first outputs (no DBFS default)
 widgets_created_any |= _mk_widget("WRITE_FILES", "true", "Write outputs? (true/false)")
-widgets_created_any |= _mk_widget("OUTPUT_BASE", f"/dbfs/tmp/datamodeler/{_run_id}", "DBFS base or folder")
-widgets_created_any |= _mk_widget("USE_UC_VOLUME_OUTPUT", "false", "Write into UC Volume? (true/false)")
-widgets_created_any |= _mk_widget("UC_VOLUME_PATH", "", "e.g. /Volumes/<cat>/<schema>/<vol>/erd")
+widgets_created_any |= _mk_widget("OUTPUT_BASE", "", "Optional absolute folder (/Volumes/... or /dbfs/...)")
+widgets_created_any |= _mk_widget("USE_UC_VOLUME_OUTPUT", "true", "Write into UC Volume? (true/false)")
+widgets_created_any |= _mk_widget("UC_VOLUME_PATH", "", "If enabled, e.g. /Volumes/<cat>/<schema>/<vol>/erd")
 
 widgets_created_any |= _mk_widget("EMIT_GRAPHML", "true", "Write GraphML? (true/false)")
 widgets_created_any |= _mk_widget("EMIT_MERMAID", "true", "Add Mermaid ERD to MD? (true/false)")
 widgets_created_any |= _mk_widget("MAX_MERMAID_TABLES", "150", "Mermaid render table cap (tables)")
 
-# Best-of-both: new UX toggles
+# UX toggles
 widgets_created_any |= _mk_widget("MERMAID_MAX_COLUMNS", "20", "Max columns per entity in Mermaid (-1 for unlimited)")
 widgets_created_any |= _mk_widget("MD_TRUNCATE_TYPE_CHARS", "30", "Max type chars in Markdown (-1 for unlimited)")
 widgets_created_any |= _mk_widget("DATETIME_SUPPORT_MIN", "0.50", "Min support to emit datetime pattern [0..1]")
@@ -82,7 +79,9 @@ widgets_created_any |= _mk_widget("VERBOSE_LOGS", "true", "Print verbose run sum
 widgets_created_any |= _mk_widget("WRITE_CSVS", "true", "Emit CSVs (entities/columns/relationships)?")
 widgets_created_any |= _mk_widget("WRITE_DELTA_SUMMARY", "false", "Write a Delta summary table (columns, relationships)?")
 
-# Placeholders honored if widgets not used
+# Timezone safety
+widgets_created_any |= _mk_widget("SESSION_TIMEZONE", "UTC", "Spark SQL session time zone (IANA)")
+
 PLACEHOLDERS = {
     "CATALOG": "{{CATALOG}}",
     "SCHEMA": "{{SCHEMA}}",
@@ -116,18 +115,16 @@ PLACEHOLDERS = {
     "VERBOSE_LOGS": "{{VERBOSE_LOGS}}",
     "WRITE_CSVS": "{{WRITE_CSVS}}",
     "WRITE_DELTA_SUMMARY": "{{WRITE_DELTA_SUMMARY}}",
+    "SESSION_TIMEZONE": "{{SESSION_TIMEZONE}}",
 }
 
 def _get_env(name, default=None):
-    """Get parameter from widgets or placeholders (always attempt get; then fallbacks)."""
-    # Try reading widget even if creation failed elsewhere
     try:
         v = dbutils.widgets.get(name)
         if v is not None and str(v).strip() != "":
             return v
     except Exception:
         pass
-    # Fallbacks
     v = PLACEHOLDERS.get(name, "")
     if isinstance(v, str) and v.startswith("{{") and v.endswith("}}"):
         return default
@@ -145,7 +142,9 @@ def _to_float(x, default=0.0):
     try: return float(str(x))
     except: return default
 
-# Parse all configuration
+# =========================
+# CONFIG
+# =========================
 CATALOG  = _get_env("CATALOG", _default_catalog)
 SCHEMA   = _get_env("SCHEMA", _default_schema)
 USE_LEGACY_DATABASE = _to_bool(_get_env("USE_LEGACY_DATABASE", "false"))
@@ -171,35 +170,36 @@ MAX_COMPOSITE_K     = _to_int(_get_env("MAX_COMPOSITE_K", "3"), 3)
 MAX_TABLES          = _to_int(_get_env("MAX_TABLES", "10000"), 10000)
 
 WRITE_FILES         = _to_bool(_get_env("WRITE_FILES", "true"))
-OUTPUT_BASE         = _get_env("OUTPUT_BASE", f"/dbfs/tmp/datamodeler/{_run_id}")
-USE_UC_VOLUME_OUT   = _to_bool(_get_env("USE_UC_VOLUME_OUTPUT", "false"))
+OUTPUT_BASE         = _get_env("OUTPUT_BASE", "")  # no DBFS default
+USE_UC_VOLUME_OUT   = _to_bool(_get_env("USE_UC_VOLUME_OUTPUT", "true"))
 UC_VOLUME_PATH      = _get_env("UC_VOLUME_PATH", "")
 
 EMIT_GRAPHML        = _to_bool(_get_env("EMIT_GRAPHML", "true"))
 EMIT_MERMAID        = _to_bool(_get_env("EMIT_MERMAID", "true"))
 MAX_MERMAID_TABLES  = _to_int(_get_env("MAX_MERMAID_TABLES", "150"), 150)
 
-# Best-of-both added params
-MERMAID_MAX_COLUMNS       = _to_int(_get_env("MERMAID_MAX_COLUMNS", "20"), 20)  # -1 for unlimited
-MD_TRUNCATE_TYPE_CHARS    = _to_int(_get_env("MD_TRUNCATE_TYPE_CHARS", "30"), 30)  # -1 for unlimited
+MERMAID_MAX_COLUMNS       = _to_int(_get_env("MERMAID_MAX_COLUMNS", "20"), 20)
+MD_TRUNCATE_TYPE_CHARS    = _to_int(_get_env("MD_TRUNCATE_TYPE_CHARS", "30"), 30)
 DATETIME_SUPPORT_MIN      = _to_float(_get_env("DATETIME_SUPPORT_MIN", "0.50"), 0.50)
 VERBOSE_LOGS              = _to_bool(_get_env("VERBOSE_LOGS", "true"))
 
 WRITE_CSVS          = _to_bool(_get_env("WRITE_CSVS", "true"))
 WRITE_DELTA_SUMMARY = _to_bool(_get_env("WRITE_DELTA_SUMMARY", "false"))
 
+SESSION_TIMEZONE_CFG = _get_env("SESSION_TIMEZONE", "UTC") or "UTC"
+
 RUN_ID   = _run_id
-VERSION  = "1.9.2"
-AUTHOR   = "Joshua Williamson (Best-of-Both)"
+VERSION  = "1.9.3"
+AUTHOR   = "Joshua Williamson (UC-safe)"
 
 # =========================
-# VALIDATION (IMPROVED)
+# VALIDATION
 # =========================
 errors, warnings = [], []
 
 if USE_LEGACY_DATABASE and (CATALOG != _default_catalog or SCHEMA != _default_schema):
     warnings.append("Using legacy DATABASE; CATALOG/SCHEMA parameters are ignored.")
-    
+
 if not USE_LEGACY_DATABASE:
     if not CATALOG or not SCHEMA:
         errors.append("Unity Catalog mode requires both CATALOG and SCHEMA to be specified.")
@@ -207,36 +207,54 @@ if not USE_LEGACY_DATABASE:
         warnings.append(f"Using default catalog/schema ({CATALOG}.{SCHEMA}). Is this intentional?")
 
 if MAX_COMPOSITE_K < 1 or MAX_COMPOSITE_K > 4:
-    warnings.append(f"MAX_COMPOSITE_K={MAX_COMPOSITE_K} is out of range [1..4]; adjusting to valid range.")
+    warnings.append(f"MAX_COMPOSITE_K={MAX_COMPOSITE_K} is out of range [1..4]; adjusting.")
     MAX_COMPOSITE_K = max(1, min(4, MAX_COMPOSITE_K))
 
 if ROW_SAMPLE_FRACTION < 0.0 or ROW_SAMPLE_FRACTION > 1.0:
-    warnings.append(f"ROW_SAMPLE_FRACTION={ROW_SAMPLE_FRACTION} is invalid; adjusting to [0..1].")
+    warnings.append(f"ROW_SAMPLE_FRACTION={ROW_SAMPLE_FRACTION} invalid; adjusting.")
     ROW_SAMPLE_FRACTION = max(0.0, min(1.0, ROW_SAMPLE_FRACTION))
 
 if MIN_REL_SCORE < 0.0 or MIN_REL_SCORE > 1.0:
-    warnings.append(f"MIN_REL_SCORE={MIN_REL_SCORE} is invalid; adjusting to [0..1].")
+    warnings.append(f"MIN_REL_SCORE={MIN_REL_SCORE} invalid; adjusting.")
     MIN_REL_SCORE = max(0.0, min(1.0, MIN_REL_SCORE))
 
 if DATETIME_SUPPORT_MIN < 0.0 or DATETIME_SUPPORT_MIN > 1.0:
-    warnings.append(f"DATETIME_SUPPORT_MIN={DATETIME_SUPPORT_MIN} is invalid; adjusting to [0..1].")
+    warnings.append(f"DATETIME_SUPPORT_MIN={DATETIME_SUPPORT_MIN} invalid; adjusting.")
     DATETIME_SUPPORT_MIN = max(0.0, min(1.0, DATETIME_SUPPORT_MIN))
 
 # =========================
-# UTILS (HARDENED)
+# TIMEZONE SAFETY
+# =========================
+def _safe_set_session_timezone():
+    tz = (SESSION_TIMEZONE_CFG or "UTC").strip()
+    try:
+        current = None
+        try:
+            current = spark.conf.get("spark.sql.session.timeZone")
+        except Exception:
+            pass
+        if not current or str(current).strip().lower() in {"", "unknown", "null", "na"}:
+            spark.conf.set("spark.sql.session.timeZone", tz)
+            return tz
+        return current
+    except Exception as e:
+        warnings.append(f"Could not set spark.sql.session.timeZone; using 'UTC' in metadata only: {e}")
+        return "UTC"
+
+SESSION_TIMEZONE_EFFECTIVE = _safe_set_session_timezone()
+
+# =========================
+# UTILS
 # =========================
 def fq_identifier(token: str) -> str:
-    """Quote identifier for Spark SQL"""
     token = token.strip().strip("`")
     return f"`{token}`"
 
 def fq_table(t: str) -> str:
-    """Fully qualify table name with backticks"""
     parts = [p for p in t.split(".") if p]
     return ".".join(fq_identifier(p) for p in parts)
 
 def is_included(t: str) -> bool:
-    """Check if table matches include/exclude patterns"""
     name = t.split(".")[-1]
     if EXCLUDE_TABLES_RE:
         try:
@@ -251,7 +269,6 @@ def is_included(t: str) -> bool:
         return True
 
 def dtype_family(dt: T.DataType) -> str:
-    """Categorize data type into family"""
     s = dt.simpleString().lower()
     if s.startswith("array"):  return "array"
     if s.startswith("map"):    return "map"
@@ -265,7 +282,6 @@ def dtype_family(dt: T.DataType) -> str:
     return s
 
 def families_compatible(f1, f2) -> bool:
-    """Check if two type families are compatible for joins"""
     if f1 == f2: return True
     if {f1,f2} <= {"integral","decimal","floating"}: return True
     if {f1,f2} <= {"stringy"}: return True
@@ -273,7 +289,6 @@ def families_compatible(f1, f2) -> bool:
     return False
 
 def safe_table(t: str):
-    """Load table with error handling"""
     try:
         return spark.table(t)
     except Exception as e:
@@ -281,10 +296,8 @@ def safe_table(t: str):
         return None
 
 def sample_df(df, max_rows, frac):
-    """Sample DataFrame with bounds"""
     if df is None: return None
     try:
-        # Ensure fraction is in valid range
         frac = max(0.0, min(1.0, frac))
         sdf = df.sample(False, frac, seed=42) if frac < 1.0 else df
         return sdf.limit(max_rows)
@@ -293,21 +306,17 @@ def sample_df(df, max_rows, frac):
         return None
 
 def approx_distinct_expr(cname: str):
-    """Create approx distinct count expression"""
     return F.approx_count_distinct(F.col(cname)).alias(cname)
 
-# Pattern matching for ID columns
 ID_NAME_HINTS = [r".*\b(id|_id)\b", r".*\b(key|_key)\b", r".*\b(uuid|guid)\b"]
 FK_NAME_HINTS = [r".*\b.*_id\b", r".*\b(user|customer|account|client|order|product|parent|owner).*(id|_id)\b"]
 
 def col_name_hints(name: str, patterns) -> bool:
-    """Check if column name matches patterns"""
     try:
         return any(re.match(p, name.lower()) for p in patterns)
     except re.error:
         return False
 
-# Enhanced datetime patterns with more formats
 DATE_TIME_PATTERNS = [
     (r"^\d{4}-\d{2}-\d{2}$", "yyyy-MM-dd"),
     (r"^\d{4}/\d{2}/\d{2}$", "yyyy/MM/dd"),
@@ -326,10 +335,8 @@ DATE_TIME_PATTERNS = [
 ]
 
 def detect_string_datetime_format(samples: List[str]) -> Tuple[Optional[str], float, Dict[str,int]]:
-    """Detect datetime format in string column samples"""
     if not samples: return None, 0.0, {}
-    counts = {}
-    n = 0
+    counts, n = {}, 0
     for s in samples:
         if s is None: continue
         try:
@@ -349,175 +356,116 @@ def detect_string_datetime_format(samples: List[str]) -> Tuple[Optional[str], fl
                 counts["unknown"] = counts.get("unknown", 0) + 1
         except Exception:
             continue
-    
-    if n == 0: return None, 0.0, {}
-    if not counts: return None, 0.0, {}
-    
+    if n == 0 or not counts: return None, 0.0, {}
     top_label, top_cnt = max(counts.items(), key=lambda kv: kv[1])
     return top_label, top_cnt/n, counts
 
-# Recursively walk nested schemas
 def walk_schema(prefix: str, dt: T.DataType, depth=0, max_depth=10) -> List[Dict[str, Any]]:
-    """Walk schema recursively to find nested fields"""
     if depth > max_depth: return []
     out = []
-    
     if isinstance(dt, T.StructType):
         for f in dt.fields:
             path = f"{prefix}.{f.name}" if prefix else f.name
-            out.append({
-                "path": path, 
-                "type": f.dataType.simpleString(), 
-                "family": dtype_family(f.dataType), 
-                "nullable": f.nullable
-            })
+            out.append({"path": path, "type": f.dataType.simpleString(), "family": dtype_family(f.dataType), "nullable": f.nullable})
             out += walk_schema(path, f.dataType, depth+1, max_depth)
     elif isinstance(dt, T.ArrayType):
         elem = dt.elementType
         path = prefix + "[]" if prefix else "[]"
-        out.append({
-            "path": path, 
-            "type": f"array<{elem.simpleString()}>", 
-            "family": "array", 
-            "nullable": True
-        })
+        out.append({"path": path, "type": f"array<{elem.simpleString()}>", "family": "array", "nullable": True})
         out += walk_schema(prefix + "[]", elem, depth+1, max_depth)
     elif isinstance(dt, T.MapType):
-        out.append({
-            "path": prefix + "{}", 
-            "type": f"map<{dt.keyType.simpleString()},{dt.valueType.simpleString()}>", 
-            "family": "map", 
-            "nullable": True
-        })
+        out.append({"path": prefix + "{}", "type": f"map<{dt.keyType.simpleString()},{dt.valueType.simpleString()}>", "family": "map", "nullable": True})
         out += walk_schema(prefix + "{}", dt.valueType, depth+1, max_depth)
-    
     return out
 
 def array_guidance(dtype: T.DataType):
-    """Generate parsing guidance for array columns"""
     if not isinstance(dtype, T.ArrayType): return None
     elem = dtype.elementType
     if isinstance(elem, T.StructType):
-        fields = ", ".join([f"{f.name}:{f.dataType.simpleString()}" for f in elem.fields[:10]])  # Limit for display
-        if len(elem.fields) > 10:
-            fields += "..."
-        return {
-            "element_type": f"STRUCT<{fields}>",
-            "parse_hint": "explode()/posexplode(), then select elem.*",
-            "sql": "SELECT t.*, e.* FROM {{TABLE}} t LATERAL VIEW explode(t.{{ARRAY_COL}}) x AS e",
-            "pyspark": "df.select('*', F.explode(F.col('{{ARRAY_COL}}')).alias('e')).select('*','e.*')",
-        }
+        fields = ", ".join([f"{f.name}:{f.dataType.simpleString()}" for f in elem.fields[:10]])
+        if len(elem.fields) > 10: fields += "..."
+        return {"element_type": f"STRUCT<{fields}>", "parse_hint": "explode()/posexplode(), then select elem.*",
+                "sql": "SELECT t.*, e.* FROM {{TABLE}} t LATERAL VIEW explode(t.{{ARRAY_COL}}) x AS e",
+                "pyspark": "df.select('*', F.explode(F.col('{{ARRAY_COL}}')).alias('e')).select('*','e.*')"}
     else:
-        return {
-            "element_type": elem.simpleString(),
-            "parse_hint": "explode()/posexplode() to normalize to rows",
-            "sql": "SELECT t.*, e AS elem FROM {{TABLE}} t LATERAL VIEW explode(t.{{ARRAY_COL}}) x AS e",
-            "pyspark": "df.select('*', F.explode(F.col('{{ARRAY_COL}}')).alias('elem'))",
-        }
+        return {"element_type": elem.simpleString(), "parse_hint": "explode()/posexplode() to normalize to rows",
+                "sql": "SELECT t.*, e AS elem FROM {{TABLE}} t LATERAL VIEW explode(t.{{ARRAY_COL}}) x AS e",
+                "pyspark": "df.select('*', F.explode(F.col('{{ARRAY_COL}}')).alias('elem'))"}
 
 def map_guidance(dtype: T.DataType):
-    """Generate parsing guidance for map columns"""
     if not isinstance(dtype, T.MapType): return None
-    return {
-        "key_type": dtype.keyType.simpleString(),
-        "value_type": dtype.valueType.simpleString(),
-        "parse_hint": "explode(map) to (key,value) rows",
-        "sql": "SELECT t.*, k, v FROM {{TABLE}} t LATERAL VIEW explode(t.{{MAP_COL}}) x AS k, v",
-        "pyspark": "df.select('*', F.explode(F.col('{{MAP_COL}}')).alias('k','v'))",
-    }
+    return {"key_type": dtype.keyType.simpleString(), "value_type": dtype.valueType.simpleString(),
+            "parse_hint": "explode(map) to (key,value) rows",
+            "sql": "SELECT t.*, k, v FROM {{TABLE}} t LATERAL VIEW explode(t.{{MAP_COL}}) x AS k, v",
+            "pyspark": "df.select('*', F.explode(F.col('{{MAP_COL}}')).alias('k','v'))"}
 
-# Scoring functions for relationship inference (IMPROVED NULL HANDLING)
 def name_match_score(fk_name, pk_name):
-    """Score based on column name similarity"""
     fk, pk = fk_name.lower(), pk_name.lower()
     if fk == pk: return 1.0
     if fk.endswith("_id") and pk in {"id","pk","pk_id"}: return 0.9
     if fk.endswith(pk) or pk.endswith(fk): return 0.7
-    fk_tokens = set(re.split(r"[_\W]+", fk))
-    pk_tokens = set(re.split(r"[_\W]+", pk))
+    fk_tokens = set(re.split(r"[_\W]+", fk)); pk_tokens = set(re.split(r"[_\W]+", pk))
     union_size = len(fk_tokens | pk_tokens)
     if union_size == 0: return 0.3
-    jacc = len(fk_tokens & pk_tokens) / union_size
-    return max(0.3, jacc)
+    j = len(fk_tokens & pk_tokens) / union_size
+    return max(0.3, j)
 
-def type_compat_score(fk_fam, pk_fam):
-    """Score based on type compatibility"""
-    return 1.0 if families_compatible(fk_fam, pk_fam) else 0.0
+def type_compat_score(fk_fam, pk_fam): return 1.0 if families_compatible(fk_fam, pk_fam) else 0.0
 
 def cardinality_score(fk_ad, pk_ad):
-    """Score based on cardinality relationship"""
-    if fk_ad is None or pk_ad is None or pk_ad == 0: 
-        return 0.5
-    ratio = fk_ad / max(1, pk_ad)  # Prevent division by zero
-    if ratio >= 1.0: 
-        return 1.0 if ratio <= 50 else 0.8
+    if fk_ad is None or pk_ad is None or pk_ad == 0: return 0.5
+    ratio = fk_ad / max(1, pk_ad)
+    if ratio >= 1.0: return 1.0 if ratio <= 50 else 0.8
     return 0.4
 
 def distinct_ratio_score(pk_ad, pk_rowcount):
-    """Score based on PK distinctness"""
-    if pk_ad is None or pk_rowcount in (None, 0): 
-        return 0.5
-    return min(1.0, pk_ad / max(1, pk_rowcount))  # Prevent division by zero
+    if pk_ad is None or pk_rowcount in (None, 0): return 0.5
+    return min(1.0, pk_ad / max(1, pk_rowcount))
 
-def null_ratio_score(fk_null):
-    """Score based on FK null ratio (lower is better)"""
-    if fk_null is None: 
-        return 0.5
-    return 1.0 - fk_null
+def null_ratio_score(fk_null): return 0.5 if fk_null is None else (1.0 - fk_null)
 
 # =========================
-# NAMESPACE DISCOVERY (UC-first)
+# DISCOVERY
 # =========================
 def ns_tables_uc(catalog: str, schema: str) -> List[str]:
-    """Discover tables in Unity Catalog"""
     try:
-        query = f"SHOW TABLES IN {fq_identifier(catalog)}.{fq_identifier(schema)}"
-        df = spark.sql(query)
-        rows = df.select("tableName").limit(MAX_TABLES + 1).collect()  # +1 to detect overflow
-        
+        df = spark.sql(f"SHOW TABLES IN {fq_identifier(catalog)}.{fq_identifier(schema)}")
+        rows = df.select("tableName").limit(MAX_TABLES + 1).collect()
         if len(rows) > MAX_TABLES:
-            warnings.append(f"Table count exceeds MAX_TABLES ({MAX_TABLES}); results truncated.")
+            warnings.append(f"Table count exceeds MAX_TABLES ({MAX_TABLES}); truncated.")
             rows = rows[:MAX_TABLES]
-        
         return [f"{catalog}.{schema}.{r.tableName}" for r in rows]
     except AnalysisException as e:
-        errors.append(f"SHOW TABLES failed for {catalog}.{schema}: {e.desc if hasattr(e, 'desc') else str(e)}")
+        errors.append(f"SHOW TABLES failed for {catalog}.{schema}: {e.desc if hasattr(e,'desc') else str(e)}")
         return []
     except Exception as e:
         errors.append(f"Unexpected error discovering tables in {catalog}.{schema}: {e}")
         return []
 
 def ns_tables_legacy(database: str) -> List[str]:
-    """Discover tables in legacy database"""
     try:
-        query = f"SHOW TABLES IN {fq_identifier(database)}"
-        df = spark.sql(query)
+        df = spark.sql(f"SHOW TABLES IN {fq_identifier(database)}")
         rows = df.select("tableName").limit(MAX_TABLES + 1).collect()
-        
         if len(rows) > MAX_TABLES:
-            warnings.append(f"Table count exceeds MAX_TABLES ({MAX_TABLES}); results truncated.")
+            warnings.append(f"Table count exceeds MAX_TABLES ({MAX_TABLES}); truncated.")
             rows = rows[:MAX_TABLES]
-        
         return [f"{database}.{r.tableName}" for r in rows]
     except AnalysisException as e:
-        errors.append(f"SHOW TABLES failed for database {database}: {e.desc if hasattr(e, 'desc') else str(e)}")
+        errors.append(f"SHOW TABLES failed for database {database}: {e.desc if hasattr(e,'desc') else str(e)}")
         return []
     except Exception as e:
         errors.append(f"Unexpected error discovering tables in {database}: {e}")
         return []
 
-# Discover tables
 tables = ns_tables_legacy(DATABASE) if USE_LEGACY_DATABASE else ns_tables_uc(CATALOG, SCHEMA)
 tables = [t for t in tables if is_included(t)]
-
 if not tables:
     errors.append("No tables found matching the specified criteria.")
     if VERBOSE_LOGS:
-        print(f"ERROR: No tables discovered. Check your catalog/schema/database configuration.")
+        print("ERROR: No tables discovered. Check your catalog/schema/database configuration.")
 
-# Pull table metadata from information_schema.tables (UC only)
 table_overview = {}
-if not USE_LEGACY_DATABASE and tables:  # Only if we have tables
+if not USE_LEGACY_DATABASE and tables:
     try:
         ist = spark.sql(f"""
             SELECT table_name, table_type, data_source_format
@@ -525,28 +473,15 @@ if not USE_LEGACY_DATABASE and tables:  # Only if we have tables
             WHERE table_schema = '{SCHEMA}'
         """)
         for r in ist.collect():
-            table_overview[f"{CATALOG}.{SCHEMA}.{r.table_name}"] = {
-                "table_type": r.table_type,
-                "data_source_format": r.data_source_format
-            }
+            table_overview[f"{CATALOG}.{SCHEMA}.{r.table_name}"] = {"table_type": r.table_type, "data_source_format": r.data_source_format}
     except Exception as e:
         warnings.append(f"information_schema.tables not accessible: {e}")
 
-# Declared constraints (PK/FK/CHECK) from information_schema
 declared_constraints = {"pk": {}, "fk": [], "check": []}
-if not USE_LEGACY_DATABASE and tables:  # Only if we have tables
+if not USE_LEGACY_DATABASE and tables:
     try:
-        # Get table constraints
-        is_tc  = spark.sql(f"""
-            SELECT * FROM {fq_identifier(CATALOG)}.information_schema.table_constraints 
-            WHERE table_schema = '{SCHEMA}'
-        """)
-        is_kcu = spark.sql(f"""
-            SELECT * FROM {fq_identifier(CATALOG)}.information_schema.key_column_usage 
-            WHERE table_schema = '{SCHEMA}'
-        """)
-        
-        # Primary Keys
+        is_tc  = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.table_constraints WHERE table_schema = '{SCHEMA}'")
+        is_kcu = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.key_column_usage WHERE table_schema = '{SCHEMA}'")
         pk_names = [r.constraint_name for r in is_tc.filter(F.col("constraint_type")=="PRIMARY KEY").select("constraint_name").distinct().collect()]
         for pk in pk_names:
             cols = [r.column_name for r in is_kcu.filter(F.col("constraint_name")==pk).orderBy("ordinal_position").select("column_name").collect()]
@@ -554,12 +489,7 @@ if not USE_LEGACY_DATABASE and tables:  # Only if we have tables
             if tbl and cols:
                 full = f"{CATALOG}.{SCHEMA}.{tbl.table_name}"
                 declared_constraints["pk"][full] = cols
-        
-        # Foreign Keys
-        is_rc  = spark.sql(f"""
-            SELECT * FROM {fq_identifier(CATALOG)}.information_schema.referential_constraints 
-            WHERE constraint_schema = '{SCHEMA}'
-        """)
+        is_rc  = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.referential_constraints WHERE constraint_schema = '{SCHEMA}'")
         fk_rows = is_tc.filter(F.col("constraint_type")=="FOREIGN KEY").select("constraint_name","table_name").collect()
         for r in fk_rows:
             fk_name = r.constraint_name
@@ -573,92 +503,53 @@ if not USE_LEGACY_DATABASE and tables:  # Only if we have tables
                     pk_tbl = f"{CATALOG}.{SCHEMA}.{pk_tbl_row.table_name}"
                     pk_cols = [x.column_name for x in is_kcu.filter(F.col("constraint_name")==pk_name).orderBy("ordinal_position").select("column_name").collect()]
                     if fk_cols and pk_cols:
-                        declared_constraints["fk"].append({
-                            "fk_table": fk_tbl, 
-                            "fk_cols": fk_cols, 
-                            "pk_table": pk_tbl, 
-                            "pk_cols": pk_cols, 
-                            "name": fk_name
-                        })
-        
-        # CHECK constraints (best-effort)
+                        declared_constraints["fk"].append({"fk_table": fk_tbl, "fk_cols": fk_cols, "pk_table": pk_tbl, "pk_cols": pk_cols, "name": fk_name})
         try:
-            is_cc = spark.sql(f"""
-                SELECT * FROM {fq_identifier(CATALOG)}.information_schema.check_constraints 
-                WHERE constraint_schema = '{SCHEMA}'
-            """)
+            is_cc = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.check_constraints WHERE constraint_schema = '{SCHEMA}'")
             for r in is_cc.collect():
-                declared_constraints["check"].append({
-                    "constraint_name": r.constraint_name, 
-                    "check_clause": r.check_clause
-                })
+                declared_constraints["check"].append({"constraint_name": r.constraint_name, "check_clause": r.check_clause})
         except Exception:
-            pass  # CHECK constraints may not be available
-            
+            pass
     except Exception as e:
         warnings.append(f"information_schema constraint discovery limited/unavailable: {e}")
 
 # =========================
-# TABLE METADATA + FAST ROW COUNTS
+# METADATA + FAST ROW COUNTS
 # =========================
 def get_row_count_fast(t: str, df) -> Optional[int]:
-    """Get row count without full scan"""
     try:
         d = spark.sql(f"DESCRIBE DETAIL {fq_table(t)}").select("numRows").first()
-        if d and d[0] is not None:
-            return int(d[0])
+        if d and d[0] is not None: return int(d[0])
     except Exception:
         pass
-    
-    # Fall back to count() only if not in FAST_MODE
     if not FAST_MODE and df is not None:
-        try: 
-            return df.count()
-        except Exception: 
-            pass
-    
+        try: return df.count()
+        except Exception: pass
     return None
 
 entities: Dict[str, Dict[str, Any]] = {}
-
 for t in tables:
     df = safe_table(t)
     if df is None:
-        entities[t] = {
-            "table": t, 
-            "columns": [], 
-            "row_count": None, 
-            "props": {}, 
-            "is_view": False, 
-            "partial": True
-        }
+        entities[t] = {"table": t, "columns": [], "row_count": None, "props": {}, "is_view": False, "partial": True}
         continue
-
-    # Get extended properties
     props = {}
     try:
         desc = spark.sql(f"DESCRIBE EXTENDED {fq_table(t)}").collect()
         props = {r.col_name: r.data_type for r in desc if r.col_name and r.col_name != ""}
     except Exception as e:
         warnings.append(f"DESCRIBE EXTENDED failed for {t}: {e}")
-
-    # Collect columns with complex-type guidance
     cols = []
     for f in df.schema.fields:
         fam = dtype_family(f.dataType)
-        
-        # Walk nested schemas (limited depth)
         struct_fields = []
         try:
             nested = walk_schema("", f.dataType)
-            struct_fields = [
-                {"name": sf["path"], "type": sf["type"], "nullable": sf["nullable"]} 
-                for sf in nested 
-                if sf["path"] and ("." in sf["path"] or "[]" in sf["path"] or "{}" in sf["path"])
-            ][:200]  # Cap for display
+            struct_fields = [{"name": sf["path"], "type": sf["type"], "nullable": sf["nullable"]}
+                             for sf in nested if sf["path"] and ("." in sf["path"] or "[]" in sf["path"] or "{}" in sf["path"])]
+            struct_fields = struct_fields[:200]
         except Exception as e:
             warnings.append(f"Schema walking failed for {t}.{f.name}: {e}")
-        
         cols.append({
             "name": f.name,
             "data_type": f.dataType.simpleString(),
@@ -670,11 +561,9 @@ for t in tables:
             "array_guidance": array_guidance(f.dataType),
             "map_guidance": map_guidance(f.dataType),
         })
-
     rc = get_row_count_fast(t, df)
     is_view = "Type" in props and "VIEW" in str(props.get("Type","")).upper()
     ov = table_overview.get(t, {})
-    
     entities[t] = {
         "table": t,
         "columns": cols,
@@ -687,116 +576,84 @@ for t in tables:
     }
 
 # =========================
-# STATS + DATE/TIME INFERENCE (bounded)
+# STATS + DATETIME INFERENCE
 # =========================
 value_sets_cache = {}
 
 def _df_cache_key(df, col: str):
-    """Stable-ish cache key favoring JVM plan string; fallback to id(df)."""
-    if df is None:
-        return None
+    if df is None: return None
     try:
-        return (df._jdf.toString(), col)  # Best-of-both: Code 1 style
+        return (df._jdf.toString(), col)
     except Exception:
-        return (id(df), col)              # Fallback used in Code 2
+        return (id(df), col)
 
 def sampled_distinct_values(df, col: str, max_rows: int) -> set:
-    """Get sampled distinct values with caching"""
     cache_key = _df_cache_key(df, col)
     if cache_key and cache_key in value_sets_cache:
         return value_sets_cache[cache_key]
-    
     out = set()
-    if df is None: 
-        if cache_key:
-            value_sets_cache[cache_key] = out
+    if df is None:
+        if cache_key: value_sets_cache[cache_key] = out
         return out
-    
     try:
         sdf = sample_df(df.select(F.col(col)).where(F.col(col).isNotNull()), max_rows, min(1.0, ROW_SAMPLE_FRACTION))
         if sdf is not None:
             vals = [r[0] for r in sdf.distinct().limit(200000).collect()]
-            out = set([str(v) for v in vals if v is not None])
+            out = set(str(v) for v in vals if v is not None)
     except Exception as e:
         warnings.append(f"Value sampling failed for column {col}: {e}")
         out = set()
-    
     if cache_key:
         value_sets_cache[cache_key] = out
     return out
 
 def collect_examples(df, cols, n=3):
-    """Collect example rows"""
-    if not INCLUDE_EXAMPLES or df is None or not cols: 
-        return []
+    if not INCLUDE_EXAMPLES or df is None or not cols: return []
     try:
         rows = df.select(*[F.col(c) for c in cols]).limit(n).collect()
         return [{c: r[i] for i, c in enumerate(cols)} for r in rows]
     except Exception:
         return []
 
-# Collect statistics for each table
 for t, meta in entities.items():
     df = safe_table(t)
     if df is None or len(meta["columns"]) == 0:
         meta["stats"] = {"null_ratio": {}, "approx_distinct": {}, "examples": []}
         meta["datetime_inference"] = {}
         continue
-
-    # Adjust sampling for very large tables
     eff_frac = ROW_SAMPLE_FRACTION
     if meta["row_count"] and meta["row_count"] > 50_000_000:
         eff_frac = min(eff_frac, 0.03)
-
     s_df = sample_df(df, NULLABILITY_SAMPLE_ROWS, eff_frac)
     null_ratio, approx_distinct, ex_rows, dt_info = {}, {}, [], {}
 
-    # Null ratios from sample
     try:
         if s_df is not None:
-            exprs = [
-                F.avg(F.when(F.col(c["name"]).isNull(), 1).otherwise(0)).alias(c["name"]) 
-                for c in meta["columns"]
-            ]
+            exprs = [F.avg(F.when(F.col(c["name"]).isNull(), 1).otherwise(0)).alias(c["name"]) for c in meta["columns"]]
             result = s_df.select(*exprs).first()
-            if result:
-                null_ratio = result.asDict()
+            if result: null_ratio = result.asDict()
     except Exception as e:
         warnings.append(f"Null ratio calculation failed for {t}: {e}")
 
-    # Approx distinct counts (skip in FAST_MODE)
     try:
         if not FAST_MODE and df is not None:
-            # Only compute for relevant types
-            exprs = [
-                approx_distinct_expr(c["name"]) 
-                for c in meta["columns"] 
-                if c["family"] in {"integral","decimal","floating","stringy","dates","boolean"}
-            ]
+            exprs = [approx_distinct_expr(c["name"]) for c in meta["columns"] if c["family"] in {"integral","decimal","floating","stringy","dates","boolean"}]
             if exprs:
                 row = df.select(*exprs).first()
-                if row:
-                    approx_distinct = row.asDict()
+                if row: approx_distinct = row.asDict()
     except Exception as e:
         warnings.append(f"Approx distinct calculation failed for {t}: {e}")
 
-    # Example rows
     ex_rows = collect_examples(df, [c["name"] for c in meta["columns"]], 3)
 
-    # Date/time inference for string columns
     for f in meta["columns"]:
         cname, fam = f["name"], f["family"]
         fmt, support, counts = None, 0.0, None
-        
         try:
             if fam == "dates":
-                # Already a date/timestamp type
-                fmt = "spark_date_or_timestamp"
-                support = 1.0
+                fmt = "spark_date_or_timestamp"; support = 1.0
             elif fam == "stringy" and s_df is not None:
-                # Sample string values for pattern detection
                 try:
-                    sample_vals = []
                     rows = s_df.select(F.col(cname)).where(F.col(cname).isNotNull()).limit(2000).collect()
                     sample_vals = [str(v[0]) for v in rows if v[0] is not None]
                     fmt, support, counts = detect_string_datetime_format(sample_vals)
@@ -804,41 +661,26 @@ for t, meta in entities.items():
                     pass
         except Exception:
             pass
-        
-        # Best-of-both: only include if meets configurable threshold
         if fmt and support >= DATETIME_SUPPORT_MIN:
             dt_info[cname] = {
                 "inferred_format": fmt,
                 "support_fraction": round(float(support), 3),
                 "pattern_counts": counts,
-                "parse_howto": (
-                    "STRING→to_date/to_timestamp with detected pattern; "
-                    "epoch_seconds→to_timestamp(col); epoch_millis→to_timestamp(col/1000.0). "
-                    "DATE/TIMESTAMP are typed; use date_format for display."
-                )
+                "parse_howto": ("STRING→to_date/to_timestamp with detected pattern; "
+                                "epoch_seconds→to_timestamp(col); epoch_millis→to_timestamp(col/1000.0). "
+                                "DATE/TIMESTAMP are typed; use date_format for display.")
             }
 
-    meta["stats"] = {
-        "null_ratio": null_ratio, 
-        "approx_distinct": approx_distinct, 
-        "examples": ex_rows
-    }
+    meta["stats"] = {"null_ratio": null_ratio, "approx_distinct": approx_distinct, "examples": ex_rows}
     meta["datetime_inference"] = dt_info
 
-# Attach stats at column level
 for t, meta in entities.items():
     nr = meta["stats"].get("null_ratio", {})
     ad = meta["stats"].get("approx_distinct", {})
     for c in meta["columns"]:
         cname = c["name"]
-        
-        # Null ratio
         c["null_ratio"] = float(nr.get(cname)) if cname in nr and nr[cname] is not None else None
-        
-        # Approx distinct
         c["approx_distinct"] = int(ad.get(cname)) if cname in ad and ad[cname] is not None else None
-        
-        # Datetime info
         if cname in meta["datetime_inference"]:
             di = meta["datetime_inference"][cname]
             c["inferred_datetime_format"] = di["inferred_format"]
@@ -847,44 +689,26 @@ for t, meta in entities.items():
             c["datetime_pattern_counts"] = di.get("pattern_counts")
 
 # =========================
-# KEY CANDIDATES + COMPOSITES (PK), FK candidates
+# PK/FK CANDIDATES + COMPOSITES
 # =========================
 def is_candidate_pk(col_meta, row_count):
-    """Determine if column is a good PK candidate"""
-    if row_count in (None, 0): 
-        return (False, 0.0)
-    
+    if row_count in (None, 0): return (False, 0.0)
     s = 0.0
     ad = col_meta.get("approx_distinct")
-    if ad is not None and row_count > 0: 
-        s += 0.6 * min(1.0, ad / row_count)
-    
+    if ad is not None and row_count > 0: s += 0.6 * min(1.0, ad / row_count)
     nr = col_meta.get("null_ratio")
-    if nr is not None: 
-        s += 0.2 * (1.0 - nr)
-    
-    if col_meta.get("is_id_name"): 
-        s += 0.2
-    
+    if nr is not None: s += 0.2 * (1.0 - nr)
+    if col_meta.get("is_id_name"): s += 0.2
     return (s >= 0.65), round(s, 3)
 
 def is_candidate_fk(col_meta):
-    """Determine if column is a good FK candidate"""
     s = 0.0
-    
     nr = col_meta.get("null_ratio")
-    if nr is not None: 
-        s += 0.3 * (1.0 - nr)
-    
-    if col_meta.get("is_fk_name") or col_meta.get("is_id_name"): 
-        s += 0.4
-    
-    if col_meta.get("family","") in {"integral","decimal","floating","stringy","dates"}: 
-        s += 0.3
-    
+    if nr is not None: s += 0.3 * (1.0 - nr)
+    if col_meta.get("is_fk_name") or col_meta.get("is_id_name"): s += 0.4
+    if col_meta.get("family","") in {"integral","decimal","floating","stringy","dates"}: s += 0.3
     return (s >= 0.55), round(s, 3)
 
-# Score all columns as PK/FK candidates
 for t, meta in entities.items():
     rc = meta.get("row_count")
     for c in meta["columns"]:
@@ -895,7 +719,6 @@ for t, meta in entities.items():
         c["candidate_fk"] = fkf
         c["candidate_fk_score"] = fks
 
-# Respect declared PKs
 for tbl, cols in declared_constraints["pk"].items():
     if tbl in entities:
         for c in entities[tbl]["columns"]:
@@ -903,112 +726,62 @@ for tbl, cols in declared_constraints["pk"].items():
                 c["candidate_pk"] = True
                 c["candidate_pk_score"] = 1.0
 
-# Composite PK discovery (NULL-safe hashing; best-of-both)
 def best_composite_pk(df, cols_meta, row_count, top_n=6, max_k=3):
-    """Find best composite PK using sampling"""
-    if df is None or not cols_meta or row_count in (None, 0):
-        return None, 0.0
-    
-    # Sort by PK score and take top N
+    if df is None or not cols_meta or row_count in (None, 0): return None, 0.0
     cols_meta = sorted(cols_meta, key=lambda c: c.get("candidate_pk_score", 0), reverse=True)[:top_n]
     names = [c["name"] for c in cols_meta]
-    
-    if len(names) < 2: 
-        return None, 0.0
-    
-    # Sample data for testing
-    sdf = sample_df(
-        df.select(*[F.col(n) for n in names]), 
-        200_000, 
-        0.2 if not FAST_MODE else 0.05
-    )
-    
-    if sdf is None: 
-        return None, 0.0
-    
+    if len(names) < 2: return None, 0.0
+    sdf = sample_df(df.select(*[F.col(n) for n in names]), 200_000, 0.2 if not FAST_MODE else 0.05)
+    if sdf is None: return None, 0.0
     best, best_score = None, 0.0
-    
     for k in range(2, min(max_k + 1, len(names) + 1)):
         for combo in itertools.combinations(names, k):
             try:
-                # Count distinct combinations using NULL-safe hash
                 ad = sdf.select(
                     F.approx_count_distinct(
-                        F.sha2(
-                            F.concat_ws("||", *[F.coalesce(F.col(x).cast("string"), F.lit("NULL")) for x in combo]), 
-                            256
-                        )
+                        F.sha2(F.concat_ws("||", *[F.coalesce(F.col(x).cast("string"), F.lit("NULL")) for x in combo]), 256)
                     )
                 ).first()[0]
-                
-                if ad is None or ad == 0:
-                    continue
-                
-                # Score based on distinctness and individual column scores
+                if ad is None or ad == 0: continue
                 distinct_ratio = ad / max(1, row_count)
-                avg_col_score = sum(
-                    next(cm for cm in cols_meta if cm["name"] == x)["candidate_pk_score"] 
-                    for x in combo
-                ) / k
-                
+                avg_col_score = sum(next(cm for cm in cols_meta if cm["name"] == x)["candidate_pk_score"] for x in combo) / k
                 score = 0.75 * distinct_ratio + 0.25 * avg_col_score
-                
                 if score > best_score:
                     best, best_score = combo, score
             except Exception as e:
                 warnings.append(f"Composite PK test failed for {combo}: {e}")
                 continue
-    
     return best, round(float(best_score), 3)
 
-# Build PK registry
 pk_registry = {}
-
 for t, meta in entities.items():
-    # Use declared PK if available
     if t in declared_constraints["pk"] and declared_constraints["pk"][t]:
         pk_registry[t] = declared_constraints["pk"][t]
         continue
-    
-    # Find candidate columns
     cands = [c for c in meta["columns"] if c.get("candidate_pk")]
-    
     if not cands:
         pk_registry[t] = []
         continue
-    
     df = safe_table(t)
     combo, score = (None, 0.0)
-    
-    # Try composite PK if not in FAST_MODE
     if not FAST_MODE and len(cands) >= 2:
         combo, score = best_composite_pk(df, cands, meta.get("row_count"), TOP_PK_CANDIDATES, MAX_COMPOSITE_K)
-    
-    # Use composite if score is high enough, otherwise use best single column
     if combo and score >= 0.80:
         pk_registry[t] = list(combo)
     elif cands:
-        # Take single best PK candidate
-        best_single = sorted(
-            [(c["name"], c["candidate_pk_score"]) for c in cands], 
-            key=lambda x: x[1], 
-            reverse=True
-        )[0][0]
+        best_single = sorted([(c["name"], c["candidate_pk_score"]) for c in cands], key=lambda x: x[1], reverse=True)[0][0]
         pk_registry[t] = [best_single]
     else:
         pk_registry[t] = []
 
 # =========================
-# RELATIONSHIPS (declared first, then inferred)
+# RELATIONSHIPS
 # =========================
 relationships = []
 
-# Add declared FKs first (multi-column safe)
 for fk in declared_constraints["fk"]:
     fk_cols_str = " + ".join(fk["fk_cols"]) if len(fk["fk_cols"]) > 1 else fk["fk_cols"][0] if fk["fk_cols"] else "UNKNOWN"
     pk_cols_str = " + ".join(fk["pk_cols"]) if len(fk["pk_cols"]) > 1 else fk["pk_cols"][0] if fk["pk_cols"] else "UNKNOWN"
-    
-    # Generate join examples
     if len(fk["fk_cols"]) == 1 and len(fk["pk_cols"]) == 1:
         join_sql = f"SELECT * FROM {fq_table(fk['fk_table'])} f JOIN {fq_table(fk['pk_table'])} p ON f.`{fk['fk_cols'][0]}` = p.`{fk['pk_cols'][0]}`"
         join_pyspark = f"fk.join(pk, F.col('f.`{fk['fk_cols'][0]}`') == F.col('p.`{fk['pk_cols'][0]}`'), 'left')"
@@ -1016,219 +789,103 @@ for fk in declared_constraints["fk"]:
         conditions = [f"f.`{fc}` = p.`{pc}`" for fc, pc in zip(fk['fk_cols'], fk['pk_cols'])]
         join_sql = f"SELECT * FROM {fq_table(fk['fk_table'])} f JOIN {fq_table(fk['pk_table'])} p ON " + " AND ".join(conditions)
         join_pyspark = "fk.join(pk, " + " & ".join([f"(F.col('f.`{fc}`') == F.col('p.`{pc}`'))" for fc, pc in zip(fk['fk_cols'], fk['pk_cols'])]) + ", 'left')"
-    
     relationships.append({
-        "fk_table": fk["fk_table"],
-        "fk_column": fk_cols_str,
-        "pk_table": fk["pk_table"],
-        "pk_column": pk_cols_str,
-        "score": 1.0,
-        "evidence": {"declared_constraint": fk["name"]},
-        "cardinality": "many-to-one",
-        "declared": True,
-        "join_example_sql": join_sql,
-        "join_example_pyspark": join_pyspark
+        "fk_table": fk["fk_table"], "fk_column": fk_cols_str,
+        "pk_table": fk["pk_table"], "pk_column": pk_cols_str,
+        "score": 1.0, "evidence": {"declared_constraint": fk["name"]},
+        "cardinality": "many-to-one", "declared": True,
+        "join_example_sql": join_sql, "join_example_pyspark": join_pyspark
     })
 
-# Infer single-column FK relationships
 for fk_table, fk_meta in entities.items():
     df_fk = safe_table(fk_table)
-    
     for fk_col in [c for c in fk_meta["columns"] if c.get("candidate_fk")]:
-        fk_name = fk_col["name"]
-        fk_fam = fk_col["family"]
-        fk_null = fk_col.get("null_ratio")
-        fk_ad = fk_col.get("approx_distinct")
-        
+        fk_name = fk_col["name"]; fk_fam = fk_col["family"]; fk_null = fk_col.get("null_ratio"); fk_ad = fk_col.get("approx_distinct")
         for pk_table, pk_cols in pk_registry.items():
-            if not pk_cols: 
+            if not pk_cols: continue
+            if any(r.get("declared") and r["fk_table"] == fk_table and r["pk_table"] == pk_table for r in relationships):
                 continue
-            
-            # Skip if declared relationship already exists
-            if any(
-                r.get("declared") and 
-                r["fk_table"] == fk_table and 
-                r["pk_table"] == pk_table 
-                for r in relationships
-            ):
-                continue
-            
             best_name, best_score, best_ev = None, 0.0, None
-            
-            # Try matching against each PK column
             for pk_name in pk_cols:
                 pk_col = next((c for c in entities[pk_table]["columns"] if c["name"] == pk_name), None)
-                if pk_col is None: 
-                    continue
-                
-                # Score components
+                if pk_col is None: continue
                 sc_name = name_match_score(fk_name, pk_name)
                 sc_type = type_compat_score(fk_fam, pk_col["family"])
-                
-                if sc_type <= 0.0:  # Types incompatible
-                    continue
-                
+                if sc_type <= 0.0: continue
                 sc_null = null_ratio_score(fk_null)
-                sc_dr = distinct_ratio_score(pk_col.get("approx_distinct"), entities[pk_table].get("row_count"))
+                sc_dr   = distinct_ratio_score(pk_col.get("approx_distinct"), entities[pk_table].get("row_count"))
                 sc_card = cardinality_score(fk_ad, pk_col.get("approx_distinct"))
-                
-                # Value overlap (expensive, optional)
                 sc_overlap = 0.0
                 if ENABLE_VALUE_OVERLAP:
                     try:
                         fk_vals = sampled_distinct_values(df_fk, fk_name, VALUE_OVERLAP_SAMPLE_ROWS)
                         pk_vals = sampled_distinct_values(safe_table(pk_table), pk_name, VALUE_OVERLAP_SAMPLE_ROWS)
                         if fk_vals:
-                            overlap_count = len(fk_vals & pk_vals)
-                            sc_overlap = min(1.0, overlap_count / max(1, len(fk_vals)))
+                            sc_overlap = min(1.0, len(fk_vals & pk_vals) / max(1, len(fk_vals)))
                     except Exception as e:
                         warnings.append(f"Overlap check failed {fk_table}.{fk_name} -> {pk_table}.{pk_name}: {e}")
                         sc_overlap = 0.0
-                
-                # Combined score
-                total = (
-                    0.20 * sc_name + 
-                    0.10 * sc_type + 
-                    0.20 * sc_dr + 
-                    0.10 * sc_null + 
-                    0.35 * sc_overlap + 
-                    0.05 * sc_card
-                )
-                
+                total = (0.20*sc_name + 0.10*sc_type + 0.20*sc_dr + 0.10*sc_null + 0.35*sc_overlap + 0.05*sc_card)
                 if total > best_score:
-                    best_score = total
-                    best_name = pk_name
-                    best_ev = {
-                        "name_match": round(sc_name, 3),
-                        "type_compat": sc_type,
-                        "pk_distinct_ratio": round(sc_dr, 3),
-                        "fk_null_complement": round(sc_null, 3),
-                        "value_overlap": round(sc_overlap, 3),
-                        "cardinality_shape": round(sc_card, 3),
-                        "fk_ad": fk_ad,
-                        "pk_ad": pk_col.get("approx_distinct")
-                    }
-            
-            # Add relationship if score meets threshold
+                    best_score = total; best_name = pk_name
+                    best_ev = {"name_match": round(sc_name,3), "type_compat": sc_type,
+                               "pk_distinct_ratio": round(sc_dr,3), "fk_null_complement": round(sc_null,3),
+                               "value_overlap": round(sc_overlap,3), "cardinality_shape": round(sc_card,3),
+                               "fk_ad": fk_ad, "pk_ad": pk_col.get("approx_distinct")}
             if best_name and best_score >= MIN_REL_SCORE:
-                # Infer cardinality type
                 card = "many-to-one"
                 try:
-                    pk_ad = next(
-                        (c for c in entities[pk_table]["columns"] if c["name"] == best_name), 
-                        {}
-                    ).get("approx_distinct")
-                    
-                    if fk_ad is not None and pk_ad is not None and pk_ad > 0:
-                        ratio = abs(fk_ad - pk_ad) / pk_ad
-                        if ratio < 0.05:  # Within 5%
-                            card = "one-to-one"
+                    pk_ad = next((c for c in entities[pk_table]["columns"] if c["name"] == best_name), {}).get("approx_distinct")
+                    if fk_ad is not None and pk_ad is not None and pk_ad > 0 and abs(fk_ad - pk_ad)/pk_ad < 0.05:
+                        card = "one-to-one"
                 except Exception:
                     pass
-                
                 relationships.append({
-                    "fk_table": fk_table,
-                    "fk_column": fk_name,
-                    "pk_table": pk_table,
-                    "pk_column": best_name,
-                    "score": round(best_score, 3),
-                    "evidence": best_ev,
-                    "cardinality": card,
-                    "declared": False,
+                    "fk_table": fk_table, "fk_column": fk_name,
+                    "pk_table": pk_table, "pk_column": best_name,
+                    "score": round(best_score, 3), "evidence": best_ev,
+                    "cardinality": card, "declared": False,
                     "join_example_sql": f"SELECT * FROM {fq_table(fk_table)} f JOIN {fq_table(pk_table)} p ON f.`{fk_name}` = p.`{best_name}`",
                     "join_example_pyspark": f"fk.join(pk, F.col('f.`{fk_name}`') == F.col('p.`{best_name}`'), 'left')"
                 })
 
-# Optional composite FK inference
 if ENABLE_COMPOSITE_FK_INFERENCE:
     for pk_table, pk_cols in pk_registry.items():
-        if len(pk_cols) < 2: 
-            continue
-        
+        if len(pk_cols) < 2: continue
         for fk_table, fk_meta in entities.items():
-            if fk_table == pk_table: 
-                continue
-            
-            # Check if FK table has all PK columns (by name similarity)
+            if fk_table == pk_table: continue
             fk_names = [c["name"] for c in fk_meta["columns"]]
-            
-            # Naive name-based subset check
-            if all(
-                any(
-                    fn.lower() == pc.lower() or fn.lower().endswith("_" + pc.lower()) 
-                    for fn in fk_names
-                ) 
-                for pc in pk_cols
-            ):
-                # Optional overlap check
+            if all(any(fn.lower()==pc.lower() or fn.lower().endswith("_"+pc.lower()) for fn in fk_names) for pc in pk_cols):
                 passes_overlap = True
-                
                 if ENABLE_VALUE_OVERLAP:
                     try:
-                        df_fk = safe_table(fk_table)
-                        df_pk = safe_table(pk_table)
-                        
+                        df_fk = safe_table(fk_table); df_pk = safe_table(pk_table)
                         if df_fk is not None and df_pk is not None:
-                            fk_sdf = sample_df(
-                                df_fk.select(*[F.col(c).cast("string") for c in pk_cols]), 
-                                VALUE_OVERLAP_SAMPLE_ROWS, 
-                                min(1.0, ROW_SAMPLE_FRACTION)
-                            )
-                            pk_sdf = sample_df(
-                                df_pk.select(*[F.col(c).cast("string") for c in pk_cols]), 
-                                VALUE_OVERLAP_SAMPLE_ROWS, 
-                                min(1.0, ROW_SAMPLE_FRACTION)
-                            )
-                            
+                            fk_sdf = sample_df(df_fk.select(*[F.col(c).cast("string") for c in pk_cols]), VALUE_OVERLAP_SAMPLE_ROWS, min(1.0, ROW_SAMPLE_FRACTION))
+                            pk_sdf = sample_df(df_pk.select(*[F.col(c).cast("string") for c in pk_cols]), VALUE_OVERLAP_SAMPLE_ROWS, min(1.0, ROW_SAMPLE_FRACTION))
                             if fk_sdf is not None and pk_sdf is not None:
-                                # Hash combinations
-                                fk_hash = {
-                                    r[0] for r in fk_sdf.select(
-                                        F.sha2(
-                                            F.concat_ws("||", *[F.coalesce(F.col(c), F.lit("NULL")) for c in pk_cols]), 
-                                            256
-                                        )
-                                    ).distinct().limit(200000).collect()
-                                }
-                                pk_hash = {
-                                    r[0] for r in pk_sdf.select(
-                                        F.sha2(
-                                            F.concat_ws("||", *[F.coalesce(F.col(c), F.lit("NULL")) for c in pk_cols]), 
-                                            256
-                                        )
-                                    ).distinct().limit(200000).collect()
-                                }
-                                
+                                fk_hash = {r[0] for r in fk_sdf.select(F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c), F.lit("NULL")) for c in pk_cols]), 256)).distinct().limit(200000).collect()}
+                                pk_hash = {r[0] for r in pk_sdf.select(F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c), F.lit("NULL")) for c in pk_cols]), 256)).distinct().limit(200000).collect()}
                                 if fk_hash:
                                     overlap = len(fk_hash & pk_hash) / max(1, len(fk_hash))
                                     passes_overlap = overlap >= 0.5
                     except Exception as e:
                         warnings.append(f"Composite FK overlap failed {fk_table}->{pk_table}: {e}")
-                
                 if passes_overlap:
-                    # Generate join conditions
                     conditions = [f"f.`{c}` = p.`{c}`" for c in pk_cols]
                     join_sql = f"SELECT * FROM {fq_table(fk_table)} f JOIN {fq_table(pk_table)} p ON " + " AND ".join(conditions)
                     join_pyspark = "fk.join(pk, " + " & ".join([f"(F.col('f.`{c}`') == F.col('p.`{c}`'))" for c in pk_cols]) + ", 'left')"
-                    
                     relationships.append({
-                        "fk_table": fk_table,
-                        "fk_column": " + ".join(pk_cols),
-                        "pk_table": pk_table,
-                        "pk_column": " + ".join(pk_cols),
+                        "fk_table": fk_table, "fk_column": " + ".join(pk_cols),
+                        "pk_table": pk_table, "pk_column": " + ".join(pk_cols),
                         "score": 0.85 if ENABLE_VALUE_OVERLAP else 0.70,
-                        "evidence": {
-                            "composite_match_on_names": True, 
-                            "overlap_checked": ENABLE_VALUE_OVERLAP
-                        },
-                        "cardinality": "many-to-one",
-                        "declared": False,
-                        "join_example_sql": join_sql,
-                        "join_example_pyspark": join_pyspark
+                        "evidence": {"composite_match_on_names": True, "overlap_checked": ENABLE_VALUE_OVERLAP},
+                        "cardinality": "many-to-one", "declared": False,
+                        "join_example_sql": join_sql, "join_example_pyspark": join_pyspark
                     })
 
 # =========================
-# MODEL ASSEMBLY
+# MODEL
 # =========================
 model = {
     "version": VERSION,
@@ -1242,7 +899,7 @@ model = {
     },
     "spark_env": {
         "spark_version": spark.version,
-        "session_timezone": spark.conf.get("spark.sql.session.timeZone", "unknown"),
+        "session_timezone": SESSION_TIMEZONE_EFFECTIVE,
         "ansi": spark.conf.get("spark.sql.ansi.enabled", "unknown")
     },
     "entities": [],
@@ -1251,7 +908,6 @@ model = {
     "errors": errors
 }
 
-# Build entities list
 for t, meta in sorted(entities.items(), key=lambda kv: kv[0].lower()):
     model["entities"].append({
         "name": t,
@@ -1262,16 +918,10 @@ for t, meta in sorted(entities.items(), key=lambda kv: kv[0].lower()):
         "partial": meta.get("partial", False),
         "columns": [
             {
-                "name": c["name"],
-                "type": c["data_type"],
-                "family": c["family"],
-                "nullable": c["nullable"],
-                "approx_distinct": c.get("approx_distinct"),
-                "null_ratio": c.get("null_ratio"),
-                "candidate_pk": c.get("candidate_pk"),
-                "candidate_pk_score": c.get("candidate_pk_score"),
-                "candidate_fk": c.get("candidate_fk"),
-                "candidate_fk_score": c.get("candidate_fk_score"),
+                "name": c["name"], "type": c["data_type"], "family": c["family"], "nullable": c["nullable"],
+                "approx_distinct": c.get("approx_distinct"), "null_ratio": c.get("null_ratio"),
+                "candidate_pk": c.get("candidate_pk"), "candidate_pk_score": c.get("candidate_pk_score"),
+                "candidate_fk": c.get("candidate_fk"), "candidate_fk_score": c.get("candidate_fk_score"),
                 "inferred_datetime_format": c.get("inferred_datetime_format"),
                 "inferred_datetime_support": c.get("inferred_datetime_support"),
                 "datetime_parse_howto": c.get("datetime_parse_howto"),
@@ -1285,102 +935,72 @@ for t, meta in sorted(entities.items(), key=lambda kv: kv[0].lower()):
     })
 
 # =========================
-# RENDER MARKDOWN + MERMAID (BEST-OF-BOTH)
+# RENDER (Markdown + Mermaid)
 # =========================
 def md_escape(s): 
-    """Escape markdown special characters"""
     if s is None: return ""
     return str(s).replace("|", "\\|").replace("\n", " ").replace("\r", "")
 
 def xml_escape(s):
-    """Escape XML special characters"""
     if s is None: return ""
     return html.escape(str(s))
 
 def mermaid_safe(s):
-    """Make string safe for Mermaid diagrams"""
     if s is None: return ""
-    # Replace problematic characters
     return str(s).replace("`", "").replace('"', "'").replace("\n", " ").replace(".", "_")
 
 def render_mermaid(model) -> str:
-    """Generate Mermaid ERD"""
     if len(model["entities"]) > MAX_MERMAID_TABLES:
         return "_Mermaid diagram omitted (too many tables for readable rendering)._"
-    
     lines = ["```mermaid", "erDiagram"]
-    
-    # Add entities
     for e in model["entities"]:
         entity_name = mermaid_safe(e["name"])
         lines.append(f"  {entity_name} {{")
-        # best-of-both: configurable columns cap
         max_cols = MERMAID_MAX_COLUMNS
         cols = e["columns"] if max_cols is None or max_cols < 0 else e["columns"][:max_cols]
         for c in cols:
-            col_type = mermaid_safe(c['type'])
-            col_name = mermaid_safe(c['name'])
-            lines.append(f"    {col_type} {col_name}")
+            lines.append(f"    {mermaid_safe(c['type'])} {mermaid_safe(c['name'])}")
         if max_cols is not None and max_cols >= 0 and len(e["columns"]) > max_cols:
             lines.append("    ... more_columns")
         lines.append("  }")
-    
-    # Add relationships (use clear many-side symbol o{)
     for r in model["relationships"]:
-        pk_entity = mermaid_safe(r["pk_table"])
-        fk_entity = mermaid_safe(r["fk_table"])
-        pk_col = mermaid_safe(r["pk_column"])
-        fk_col = mermaid_safe(r["fk_column"])
+        pk_entity = mermaid_safe(r["pk_table"]); fk_entity = mermaid_safe(r["fk_table"])
+        pk_col = mermaid_safe(r["pk_column"]);   fk_col = mermaid_safe(r["fk_column"])
         label = f"{pk_col}_{fk_col}"
         lines.append(f"  {pk_entity} ||--o{{ {fk_entity} : \"{label}\"")
-    
     lines.append("```")
     return "\n".join(lines)
 
 def render_markdown(model) -> str:
-    """Generate comprehensive Markdown report"""
-    ns = model["namespace"]
-    nsname = ns["database"] or f"{ns['catalog']}.{ns['schema']}"
+    ns = model["namespace"]; nsname = ns["database"] or f"{ns['catalog']}.{ns['schema']}"
     lines = []
-    
-    # Header
     lines.append(f"# ERD / Data Model Report — {nsname}")
     lines.append(f"_Author: {AUTHOR}_  ")
     lines.append(f"_Version: {VERSION}_  ")
     lines.append(f"_Run ID: {RUN_ID}_  ")
     lines.append(f"_Spark: {model['spark_env']['spark_version']}; Timezone: {model['spark_env']['session_timezone']}_\n")
-    
-    # Summary
     lines.append("## Summary")
     lines.append(f"- **Tables discovered**: {len(model['entities'])}")
     lines.append(f"- **Relationships identified**: {len(model['relationships'])}")
     lines.append(f"- **Declared constraints**: {len([r for r in model['relationships'] if r.get('declared')])}")
     lines.append(f"- **Inferred relationships**: {len([r for r in model['relationships'] if not r.get('declared')])}")
     lines.append("")
-    
-    # Entities
     lines.append("## Entities\n")
     for e in model["entities"]:
         lines.append(f"### {md_escape(e['name'])}")
-        
         tt = e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE")
         dsf = e.get("data_source_format") or "unknown"
         lines.append(f"- **Type**: {tt}  ")
         lines.append(f"- **Data source**: {dsf}  ")
         lines.append(f"- **Approx rows**: {e.get('row_count') or 'unknown'}  ")
-        
         if e.get("partial"):
             lines.append(f"- ⚠️ **Note**: Partial metadata (access limits or load failures)  ")
-        
         lines.append("\n#### Columns")
         lines.append("| Name | Type | Nullable | ~Distinct | Null% | PK? | FK? | Date/Time Format | Complex |")
         lines.append("|------|------|----------|-----------|-------|-----|-----|------------------|---------|")
-        
         for c in e["columns"]:
-            dt_fmt = c.get("inferred_datetime_format")
-            support_pct = int((c.get('inferred_datetime_support') or 0)*100)
+            dt_fmt = c.get("inferred_datetime_format"); support_pct = int((c.get('inferred_datetime_support') or 0)*100)
             dt_str = f"{dt_fmt} ({support_pct}%)" if dt_fmt else ""
-            
             complex_str = ""
             if c.get("struct_fields"):
                 complex_str = f"STRUCT ({len(c['struct_fields'])} nested)"
@@ -1388,57 +1008,33 @@ def render_markdown(model) -> str:
                 complex_str = f"ARRAY→{c['array_guidance']['element_type']}"
             elif c.get("map_guidance"):
                 complex_str = f"MAP<{c['map_guidance']['key_type']},{c['map_guidance']['value_type']}>"
-            
             null_pct = f"{c.get('null_ratio')*100:.1f}%" if c.get('null_ratio') is not None else ""
             pk_str = f"✓ ({c.get('candidate_pk_score')})" if c.get("candidate_pk") else ""
             fk_str = f"✓ ({c.get('candidate_fk_score')})" if c.get("candidate_fk") else ""
-            
-            # Best-of-both: configurable truncation of type string
             t_str = c["type"]
             if MD_TRUNCATE_TYPE_CHARS is not None and MD_TRUNCATE_TYPE_CHARS >= 0 and len(t_str) > MD_TRUNCATE_TYPE_CHARS:
                 t_str = t_str[:MD_TRUNCATE_TYPE_CHARS] + "…"
-            
             lines.append("| {n} | {t} | {nu} | {ad} | {nr} | {pk} | {fk} | {df} | {cx} |".format(
-                n=md_escape(c["name"]),
-                t=md_escape(t_str),
-                nu="Y" if c["nullable"] else "N",
-                ad=md_escape(c.get("approx_distinct", "")),
-                nr=md_escape(null_pct),
-                pk=md_escape(pk_str),
-                fk=md_escape(fk_str),
-                df=md_escape(dt_str),
-                cx=md_escape(complex_str)
+                n=md_escape(c["name"]), t=md_escape(t_str), nu="Y" if c["nullable"] else "N",
+                ad=md_escape(c.get("approx_distinct","")), nr=md_escape(null_pct),
+                pk=md_escape(pk_str), fk=md_escape(fk_str), df=md_escape(dt_str), cx=md_escape(complex_str)
             ))
-        
-        # Examples
         if e.get("examples"):
             lines.append("\n**Example rows** (up to 3):")
             for i, r in enumerate(e["examples"][:3], 1):
-                lines.append(f"{i}. `{md_escape(str(r)[:200])}`")  # Truncate long examples
-        
+                lines.append(f"{i}. `{md_escape(str(r)[:200])}`")
         lines.append("\n")
-    
-    # Relationships
     lines.append("## Relationships")
-    
     if model["relationships"]:
         lines.append("\n### Relationship Catalog")
         lines.append("| FK Table | FK Column(s) | PK Table | PK Column(s) | Score | Declared? | Cardinality | Evidence |")
         lines.append("|----------|--------------|----------|--------------|-------|-----------|-------------|----------|")
-        
         for r in sorted(model["relationships"], key=lambda x: (-x["score"], x["fk_table"], x["pk_table"])):
             ev = r.get("evidence", {})
-            
-            if r.get("declared"):
-                evs = f"Declared: {ev.get('declared_constraint', 'constraint')}"
-            else:
-                evs = f"name:{ev.get('name_match','?')}, type:{ev.get('type_compat','?')}, overlap:{ev.get('value_overlap','?')}"
-            
+            evs = f"Declared: {ev.get('declared_constraint','constraint')}" if r.get("declared") else f"name:{ev.get('name_match','?')}, type:{ev.get('type_compat','?')}, overlap:{ev.get('value_overlap','?')}"
             lines.append(f"| {md_escape(r['fk_table'])} | {md_escape(r['fk_column'])} | {md_escape(r['pk_table'])} | {md_escape(r['pk_column'])} | {r['score']:.3f} | {r.get('declared',False)} | {r.get('cardinality','?')} | {md_escape(evs)} |")
-        
         lines.append("\n### Join Examples")
         lines.append("Sample SQL and PySpark code for top relationships:\n")
-        
         for r in model["relationships"][:min(15, len(model["relationships"]))]:
             lines.append(f"**{md_escape(r['fk_table'])}** → **{md_escape(r['pk_table'])}**")
             lines.append(f"- Columns: `{md_escape(r['fk_column'])}` = `{md_escape(r['pk_column'])}`")
@@ -1447,70 +1043,66 @@ def render_markdown(model) -> str:
             lines.append("")
     else:
         lines.append("_No relationships found above the threshold._")
-    
-    # Complex type guidance
     lines.append("\n## How to Parse Complex Types")
     lines.append("- **ARRAY**: Use `explode()` or `posexplode()`, then `SELECT elem` or `elem.*` for STRUCT elements")
     lines.append("- **MAP**: Use `explode(map_col)` to get (key, value) rows; `map_keys()` / `map_values()` for projections")
     lines.append("- **STRUCT**: Use `col.*` to flatten one level; recurse for nested structures")
     lines.append("")
-    
-    # Date/time parsing guidance
     lines.append("## Date/Time Parsing Guidance")
     lines.append("- **STRING with pattern** → `to_date()` / `to_timestamp()` with the detected pattern")
     lines.append("- **epoch_seconds** → `to_timestamp(col)`")
     lines.append("- **epoch_millis** → `to_timestamp(col / 1000.0)`")
     lines.append("- **Native DATE/TIMESTAMP** → Already typed; use `date_format()` for display")
     lines.append("")
-    
-    # Mermaid ERD
     if EMIT_MERMAID:
         lines.append("## Entity Relationship Diagram")
         lines.append(render_mermaid(model))
         lines.append("")
-    
-    # Warnings and errors
     if warnings:
         lines.append("## ⚠️ Warnings")
-        for w in warnings[:50]:  # Limit warnings
+        for w in warnings[:50]:
             lines.append(f"- {md_escape(w)}")
         if len(warnings) > 50:
             lines.append(f"- ... and {len(warnings) - 50} more warnings")
         lines.append("")
-    
     if errors:
         lines.append("## ❌ Errors")
         for e in errors:
             lines.append(f"- {md_escape(e)}")
         lines.append("")
-    
     return "\n".join(lines)
 
 markdown_report = render_markdown(model)
 
 # =========================
-# OUTPUTS (IMPROVED ERROR HANDLING)
+# OUTPUTS (UC-first; no DBFS default)
 # =========================
-out_dir = (UC_VOLUME_PATH.rstrip("/") + f"/{RUN_ID}") if (USE_UC_VOLUME_OUT and UC_VOLUME_PATH) else OUTPUT_BASE
+def _compute_out_dir():
+    if USE_UC_VOLUME_OUT and UC_VOLUME_PATH:
+        return UC_VOLUME_PATH.rstrip("/") + f"/{RUN_ID}"
+    if OUTPUT_BASE:
+        return OUTPUT_BASE.rstrip("/") + f"/{RUN_ID}"
+    return None
+
+out_dir = _compute_out_dir()
+if WRITE_FILES and out_dir is None:
+    warnings.append("WRITE_FILES requested but no UC_VOLUME_PATH or OUTPUT_BASE provided. File writing disabled (UC-first, no DBFS default).")
+    WRITE_FILES = False
 
 def _safe_write_text(path, txt):
-    """Write text file with error handling"""
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(txt)
+        with open(path, "w", encoding="utf-8") as f: f.write(txt)
         return True
     except Exception as e:
         warnings.append(f"Write failed: {path}: {e}")
         return False
 
 def _safe_write_csv(path, rows, header):
-    """Write CSV file with error handling"""
     try:
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(header)
-            for r in rows:
-                w.writerow(r)
+            for r in rows: w.writerow(r)
         return True
     except Exception as e:
         warnings.append(f"CSV write failed: {path}: {e}")
@@ -1519,204 +1111,93 @@ def _safe_write_csv(path, rows, header):
 if WRITE_FILES:
     try:
         os.makedirs(out_dir, exist_ok=True)
-        if VERBOSE_LOGS:
-            print(f"Output directory: {out_dir}")
+        if VERBOSE_LOGS: print(f"Output directory: {out_dir}")
     except Exception as e:
         errors.append(f"Cannot create output directory: {e}")
         WRITE_FILES = False
-    
+
     if WRITE_FILES:
-        # Write JSON model
         _safe_write_text(f"{out_dir}/data_model.json", json.dumps(model, indent=2))
-        
-        # Write Markdown report
         _safe_write_text(f"{out_dir}/data_model.md", markdown_report)
-        
-        # Write GraphML (IMPROVED XML ESCAPING)
+
         if EMIT_GRAPHML:
-            gml = [
-                '<?xml version="1.0" encoding="UTF-8"?>',
-                '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
-                '  <key id="label" for="edge" attr.name="label" attr.type="string"/>',
-                '  <graph edgedefault="directed">'
-            ]
-            
-            # Nodes
+            gml = ['<?xml version="1.0" encoding="UTF-8"?>',
+                   '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
+                   '  <key id="label" for="edge" attr.name="label" attr.type="string"/>',
+                   '  <graph edgedefault="directed">']
             nodes = sorted([e["name"] for e in model["entities"]])
-            for n in nodes:
-                gml.append(f'    <node id="{xml_escape(n)}"/>')
-            
-            # Edges
+            for n in nodes: gml.append(f'    <node id="{xml_escape(n)}"/>')
             for r in model["relationships"]:
                 edge_label = f"{r['fk_column']}→{r['pk_column']} ({r['score']:.2f})"
                 gml.append(f'    <edge source="{xml_escape(r["fk_table"])}" target="{xml_escape(r["pk_table"])}">')
                 gml.append(f'      <data key="label">{xml_escape(edge_label)}</data>')
                 gml.append('    </edge>')
-            
             gml += ['  </graph>', '</graphml>']
             _safe_write_text(f"{out_dir}/data_model.graphml", "\n".join(gml))
-        
-        # Write CSVs
+
         if WRITE_CSVS:
-            # Entities CSV
-            ent_rows = [
-                (
-                    e["name"], 
-                    e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE"), 
-                    e.get("data_source_format") or "", 
-                    e.get("row_count")
-                ) 
-                for e in model["entities"]
-            ]
+            ent_rows = [(e["name"], e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE"), e.get("data_source_format") or "", e.get("row_count")) for e in model["entities"]]
             _safe_write_csv(f"{out_dir}/entities.csv", ent_rows, ["table", "table_type", "data_source_format", "row_count"])
-            
-            # Columns CSV
+
             col_rows = []
             for e in model["entities"]:
                 for c in e["columns"]:
-                    col_rows.append([
-                        e["name"], 
-                        c["name"], 
-                        c["type"], 
-                        c["family"], 
-                        c["nullable"],
-                        c.get("approx_distinct"), 
-                        c.get("null_ratio"),
-                        c.get("candidate_pk"), 
-                        c.get("candidate_fk"),
-                        c.get("inferred_datetime_format") or "", 
-                        c.get("inferred_datetime_support") or ""
-                    ])
-            _safe_write_csv(
-                f"{out_dir}/columns.csv", 
-                col_rows, 
-                ["table", "column", "type", "family", "nullable", "approx_distinct", "null_ratio", 
-                 "candidate_pk", "candidate_fk", "inferred_datetime_format", "format_support"]
-            )
-            
-            # Relationships CSV
-            rel_rows = [
-                (
-                    r["fk_table"], 
-                    r["fk_column"], 
-                    r["pk_table"], 
-                    r["pk_column"], 
-                    r["score"], 
-                    r.get("declared", False), 
-                    r.get("cardinality", "many-to-one")
-                ) 
-                for r in model["relationships"]
-            ]
-            _safe_write_csv(
-                f"{out_dir}/relationships.csv", 
-                rel_rows, 
-                ["fk_table", "fk_column", "pk_table", "pk_column", "score", "declared", "cardinality"]
-            )
-        
-        # Write run manifest
+                    col_rows.append([e["name"], c["name"], c["type"], c["family"], c["nullable"],
+                                     c.get("approx_distinct"), c.get("null_ratio"),
+                                     c.get("candidate_pk"), c.get("candidate_fk"),
+                                     c.get("inferred_datetime_format") or "", c.get("inferred_datetime_support") or ""])
+            _safe_write_csv(f"{out_dir}/columns.csv", col_rows, ["table","column","type","family","nullable","approx_distinct","null_ratio","candidate_pk","candidate_fk","inferred_datetime_format","format_support"])
+
+            rel_rows = [(r["fk_table"], r["fk_column"], r["pk_table"], r["pk_column"], r["score"], r.get("declared", False), r.get("cardinality","many-to-one")) for r in model["relationships"]]
+            _safe_write_csv(f"{out_dir}/relationships.csv", rel_rows, ["fk_table","fk_column","pk_table","pk_column","score","declared","cardinality"])
+
         manifest = {
-            "version": VERSION,
-            "author": AUTHOR,
-            "run_id": RUN_ID,
-            "namespace": model["namespace"],
+            "version": VERSION, "author": AUTHOR, "run_id": RUN_ID, "namespace": model["namespace"],
             "counts": {
-                "tables": len(model["entities"]),
-                "relationships": len(model["relationships"]),
+                "tables": len(model["entities"]), "relationships": len(model["relationships"]),
                 "declared_relationships": len([r for r in model["relationships"] if r.get("declared")]),
                 "inferred_relationships": len([r for r in model["relationships"] if not r.get("declared")]),
-                "warnings": len(warnings),
-                "errors": len(errors),
+                "warnings": len(warnings), "errors": len(errors),
             },
             "params": {
-                "FAST_MODE": FAST_MODE,
-                "ENABLE_VALUE_OVERLAP": ENABLE_VALUE_OVERLAP,
-                "ENABLE_COMPOSITE_FK_INFERENCE": ENABLE_COMPOSITE_FK_INFERENCE,
-                "INCLUDE_EXAMPLES": INCLUDE_EXAMPLES,
-                "ROW_SAMPLE_FRACTION": ROW_SAMPLE_FRACTION,
-                "ROW_SAMPLE_MAX": ROW_SAMPLE_MAX,
-                "NULLABILITY_SAMPLE_ROWS": NULLABILITY_SAMPLE_ROWS,
-                "VALUE_OVERLAP_SAMPLE_ROWS": VALUE_OVERLAP_SAMPLE_ROWS,
-                "DISTINCT_COUNT_CAP": DISTINCT_COUNT_CAP,
-                "MIN_REL_SCORE": MIN_REL_SCORE,
-                "TOP_PK_CANDIDATES": TOP_PK_CANDIDATES,
-                "MAX_COMPOSITE_K": MAX_COMPOSITE_K,
-                "MAX_TABLES": MAX_TABLES,
-                "EMIT_GRAPHML": EMIT_GRAPHML,
-                "EMIT_MERMAID": EMIT_MERMAID,
-                "MAX_MERMAID_TABLES": MAX_MERMAID_TABLES,
-                "MERMAID_MAX_COLUMNS": MERMAID_MAX_COLUMNS,
-                "MD_TRUNCATE_TYPE_CHARS": MD_TRUNCATE_TYPE_CHARS,
-                "DATETIME_SUPPORT_MIN": DATETIME_SUPPORT_MIN,
-                "VERBOSE_LOGS": VERBOSE_LOGS,
-                "WRITE_CSVS": WRITE_CSVS,
-                "WRITE_DELTA_SUMMARY": WRITE_DELTA_SUMMARY
+                "FAST_MODE": FAST_MODE, "ENABLE_VALUE_OVERLAP": ENABLE_VALUE_OVERLAP,
+                "ENABLE_COMPOSITE_FK_INFERENCE": ENABLE_COMPOSITE_FK_INFERENCE, "INCLUDE_EXAMPLES": INCLUDE_EXAMPLES,
+                "ROW_SAMPLE_FRACTION": ROW_SAMPLE_FRACTION, "ROW_SAMPLE_MAX": ROW_SAMPLE_MAX,
+                "NULLABILITY_SAMPLE_ROWS": NULLABILITY_SAMPLE_ROWS, "VALUE_OVERLAP_SAMPLE_ROWS": VALUE_OVERLAP_SAMPLE_ROWS,
+                "DISTINCT_COUNT_CAP": DISTINCT_COUNT_CAP, "MIN_REL_SCORE": MIN_REL_SCORE,
+                "TOP_PK_CANDIDATES": TOP_PK_CANDIDATES, "MAX_COMPOSITE_K": MAX_COMPOSITE_K, "MAX_TABLES": MAX_TABLES,
+                "EMIT_GRAPHML": EMIT_GRAPHML, "EMIT_MERMAID": EMIT_MERMAID, "MAX_MERMAID_TABLES": MAX_MERMAID_TABLES,
+                "MERMAID_MAX_COLUMNS": MERMAID_MAX_COLUMNS, "MD_TRUNCATE_TYPE_CHARS": MD_TRUNCATE_TYPE_CHARS,
+                "DATETIME_SUPPORT_MIN": DATETIME_SUPPORT_MIN, "VERBOSE_LOGS": VERBOSE_LOGS,
+                "WRITE_CSVS": WRITE_CSVS, "WRITE_DELTA_SUMMARY": WRITE_DELTA_SUMMARY,
+                "SESSION_TIMEZONE": SESSION_TIMEZONE_EFFECTIVE
             },
-            "output_dir": out_dir,
-            "spark_env": model["spark_env"],
+            "output_dir": out_dir, "spark_env": model["spark_env"],
             "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
-            "warnings": warnings[:100],  # Limit in manifest
-            "errors": errors
+            "warnings": warnings[:100], "errors": errors
         }
         _safe_write_text(f"{out_dir}/run_manifest.json", json.dumps(manifest, indent=2))
 
-# Optional Delta summary tables
+# =========================
+# OPTIONAL DELTA SUMMARY
+# =========================
 if WRITE_DELTA_SUMMARY and WRITE_FILES:
     try:
-        # Columns table
         cols_rows = []
         for e in model["entities"]:
             for c in e["columns"]:
-                cols_rows.append((
-                    RUN_ID, 
-                    e["name"], 
-                    e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE"),
-                    c["name"], 
-                    c["type"], 
-                    c["family"], 
-                    c["nullable"],
-                    c.get("approx_distinct"), 
-                    c.get("null_ratio"),
-                    c.get("candidate_pk"), 
-                    c.get("candidate_fk"),
-                    c.get("inferred_datetime_format") or None
-                ))
-        
-        # Relationships table
-        rel_rows = [
-            (
-                RUN_ID, 
-                r["fk_table"], 
-                r["fk_column"], 
-                r["pk_table"], 
-                r["pk_column"], 
-                r["score"], 
-                r.get("declared", False), 
-                r.get("cardinality", "many-to-one")
-            ) 
-            for r in model["relationships"]
-        ]
-        
-        # Create DataFrames
-        df_cols = spark.createDataFrame(
-            cols_rows, 
-            schema="run_id string, table string, table_type string, column string, type string, "
-                   "family string, nullable boolean, approx_distinct long, null_ratio double, "
-                   "candidate_pk boolean, candidate_fk boolean, inferred_datetime_format string"
-        )
-        
-        df_rels = spark.createDataFrame(
-            rel_rows, 
-            schema="run_id string, fk_table string, fk_column string, pk_table string, "
-                   "pk_column string, score double, declared boolean, cardinality string"
-        )
-        
-        # Write to Delta
-        out_delta_base = out_dir.replace("/dbfs", "") if out_dir.startswith("/dbfs") else out_dir
+                cols_rows.append((RUN_ID, e["name"], e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE"),
+                                  c["name"], c["type"], c["family"], c["nullable"],
+                                  c.get("approx_distinct"), c.get("null_ratio"),
+                                  c.get("candidate_pk"), c.get("candidate_fk"),
+                                  c.get("inferred_datetime_format") or None))
+        rel_rows = [(RUN_ID, r["fk_table"], r["fk_column"], r["pk_table"], r["pk_column"], r["score"], r.get("declared", False), r.get("cardinality","many-to-one")) for r in model["relationships"]]
+        df_cols = spark.createDataFrame(cols_rows, schema="run_id string, table string, table_type string, column string, type string, family string, nullable boolean, approx_distinct long, null_ratio double, candidate_pk boolean, candidate_fk boolean, inferred_datetime_format string")
+        df_rels = spark.createDataFrame(rel_rows, schema="run_id string, fk_table string, fk_column string, pk_table string, pk_column string, score double, declared boolean, cardinality string")
+        out_delta_base = out_dir
         df_cols.write.mode("overwrite").format("delta").save(out_delta_base + "/delta_columns")
         df_rels.write.mode("overwrite").format("delta").save(out_delta_base + "/delta_relationships")
-        
-        if VERBOSE_LOGS:
-            print(f"Delta tables written to: {out_delta_base}")
+        if VERBOSE_LOGS: print(f"Delta tables written to: {out_delta_base}")
     except Exception as e:
         warnings.append(f"Delta summary write failed: {e}")
         errors.append(f"Could not write Delta tables: {e}")
@@ -1734,22 +1215,17 @@ if VERBOSE_LOGS:
     print(f"Relationships found: {len(model['relationships'])}")
     print(f"Warnings: {len(warnings)}")
     print(f"Errors: {len(errors)}")
-
     if WRITE_FILES:
         print(f"\nOutput directory: {out_dir}")
         print("Files generated:")
         print("  - data_model.json (complete model)")
         print("  - data_model.md (human-readable report)")
-        if EMIT_GRAPHML:
-            print("  - data_model.graphml (graph format)")
-        if WRITE_CSVS:
-            print("  - entities.csv, columns.csv, relationships.csv")
-        if WRITE_DELTA_SUMMARY:
-            print("  - Delta tables: delta_columns, delta_relationships")
+        if EMIT_GRAPHML: print("  - data_model.graphml (graph format)")
+        if WRITE_CSVS: print("  - entities.csv, columns.csv, relationships.csv")
+        if WRITE_DELTA_SUMMARY: print("  - Delta tables: delta_columns, delta_relationships")
         print("  - run_manifest.json (execution metadata)")
     else:
-        print("\nFile writing disabled. Set WRITE_FILES=true to save outputs.")
-
+        print("\nFile writing disabled. Provide UC_VOLUME_PATH or OUTPUT_BASE to enable writes.")
     print("\n" + "="*80)
     print("MARKDOWN REPORT PREVIEW (first 4000 chars)")
     print("="*80 + "\n")
@@ -1758,7 +1234,6 @@ if VERBOSE_LOGS:
         print(f"\n... ({len(markdown_report) - 4000} more characters)")
     print("\n" + "="*80)
 
-# Display any critical errors
 if errors and VERBOSE_LOGS:
     print("\n⚠️  CRITICAL ERRORS:")
     for e in errors:
