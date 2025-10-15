@@ -1,20 +1,20 @@
 # Databricks / PySpark
 # Universal ERD & Data Model Generator (Unity Catalog–first)
 # Author: Joshua Williamson
-# Version: 1.9.3 (UC-safe outputs + timezone fix + best-of-both)
+# Version: 1.9.4 (Performance optimized for UC on AWS E2)
 # ------------------------------------------------------------------------------------
 # This version:
-# - Prefers Unity Catalog Volumes for outputs (no DBFS default). Files are written only if:
-#     (a) USE_UC_VOLUME_OUTPUT=true and UC_VOLUME_PATH is provided, or
-#     (b) OUTPUT_BASE is explicitly set to a valid absolute path (e.g., /Volumes/... or /dbfs/...)
-# - Adds SESSION_TIMEZONE widget + safe setter; fixes "Invalid_conf_value ... timeZone=unknown".
-# - Retains 1.9.2 hardening and “best-of-both” improvements (stable overlap cache key, config caps, etc.).
+# - Major performance improvements: reduced sampling, batch processing, progress tracking
+# - Datetime detection disabled by default (enable only when needed)
+# - Optimized for Unity Catalog on Databricks 15.4 LTS
+# - Intelligent caching and timeout mechanisms
+# - Prefers Unity Catalog Volumes for outputs (no DBFS default)
 # ------------------------------------------------------------------------------------
 
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from pyspark.sql.utils import AnalysisException
-import sys, json, re, datetime, math, itertools, uuid, os, csv, html
+import sys, json, re, datetime, math, itertools, uuid, os, csv, html, time
 from typing import Dict, Any, List, Tuple, Optional
 
 # =========================
@@ -49,10 +49,11 @@ widgets_created_any |= _mk_widget("ENABLE_VALUE_OVERLAP", "false", "Compute FK�
 widgets_created_any |= _mk_widget("ENABLE_COMPOSITE_FK_INFERENCE", "false", "Try composite FK inference? (true/false)")
 widgets_created_any |= _mk_widget("INCLUDE_EXAMPLES", "false", "Include sample rows? (true/false)")
 
-widgets_created_any |= _mk_widget("ROW_SAMPLE_FRACTION", "0.10", "Sample fraction [0..1]")
-widgets_created_any |= _mk_widget("ROW_SAMPLE_MAX", "500000", "Row cap per table")
-widgets_created_any |= _mk_widget("NULLABILITY_SAMPLE_ROWS", "300000", "Rows for null ratio")
-widgets_created_any |= _mk_widget("VALUE_OVERLAP_SAMPLE_ROWS", "150000", "Rows for value overlap")
+# Performance-optimized sampling defaults
+widgets_created_any |= _mk_widget("ROW_SAMPLE_FRACTION", "0.05", "Sample fraction [0..1]")
+widgets_created_any |= _mk_widget("ROW_SAMPLE_MAX", "100000", "Row cap per table")
+widgets_created_any |= _mk_widget("NULLABILITY_SAMPLE_ROWS", "50000", "Rows for null ratio")
+widgets_created_any |= _mk_widget("VALUE_OVERLAP_SAMPLE_ROWS", "50000", "Rows for value overlap")
 widgets_created_any |= _mk_widget("DISTINCT_COUNT_CAP", "5000000", "High distinct cap (hint)")
 
 widgets_created_any |= _mk_widget("MIN_REL_SCORE", "0.55", "Min inferred relationship score")
@@ -73,11 +74,19 @@ widgets_created_any |= _mk_widget("MAX_MERMAID_TABLES", "150", "Mermaid render t
 # UX toggles
 widgets_created_any |= _mk_widget("MERMAID_MAX_COLUMNS", "20", "Max columns per entity in Mermaid (-1 for unlimited)")
 widgets_created_any |= _mk_widget("MD_TRUNCATE_TYPE_CHARS", "30", "Max type chars in Markdown (-1 for unlimited)")
-widgets_created_any |= _mk_widget("DATETIME_SUPPORT_MIN", "0.50", "Min support to emit datetime pattern [0..1]")
-widgets_created_any |= _mk_widget("VERBOSE_LOGS", "true", "Print verbose run summary? (true/false)")
 
+# Performance: datetime detection disabled by default, much smaller samples
+widgets_created_any |= _mk_widget("ENABLE_DATETIME_DETECTION", "false", "Detect datetime patterns in strings? (slow)")
+widgets_created_any |= _mk_widget("DATETIME_SAMPLE_SIZE", "100", "Rows to sample for datetime detection")
+widgets_created_any |= _mk_widget("DATETIME_SUPPORT_MIN", "0.50", "Min support to emit datetime pattern [0..1]")
+
+widgets_created_any |= _mk_widget("VERBOSE_LOGS", "true", "Print verbose run summary? (true/false)")
 widgets_created_any |= _mk_widget("WRITE_CSVS", "true", "Emit CSVs (entities/columns/relationships)?")
 widgets_created_any |= _mk_widget("WRITE_DELTA_SUMMARY", "false", "Write a Delta summary table (columns, relationships)?")
+
+# Performance controls
+widgets_created_any |= _mk_widget("SKIP_INFORMATION_SCHEMA", "false", "Skip UC information_schema queries? (true/false)")
+widgets_created_any |= _mk_widget("MAX_RUNTIME_MINUTES", "30", "Max runtime before timeout (minutes)")
 
 # Timezone safety
 widgets_created_any |= _mk_widget("SESSION_TIMEZONE", "UTC", "Spark SQL session time zone (IANA)")
@@ -111,10 +120,14 @@ PLACEHOLDERS = {
     "MAX_MERMAID_TABLES": "{{MAX_MERMAID_TABLES}}",
     "MERMAID_MAX_COLUMNS": "{{MERMAID_MAX_COLUMNS}}",
     "MD_TRUNCATE_TYPE_CHARS": "{{MD_TRUNCATE_TYPE_CHARS}}",
+    "ENABLE_DATETIME_DETECTION": "{{ENABLE_DATETIME_DETECTION}}",
+    "DATETIME_SAMPLE_SIZE": "{{DATETIME_SAMPLE_SIZE}}",
     "DATETIME_SUPPORT_MIN": "{{DATETIME_SUPPORT_MIN}}",
     "VERBOSE_LOGS": "{{VERBOSE_LOGS}}",
     "WRITE_CSVS": "{{WRITE_CSVS}}",
     "WRITE_DELTA_SUMMARY": "{{WRITE_DELTA_SUMMARY}}",
+    "SKIP_INFORMATION_SCHEMA": "{{SKIP_INFORMATION_SCHEMA}}",
+    "MAX_RUNTIME_MINUTES": "{{MAX_RUNTIME_MINUTES}}",
     "SESSION_TIMEZONE": "{{SESSION_TIMEZONE}}",
 }
 
@@ -158,10 +171,10 @@ ENABLE_VALUE_OVERLAP  = _to_bool(_get_env("ENABLE_VALUE_OVERLAP", "false")) and 
 ENABLE_COMPOSITE_FK_INFERENCE = _to_bool(_get_env("ENABLE_COMPOSITE_FK_INFERENCE", "false")) and not FAST_MODE
 INCLUDE_EXAMPLES      = _to_bool(_get_env("INCLUDE_EXAMPLES", "false"))
 
-ROW_SAMPLE_FRACTION       = _to_float(_get_env("ROW_SAMPLE_FRACTION", "0.10"), 0.10)
-ROW_SAMPLE_MAX            = _to_int(_get_env("ROW_SAMPLE_MAX", "500000"), 500000)
-NULLABILITY_SAMPLE_ROWS   = _to_int(_get_env("NULLABILITY_SAMPLE_ROWS", "300000"), 300000)
-VALUE_OVERLAP_SAMPLE_ROWS = _to_int(_get_env("VALUE_OVERLAP_SAMPLE_ROWS", "150000"), 150000)
+ROW_SAMPLE_FRACTION       = _to_float(_get_env("ROW_SAMPLE_FRACTION", "0.05"), 0.05)
+ROW_SAMPLE_MAX            = _to_int(_get_env("ROW_SAMPLE_MAX", "100000"), 100000)
+NULLABILITY_SAMPLE_ROWS   = _to_int(_get_env("NULLABILITY_SAMPLE_ROWS", "50000"), 50000)
+VALUE_OVERLAP_SAMPLE_ROWS = _to_int(_get_env("VALUE_OVERLAP_SAMPLE_ROWS", "50000"), 50000)
 DISTINCT_COUNT_CAP        = _to_int(_get_env("DISTINCT_COUNT_CAP", "5000000"), 5000000)
 
 MIN_REL_SCORE       = _to_float(_get_env("MIN_REL_SCORE", "0.55"), 0.55)
@@ -180,17 +193,22 @@ MAX_MERMAID_TABLES  = _to_int(_get_env("MAX_MERMAID_TABLES", "150"), 150)
 
 MERMAID_MAX_COLUMNS       = _to_int(_get_env("MERMAID_MAX_COLUMNS", "20"), 20)
 MD_TRUNCATE_TYPE_CHARS    = _to_int(_get_env("MD_TRUNCATE_TYPE_CHARS", "30"), 30)
+ENABLE_DATETIME_DETECTION = _to_bool(_get_env("ENABLE_DATETIME_DETECTION", "false"))
+DATETIME_SAMPLE_SIZE      = _to_int(_get_env("DATETIME_SAMPLE_SIZE", "100"), 100)
 DATETIME_SUPPORT_MIN      = _to_float(_get_env("DATETIME_SUPPORT_MIN", "0.50"), 0.50)
 VERBOSE_LOGS              = _to_bool(_get_env("VERBOSE_LOGS", "true"))
 
 WRITE_CSVS          = _to_bool(_get_env("WRITE_CSVS", "true"))
 WRITE_DELTA_SUMMARY = _to_bool(_get_env("WRITE_DELTA_SUMMARY", "false"))
 
+SKIP_INFORMATION_SCHEMA = _to_bool(_get_env("SKIP_INFORMATION_SCHEMA", "false"))
+MAX_RUNTIME_MINUTES     = _to_int(_get_env("MAX_RUNTIME_MINUTES", "30"), 30)
+
 SESSION_TIMEZONE_CFG = _get_env("SESSION_TIMEZONE", "UTC") or "UTC"
 
 RUN_ID   = _run_id
-VERSION  = "1.9.3"
-AUTHOR   = "Joshua Williamson (UC-safe)"
+VERSION  = "1.9.4"
+AUTHOR   = "Joshua Williamson (UC-safe, performance optimized)"
 
 # =========================
 # VALIDATION
@@ -457,6 +475,12 @@ def ns_tables_legacy(database: str) -> List[str]:
         errors.append(f"Unexpected error discovering tables in {database}: {e}")
         return []
 
+print("="*80)
+print(f"Starting ERD Generation v{VERSION}")
+print(f"Run ID: {RUN_ID}")
+print("="*80)
+
+start_time = time.time()
 tables = ns_tables_legacy(DATABASE) if USE_LEGACY_DATABASE else ns_tables_uc(CATALOG, SCHEMA)
 tables = [t for t in tables if is_included(t)]
 if not tables:
@@ -464,24 +488,43 @@ if not tables:
     if VERBOSE_LOGS:
         print("ERROR: No tables discovered. Check your catalog/schema/database configuration.")
 
+print(f"Discovered {len(tables)} tables in {time.time()-start_time:.1f}s")
+
+# =========================
+# TABLE OVERVIEW (OPTIMIZED)
+# =========================
 table_overview = {}
-if not USE_LEGACY_DATABASE and tables:
+if not USE_LEGACY_DATABASE and tables and not SKIP_INFORMATION_SCHEMA:
     try:
+        print("Querying information_schema.tables...")
+        ist_start = time.time()
         ist = spark.sql(f"""
             SELECT table_name, table_type, data_source_format
             FROM {fq_identifier(CATALOG)}.information_schema.tables
             WHERE table_schema = '{SCHEMA}'
-        """)
+        """).cache()
+        
         for r in ist.collect():
-            table_overview[f"{CATALOG}.{SCHEMA}.{r.table_name}"] = {"table_type": r.table_type, "data_source_format": r.data_source_format}
+            table_overview[f"{CATALOG}.{SCHEMA}.{r.table_name}"] = {
+                "table_type": r.table_type, 
+                "data_source_format": r.data_source_format
+            }
+        ist.unpersist()
+        print(f"information_schema query completed in {time.time()-ist_start:.1f}s")
     except Exception as e:
-        warnings.append(f"information_schema.tables not accessible: {e}")
+        warnings.append(f"information_schema.tables not accessible (continuing without): {e}")
 
+# =========================
+# DECLARED CONSTRAINTS (OPTIMIZED)
+# =========================
 declared_constraints = {"pk": {}, "fk": [], "check": []}
-if not USE_LEGACY_DATABASE and tables:
+if not USE_LEGACY_DATABASE and tables and not SKIP_INFORMATION_SCHEMA:
     try:
-        is_tc  = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.table_constraints WHERE table_schema = '{SCHEMA}'")
-        is_kcu = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.key_column_usage WHERE table_schema = '{SCHEMA}'")
+        print("Querying declared constraints...")
+        const_start = time.time()
+        is_tc  = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.table_constraints WHERE table_schema = '{SCHEMA}'").cache()
+        is_kcu = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.key_column_usage WHERE table_schema = '{SCHEMA}'").cache()
+        
         pk_names = [r.constraint_name for r in is_tc.filter(F.col("constraint_type")=="PRIMARY KEY").select("constraint_name").distinct().collect()]
         for pk in pk_names:
             cols = [r.column_name for r in is_kcu.filter(F.col("constraint_name")==pk).orderBy("ordinal_position").select("column_name").collect()]
@@ -489,7 +532,8 @@ if not USE_LEGACY_DATABASE and tables:
             if tbl and cols:
                 full = f"{CATALOG}.{SCHEMA}.{tbl.table_name}"
                 declared_constraints["pk"][full] = cols
-        is_rc  = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.referential_constraints WHERE constraint_schema = '{SCHEMA}'")
+        
+        is_rc  = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.referential_constraints WHERE constraint_schema = '{SCHEMA}'").cache()
         fk_rows = is_tc.filter(F.col("constraint_type")=="FOREIGN KEY").select("constraint_name","table_name").collect()
         for r in fk_rows:
             fk_name = r.constraint_name
@@ -504,12 +548,19 @@ if not USE_LEGACY_DATABASE and tables:
                     pk_cols = [x.column_name for x in is_kcu.filter(F.col("constraint_name")==pk_name).orderBy("ordinal_position").select("column_name").collect()]
                     if fk_cols and pk_cols:
                         declared_constraints["fk"].append({"fk_table": fk_tbl, "fk_cols": fk_cols, "pk_table": pk_tbl, "pk_cols": pk_cols, "name": fk_name})
+        
         try:
             is_cc = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.check_constraints WHERE constraint_schema = '{SCHEMA}'")
             for r in is_cc.collect():
                 declared_constraints["check"].append({"constraint_name": r.constraint_name, "check_clause": r.check_clause})
         except Exception:
             pass
+        
+        is_tc.unpersist()
+        is_kcu.unpersist()
+        is_rc.unpersist()
+        print(f"Constraint discovery completed in {time.time()-const_start:.1f}s")
+        print(f"  - PKs: {len(declared_constraints['pk'])}, FKs: {len(declared_constraints['fk'])}, Checks: {len(declared_constraints['check'])}")
     except Exception as e:
         warnings.append(f"information_schema constraint discovery limited/unavailable: {e}")
 
@@ -528,17 +579,35 @@ def get_row_count_fast(t: str, df) -> Optional[int]:
     return None
 
 entities: Dict[str, Dict[str, Any]] = {}
-for t in tables:
+print("\nPhase 1: Gathering table metadata...")
+meta_start = time.time()
+
+for idx, t in enumerate(tables, 1):
+    # Progress tracking
+    if VERBOSE_LOGS and idx % 5 == 0:
+        elapsed = time.time() - meta_start
+        rate = idx / elapsed if elapsed > 0 else 0
+        est_remaining = (len(tables) - idx) / rate if rate > 0 else 0
+        print(f"  [{idx}/{len(tables)}] Processing {t} - {elapsed:.1f}s elapsed, ~{est_remaining:.1f}s remaining")
+    
+    # Timeout check
+    if (time.time() - start_time) > (MAX_RUNTIME_MINUTES * 60):
+        warnings.append(f"Exceeded MAX_RUNTIME_MINUTES ({MAX_RUNTIME_MINUTES}), stopping table discovery early")
+        tables = tables[:idx]
+        break
+    
     df = safe_table(t)
     if df is None:
         entities[t] = {"table": t, "columns": [], "row_count": None, "props": {}, "is_view": False, "partial": True}
         continue
+    
     props = {}
     try:
         desc = spark.sql(f"DESCRIBE EXTENDED {fq_table(t)}").collect()
         props = {r.col_name: r.data_type for r in desc if r.col_name and r.col_name != ""}
     except Exception as e:
         warnings.append(f"DESCRIBE EXTENDED failed for {t}: {e}")
+    
     cols = []
     for f in df.schema.fields:
         fam = dtype_family(f.dataType)
@@ -550,6 +619,7 @@ for t in tables:
             struct_fields = struct_fields[:200]
         except Exception as e:
             warnings.append(f"Schema walking failed for {t}.{f.name}: {e}")
+        
         cols.append({
             "name": f.name,
             "data_type": f.dataType.simpleString(),
@@ -561,6 +631,7 @@ for t in tables:
             "array_guidance": array_guidance(f.dataType),
             "map_guidance": map_guidance(f.dataType),
         })
+    
     rc = get_row_count_fast(t, df)
     is_view = "Type" in props and "VIEW" in str(props.get("Type","")).upper()
     ov = table_overview.get(t, {})
@@ -575,8 +646,10 @@ for t in tables:
         "partial": False
     }
 
+print(f"Phase 1 completed in {time.time()-meta_start:.1f}s")
+
 # =========================
-# STATS + DATETIME INFERENCE
+# STATS + DATETIME INFERENCE (OPTIMIZED)
 # =========================
 value_sets_cache = {}
 
@@ -615,18 +688,37 @@ def collect_examples(df, cols, n=3):
     except Exception:
         return []
 
-for t, meta in entities.items():
+print("\nPhase 2: Computing statistics and datetime patterns...")
+stats_start = time.time()
+
+for idx, (t, meta) in enumerate(entities.items(), 1):
+    # Progress tracking
+    if VERBOSE_LOGS and idx % 5 == 0:
+        elapsed = time.time() - stats_start
+        rate = idx / elapsed if elapsed > 0 else 0
+        est_remaining = (len(entities) - idx) / rate if rate > 0 else 0
+        print(f"  [{idx}/{len(entities)}] Stats for {t} - {elapsed:.1f}s elapsed, ~{est_remaining:.1f}s remaining")
+    
+    # Timeout check
+    if (time.time() - start_time) > (MAX_RUNTIME_MINUTES * 60):
+        warnings.append(f"Exceeded MAX_RUNTIME_MINUTES ({MAX_RUNTIME_MINUTES}), stopping stats computation early")
+        break
+    
     df = safe_table(t)
     if df is None or len(meta["columns"]) == 0:
         meta["stats"] = {"null_ratio": {}, "approx_distinct": {}, "examples": []}
         meta["datetime_inference"] = {}
         continue
+    
+    # Adaptive sampling for very large tables
     eff_frac = ROW_SAMPLE_FRACTION
     if meta["row_count"] and meta["row_count"] > 50_000_000:
         eff_frac = min(eff_frac, 0.03)
+    
     s_df = sample_df(df, NULLABILITY_SAMPLE_ROWS, eff_frac)
     null_ratio, approx_distinct, ex_rows, dt_info = {}, {}, [], {}
 
+    # NULL RATIO
     try:
         if s_df is not None:
             exprs = [F.avg(F.when(F.col(c["name"]).isNull(), 1).otherwise(0)).alias(c["name"]) for c in meta["columns"]]
@@ -635,45 +727,62 @@ for t, meta in entities.items():
     except Exception as e:
         warnings.append(f"Null ratio calculation failed for {t}: {e}")
 
+    # APPROX DISTINCT (BATCHED FOR PERFORMANCE)
     try:
         if not FAST_MODE and df is not None:
-            exprs = [approx_distinct_expr(c["name"]) for c in meta["columns"] if c["family"] in {"integral","decimal","floating","stringy","dates","boolean"}]
-            if exprs:
-                row = df.select(*exprs).first()
-                if row: approx_distinct = row.asDict()
+            eligible_cols = [c["name"] for c in meta["columns"] 
+                            if c["family"] in {"integral","decimal","floating","stringy","dates","boolean"}]
+            if eligible_cols:
+                # Process in batches of 50 to avoid huge queries
+                for i in range(0, len(eligible_cols), 50):
+                    batch = eligible_cols[i:i+50]
+                    exprs = [approx_distinct_expr(cname) for cname in batch]
+                    row = df.select(*exprs).first()
+                    if row:
+                        approx_distinct.update(row.asDict())
     except Exception as e:
         warnings.append(f"Approx distinct calculation failed for {t}: {e}")
 
+    # EXAMPLES
     ex_rows = collect_examples(df, [c["name"] for c in meta["columns"]], 3)
 
-    for f in meta["columns"]:
-        cname, fam = f["name"], f["family"]
-        fmt, support, counts = None, 0.0, None
-        try:
-            if fam == "dates":
-                fmt = "spark_date_or_timestamp"; support = 1.0
-            elif fam == "stringy" and s_df is not None:
-                try:
-                    rows = s_df.select(F.col(cname)).where(F.col(cname).isNotNull()).limit(2000).collect()
-                    sample_vals = [str(v[0]) for v in rows if v[0] is not None]
-                    fmt, support, counts = detect_string_datetime_format(sample_vals)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        if fmt and support >= DATETIME_SUPPORT_MIN:
-            dt_info[cname] = {
-                "inferred_format": fmt,
-                "support_fraction": round(float(support), 3),
-                "pattern_counts": counts,
-                "parse_howto": ("STRING→to_date/to_timestamp with detected pattern; "
-                                "epoch_seconds→to_timestamp(col); epoch_millis→to_timestamp(col/1000.0). "
-                                "DATE/TIMESTAMP are typed; use date_format for display.")
-            }
+    # DATETIME DETECTION (ONLY IF ENABLED, MUCH SMALLER SAMPLES)
+    if ENABLE_DATETIME_DETECTION and not FAST_MODE:
+        for f in meta["columns"]:
+            cname, fam = f["name"], f["family"]
+            fmt, support, counts = None, 0.0, None
+            try:
+                if fam == "dates":
+                    fmt = "spark_date_or_timestamp"
+                    support = 1.0
+                elif fam == "stringy" and s_df is not None:
+                    try:
+                        # MUCH SMALLER sample for datetime detection
+                        rows = s_df.select(F.col(cname)).where(F.col(cname).isNotNull()).limit(DATETIME_SAMPLE_SIZE).collect()
+                        sample_vals = [str(v[0]) for v in rows if v[0] is not None]
+                        if len(sample_vals) >= 10:  # Only detect if sufficient samples
+                            fmt, support, counts = detect_string_datetime_format(sample_vals)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            
+            if fmt and support >= DATETIME_SUPPORT_MIN:
+                dt_info[cname] = {
+                    "inferred_format": fmt,
+                    "support_fraction": round(float(support), 3),
+                    "pattern_counts": counts,
+                    "parse_howto": ("STRING→to_date/to_timestamp with detected pattern; "
+                                    "epoch_seconds→to_timestamp(col); epoch_millis→to_timestamp(col/1000.0). "
+                                    "DATE/TIMESTAMP are typed; use date_format for display.")
+                }
 
     meta["stats"] = {"null_ratio": null_ratio, "approx_distinct": approx_distinct, "examples": ex_rows}
     meta["datetime_inference"] = dt_info
 
+print(f"Phase 2 completed in {time.time()-stats_start:.1f}s")
+
+# Enrich column metadata
 for t, meta in entities.items():
     nr = meta["stats"].get("null_ratio", {})
     ad = meta["stats"].get("approx_distinct", {})
@@ -691,6 +800,9 @@ for t, meta in entities.items():
 # =========================
 # PK/FK CANDIDATES + COMPOSITES
 # =========================
+print("\nPhase 3: Identifying PK/FK candidates...")
+pk_start = time.time()
+
 def is_candidate_pk(col_meta, row_count):
     if row_count in (None, 0): return (False, 0.0)
     s = 0.0
@@ -719,6 +831,7 @@ for t, meta in entities.items():
         c["candidate_fk"] = fkf
         c["candidate_fk_score"] = fks
 
+# Apply declared constraints
 for tbl, cols in declared_constraints["pk"].items():
     if tbl in entities:
         for c in entities[tbl]["columns"]:
@@ -774,11 +887,18 @@ for t, meta in entities.items():
     else:
         pk_registry[t] = []
 
+print(f"Phase 3 completed in {time.time()-pk_start:.1f}s")
+print(f"  - Identified PKs for {len([k for k,v in pk_registry.items() if v])} tables")
+
 # =========================
 # RELATIONSHIPS
 # =========================
+print("\nPhase 4: Inferring relationships...")
+rel_start = time.time()
+
 relationships = []
 
+# Declared relationships
 for fk in declared_constraints["fk"]:
     fk_cols_str = " + ".join(fk["fk_cols"]) if len(fk["fk_cols"]) > 1 else fk["fk_cols"][0] if fk["fk_cols"] else "UNKNOWN"
     pk_cols_str = " + ".join(fk["pk_cols"]) if len(fk["pk_cols"]) > 1 else fk["pk_cols"][0] if fk["pk_cols"] else "UNKNOWN"
@@ -797,6 +917,8 @@ for fk in declared_constraints["fk"]:
         "join_example_sql": join_sql, "join_example_pyspark": join_pyspark
     })
 
+# Inferred relationships
+rel_checked = 0
 for fk_table, fk_meta in entities.items():
     df_fk = safe_table(fk_table)
     for fk_col in [c for c in fk_meta["columns"] if c.get("candidate_fk")]:
@@ -805,6 +927,13 @@ for fk_table, fk_meta in entities.items():
             if not pk_cols: continue
             if any(r.get("declared") and r["fk_table"] == fk_table and r["pk_table"] == pk_table for r in relationships):
                 continue
+            
+            # Timeout check
+            rel_checked += 1
+            if rel_checked % 100 == 0 and (time.time() - start_time) > (MAX_RUNTIME_MINUTES * 60):
+                warnings.append(f"Exceeded MAX_RUNTIME_MINUTES ({MAX_RUNTIME_MINUTES}), stopping relationship inference early")
+                break
+            
             best_name, best_score, best_ev = None, 0.0, None
             for pk_name in pk_cols:
                 pk_col = next((c for c in entities[pk_table]["columns"] if c["name"] == pk_name), None)
@@ -849,6 +978,7 @@ for fk_table, fk_meta in entities.items():
                     "join_example_pyspark": f"fk.join(pk, F.col('f.`{fk_name}`') == F.col('p.`{best_name}`'), 'left')"
                 })
 
+# Composite FK inference
 if ENABLE_COMPOSITE_FK_INFERENCE:
     for pk_table, pk_cols in pk_registry.items():
         if len(pk_cols) < 2: continue
@@ -883,6 +1013,9 @@ if ENABLE_COMPOSITE_FK_INFERENCE:
                         "cardinality": "many-to-one", "declared": False,
                         "join_example_sql": join_sql, "join_example_pyspark": join_pyspark
                     })
+
+print(f"Phase 4 completed in {time.time()-rel_start:.1f}s")
+print(f"  - Found {len(relationships)} relationships ({len([r for r in relationships if r.get('declared')])} declared, {len([r for r in relationships if not r.get('declared')])} inferred)")
 
 # =========================
 # MODEL
@@ -1072,7 +1205,10 @@ def render_markdown(model) -> str:
         lines.append("")
     return "\n".join(lines)
 
+print("\nPhase 5: Rendering reports...")
+render_start = time.time()
 markdown_report = render_markdown(model)
+print(f"Phase 5 completed in {time.time()-render_start:.1f}s")
 
 # =========================
 # OUTPUTS (UC-first; no DBFS default)
@@ -1110,8 +1246,9 @@ def _safe_write_csv(path, rows, header):
 
 if WRITE_FILES:
     try:
+        print(f"\nPhase 6: Writing outputs to {out_dir}...")
+        write_start = time.time()
         os.makedirs(out_dir, exist_ok=True)
-        if VERBOSE_LOGS: print(f"Output directory: {out_dir}")
     except Exception as e:
         errors.append(f"Cannot create output directory: {e}")
         WRITE_FILES = False
@@ -1168,8 +1305,10 @@ if WRITE_FILES:
                 "TOP_PK_CANDIDATES": TOP_PK_CANDIDATES, "MAX_COMPOSITE_K": MAX_COMPOSITE_K, "MAX_TABLES": MAX_TABLES,
                 "EMIT_GRAPHML": EMIT_GRAPHML, "EMIT_MERMAID": EMIT_MERMAID, "MAX_MERMAID_TABLES": MAX_MERMAID_TABLES,
                 "MERMAID_MAX_COLUMNS": MERMAID_MAX_COLUMNS, "MD_TRUNCATE_TYPE_CHARS": MD_TRUNCATE_TYPE_CHARS,
+                "ENABLE_DATETIME_DETECTION": ENABLE_DATETIME_DETECTION, "DATETIME_SAMPLE_SIZE": DATETIME_SAMPLE_SIZE,
                 "DATETIME_SUPPORT_MIN": DATETIME_SUPPORT_MIN, "VERBOSE_LOGS": VERBOSE_LOGS,
                 "WRITE_CSVS": WRITE_CSVS, "WRITE_DELTA_SUMMARY": WRITE_DELTA_SUMMARY,
+                "SKIP_INFORMATION_SCHEMA": SKIP_INFORMATION_SCHEMA, "MAX_RUNTIME_MINUTES": MAX_RUNTIME_MINUTES,
                 "SESSION_TIMEZONE": SESSION_TIMEZONE_EFFECTIVE
             },
             "output_dir": out_dir, "spark_env": model["spark_env"],
@@ -1177,12 +1316,15 @@ if WRITE_FILES:
             "warnings": warnings[:100], "errors": errors
         }
         _safe_write_text(f"{out_dir}/run_manifest.json", json.dumps(manifest, indent=2))
+        print(f"Phase 6 completed in {time.time()-write_start:.1f}s")
 
 # =========================
 # OPTIONAL DELTA SUMMARY
 # =========================
 if WRITE_DELTA_SUMMARY and WRITE_FILES:
     try:
+        print("\nWriting Delta summary tables...")
+        delta_start = time.time()
         cols_rows = []
         for e in model["entities"]:
             for c in e["columns"]:
@@ -1197,7 +1339,7 @@ if WRITE_DELTA_SUMMARY and WRITE_FILES:
         out_delta_base = out_dir
         df_cols.write.mode("overwrite").format("delta").save(out_delta_base + "/delta_columns")
         df_rels.write.mode("overwrite").format("delta").save(out_delta_base + "/delta_relationships")
-        if VERBOSE_LOGS: print(f"Delta tables written to: {out_delta_base}")
+        print(f"Delta tables written in {time.time()-delta_start:.1f}s")
     except Exception as e:
         warnings.append(f"Delta summary write failed: {e}")
         errors.append(f"Could not write Delta tables: {e}")
@@ -1205,14 +1347,19 @@ if WRITE_DELTA_SUMMARY and WRITE_FILES:
 # =========================
 # FINAL OUTPUT
 # =========================
+total_time = time.time() - start_time
+
 if VERBOSE_LOGS:
     print("\n" + "="*80)
     print("ERD GENERATION COMPLETE")
     print("="*80)
     print(f"Version: {VERSION}")
     print(f"Run ID: {RUN_ID}")
+    print(f"Total runtime: {total_time:.1f}s ({total_time/60:.1f} minutes)")
     print(f"Tables analyzed: {len(model['entities'])}")
     print(f"Relationships found: {len(model['relationships'])}")
+    print(f"  - Declared: {len([r for r in model['relationships'] if r.get('declared')])}")
+    print(f"  - Inferred: {len([r for r in model['relationships'] if not r.get('declared')])}")
     print(f"Warnings: {len(warnings)}")
     print(f"Errors: {len(errors)}")
     if WRITE_FILES:
@@ -1239,3 +1386,18 @@ if errors and VERBOSE_LOGS:
     for e in errors:
         print(f"  - {e}")
     print()
+
+if not VERBOSE_LOGS:
+    print(f"\nERD Generation Complete - Runtime: {total_time:.1f}s")
+    print(f"Tables: {len(model['entities'])} | Relationships: {len(model['relationships'])} | Warnings: {len(warnings)} | Errors: {len(errors)}")
+    if WRITE_FILES:
+        print(f"Output: {out_dir}")
+
+# Display key results
+print("\n📊 Quick Summary:")
+print(f"  • Processed {len(model['entities'])} tables in {total_time:.1f}s")
+print(f"  • Identified {len([r for r in model['relationships'] if r.get('declared')])} declared + {len([r for r in model['relationships'] if not r.get('declared')])} inferred relationships")
+if ENABLE_DATETIME_DETECTION:
+    dt_detected = sum(1 for e in model['entities'] for c in e['columns'] if c.get('inferred_datetime_format'))
+    print(f"  • Detected datetime patterns in {dt_detected} columns")
+print(f"  • Performance: ~{len(model['entities'])/(total_time/60):.1f} tables/minute")
