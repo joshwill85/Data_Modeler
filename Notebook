@@ -1,339 +1,508 @@
 # Databricks / PySpark
-# Universal ERD & Data Model Generator (Unity Catalog–first)
+# Universal ERD & Data Model Generator (Unity Catalog ready)
 # Author: Joshua Williamson
-# Version: 1.9.4 (Performance optimized for UC on AWS E2)
-# ------------------------------------------------------------------------------------
-# This version:
-# - Major performance improvements: reduced sampling, batch processing, progress tracking
-# - Datetime detection disabled by default (enable only when needed)
-# - Optimized for Unity Catalog on Databricks 15.4 LTS
-# - Intelligent caching and timeout mechanisms
-# - Prefers Unity Catalog Volumes for outputs (no DBFS default)
-# ------------------------------------------------------------------------------------
+# Version: 2.0.0
+# ------------------------------------------------------------------------------
+# This notebook is a single-file, production-grade workflow intended to run in
+# Databricks (Unity Catalog first, legacy DB optional).  It performs:
+#   1. Namespace discovery with include/exclude guards
+#   2. Table metadata capture (schema, storage hints, row counts)
+#   3. Targeted sampling for column statistics and datetime heuristics
+#   4. Primary/foreign key candidate scoring with optional composite search
+#   5. Relationship inference with optional sampled value overlap checks
+#   6. Report generation (JSON, Markdown + Mermaid, GraphML, CSVs, Delta tables)
+#   7. Output persistence to UC Volumes or any provided path (no DBFS default)
+# The implementation favours bounded work, clear logging, and auditability.
+# ------------------------------------------------------------------------------
 
-from pyspark.sql import functions as F
-from pyspark.sql import types as T
+from __future__ import annotations
+
+import csv
+import datetime as dt
+import html
+import itertools
+import json
+import os
+import re
+import time
+import uuid
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
 from pyspark.sql.utils import AnalysisException
-import sys, json, re, datetime, math, itertools, uuid, os, csv, html, time
-from typing import Dict, Any, List, Tuple, Optional
 
-# =========================
-# WIDGETS + PLACEHOLDERS
-# =========================
-def _mk_widget(name, default, desc):
-    try:
-        dbutils.widgets.text(name, default, desc)
-        return True
-    except NameError:
+
+VERSION = "2.1.0"
+AUTHOR = "Joshua Williamson"
+
+
+# ------------------------------------------------------------------------------
+# Widget bootstrap
+# ------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class WidgetSpec:
+    name: str
+    default: str
+    description: str
+
+
+WIDGET_SPECS: List[WidgetSpec] = [
+    WidgetSpec("CATALOG", "main", "Unity Catalog name"),
+    WidgetSpec("SCHEMA", "default", "Unity Catalog schema"),
+    WidgetSpec("USE_LEGACY_DATABASE", "false", "Use legacy database? (true/false)"),
+    WidgetSpec("DATABASE", "default", "Legacy database name"),
+    WidgetSpec("INCLUDE_TABLES_RE", ".*", "Regex include tables"),
+    WidgetSpec("EXCLUDE_TABLES_RE", "", "Regex exclude tables"),
+    WidgetSpec("FAST_MODE", "true", "Fast mode (skip heavy stats)"),
+    WidgetSpec("ENABLE_VALUE_OVERLAP", "false", "Sample FK⊆PK overlap (slow)"),
+    WidgetSpec("ENABLE_COMPOSITE_FK_INFERENCE", "false", "Composite FK inference (slow)"),
+    WidgetSpec("ENABLE_ADVANCED_KEY_TESTS", "true", "Run sampled uniqueness/referential checks"),
+    WidgetSpec("INCLUDE_EXAMPLES", "false", "Include sample rows"),
+    WidgetSpec("ROW_SAMPLE_FRACTION", "0.05", "Sample fraction [0..1]"),
+    WidgetSpec("ROW_SAMPLE_MAX", "100000", "Sample row cap"),
+    WidgetSpec("NULLABILITY_SAMPLE_ROWS", "50000", "Rows for null ratio"),
+    WidgetSpec("VALUE_OVERLAP_SAMPLE_ROWS", "50000", "Rows for value overlap"),
+    WidgetSpec("DISTINCT_COUNT_CAP", "5000000", "Approx distinct hint (unused placeholder)"),
+    WidgetSpec("MIN_REL_SCORE", "0.55", "Min relationship score"),
+    WidgetSpec("TOP_PK_CANDIDATES", "6", "Top-N columns for composite PK"),
+    WidgetSpec("MAX_COMPOSITE_K", "3", "Max columns in composite PK"),
+    WidgetSpec("MAX_TABLES", "10000", "Safety cap on tables"),
+    WidgetSpec("WRITE_FILES", "true", "Persist outputs to storage"),
+    WidgetSpec("OUTPUT_BASE", "", "Output base folder (/Volumes/... or /dbfs/...)"),
+    WidgetSpec("USE_UC_VOLUME_OUTPUT", "true", "Prefer UC Volume output"),
+    WidgetSpec("UC_VOLUME_PATH", "", "Explicit UC Volume path"),
+    WidgetSpec("EMIT_GRAPHML", "true", "Emit GraphML"),
+    WidgetSpec("EMIT_MERMAID", "true", "Render Mermaid ERD in Markdown"),
+    WidgetSpec("EMIT_HTML", "true", "Render interactive HTML ERD"),
+    WidgetSpec("MAX_MERMAID_TABLES", "150", "Mermaid table cap"),
+    WidgetSpec("MERMAID_MAX_COLUMNS", "20", "Columns per entity in Mermaid"),
+    WidgetSpec("MD_TRUNCATE_TYPE_CHARS", "30", "Truncate type strings in Markdown"),
+    WidgetSpec("HTML_MAX_COLUMNS", "30", "Columns per entity in HTML ERD"),
+    WidgetSpec("ENABLE_DATETIME_DETECTION", "false", "Detect datetime patterns in strings"),
+    WidgetSpec("DATETIME_SAMPLE_SIZE", "100", "Rows to sample for datetime detection"),
+    WidgetSpec("DATETIME_SUPPORT_MIN", "0.50", "Min support for datetime pattern"),
+    WidgetSpec("PK_SAMPLE_ROWS", "20000", "Rows to sample for PK uniqueness checks"),
+    WidgetSpec("PK_ACCEPT_THRESHOLD", "0.70", "Min PK score to accept as key"),
+    WidgetSpec("PK_HIGH_CONFIDENCE", "0.90", "PK score for high confidence"),
+    WidgetSpec("RELATIONSHIP_HIGH_CONFIDENCE", "0.75", "Relationship score for high confidence"),
+    WidgetSpec("VERBOSE_LOGS", "true", "Verbose logging"),
+    WidgetSpec("WRITE_CSVS", "true", "Emit CSV extracts"),
+    WidgetSpec("WRITE_DELTA_SUMMARY", "false", "Emit Delta summary tables"),
+    WidgetSpec("SKIP_INFORMATION_SCHEMA", "false", "Skip information_schema usage"),
+    WidgetSpec("MAX_RUNTIME_MINUTES", "30", "Max runtime before soft timeout"),
+    WidgetSpec("SESSION_TIMEZONE", "UTC", "spark.sql.session.timeZone override"),
+]
+
+
+def _bootstrap_widgets(dbutils: Any) -> bool:
+    """Create Databricks widgets when running in the notebook UI."""
+    if dbutils is None:
         return False
-    except Exception as e:
-        print(f"Warning: Could not create widget '{name}': {e}")
-        return False
-
-_default_catalog = "main"
-_default_schema  = "default"
-_default_db      = "default"
-_run_id = datetime.datetime.utcnow().strftime("run_%Y%m%d_%H%M%S_") + str(uuid.uuid4())[:8]
-
-widgets_created_any = False
-widgets_created_any |= _mk_widget("CATALOG", _default_catalog, "UC Catalog")
-widgets_created_any |= _mk_widget("SCHEMA" , _default_schema,  "UC Schema")
-widgets_created_any |= _mk_widget("USE_LEGACY_DATABASE", "false", "Use legacy database? (true/false)")
-widgets_created_any |= _mk_widget("DATABASE", _default_db, "Legacy database (if used)")
-
-widgets_created_any |= _mk_widget("INCLUDE_TABLES_RE", ".*", "Regex include")
-widgets_created_any |= _mk_widget("EXCLUDE_TABLES_RE", "", "Regex exclude")
-
-widgets_created_any |= _mk_widget("FAST_MODE", "true", "Skip heavy stats/overlap? (true/false)")
-widgets_created_any |= _mk_widget("ENABLE_VALUE_OVERLAP", "false", "Compute FK⊆PK overlap (slow)? (true/false)")
-widgets_created_any |= _mk_widget("ENABLE_COMPOSITE_FK_INFERENCE", "false", "Try composite FK inference? (true/false)")
-widgets_created_any |= _mk_widget("INCLUDE_EXAMPLES", "false", "Include sample rows? (true/false)")
-
-# Performance-optimized sampling defaults
-widgets_created_any |= _mk_widget("ROW_SAMPLE_FRACTION", "0.05", "Sample fraction [0..1]")
-widgets_created_any |= _mk_widget("ROW_SAMPLE_MAX", "100000", "Row cap per table")
-widgets_created_any |= _mk_widget("NULLABILITY_SAMPLE_ROWS", "50000", "Rows for null ratio")
-widgets_created_any |= _mk_widget("VALUE_OVERLAP_SAMPLE_ROWS", "50000", "Rows for value overlap")
-widgets_created_any |= _mk_widget("DISTINCT_COUNT_CAP", "5000000", "High distinct cap (hint)")
-
-widgets_created_any |= _mk_widget("MIN_REL_SCORE", "0.55", "Min inferred relationship score")
-widgets_created_any |= _mk_widget("TOP_PK_CANDIDATES", "6", "Top-N cols for composite PK")
-widgets_created_any |= _mk_widget("MAX_COMPOSITE_K", "3", "Max PK composite size (1-4)")
-widgets_created_any |= _mk_widget("MAX_TABLES", "10000", "Safety cap on tables in a run")
-
-# UC-first outputs (no DBFS default)
-widgets_created_any |= _mk_widget("WRITE_FILES", "true", "Write outputs? (true/false)")
-widgets_created_any |= _mk_widget("OUTPUT_BASE", "", "Optional absolute folder (/Volumes/... or /dbfs/...)")
-widgets_created_any |= _mk_widget("USE_UC_VOLUME_OUTPUT", "true", "Write into UC Volume? (true/false)")
-widgets_created_any |= _mk_widget("UC_VOLUME_PATH", "", "If enabled, e.g. /Volumes/<cat>/<schema>/<vol>/erd")
-
-widgets_created_any |= _mk_widget("EMIT_GRAPHML", "true", "Write GraphML? (true/false)")
-widgets_created_any |= _mk_widget("EMIT_MERMAID", "true", "Add Mermaid ERD to MD? (true/false)")
-widgets_created_any |= _mk_widget("MAX_MERMAID_TABLES", "150", "Mermaid render table cap (tables)")
-
-# UX toggles
-widgets_created_any |= _mk_widget("MERMAID_MAX_COLUMNS", "20", "Max columns per entity in Mermaid (-1 for unlimited)")
-widgets_created_any |= _mk_widget("MD_TRUNCATE_TYPE_CHARS", "30", "Max type chars in Markdown (-1 for unlimited)")
-
-# Performance: datetime detection disabled by default, much smaller samples
-widgets_created_any |= _mk_widget("ENABLE_DATETIME_DETECTION", "false", "Detect datetime patterns in strings? (slow)")
-widgets_created_any |= _mk_widget("DATETIME_SAMPLE_SIZE", "100", "Rows to sample for datetime detection")
-widgets_created_any |= _mk_widget("DATETIME_SUPPORT_MIN", "0.50", "Min support to emit datetime pattern [0..1]")
-
-widgets_created_any |= _mk_widget("VERBOSE_LOGS", "true", "Print verbose run summary? (true/false)")
-widgets_created_any |= _mk_widget("WRITE_CSVS", "true", "Emit CSVs (entities/columns/relationships)?")
-widgets_created_any |= _mk_widget("WRITE_DELTA_SUMMARY", "false", "Write a Delta summary table (columns, relationships)?")
-
-# Performance controls
-widgets_created_any |= _mk_widget("SKIP_INFORMATION_SCHEMA", "false", "Skip UC information_schema queries? (true/false)")
-widgets_created_any |= _mk_widget("MAX_RUNTIME_MINUTES", "30", "Max runtime before timeout (minutes)")
-
-# Timezone safety
-widgets_created_any |= _mk_widget("SESSION_TIMEZONE", "UTC", "Spark SQL session time zone (IANA)")
-
-PLACEHOLDERS = {
-    "CATALOG": "{{CATALOG}}",
-    "SCHEMA": "{{SCHEMA}}",
-    "USE_LEGACY_DATABASE": "{{USE_LEGACY_DATABASE}}",
-    "DATABASE": "{{DATABASE}}",
-    "INCLUDE_TABLES_RE": r"{{INCLUDE_TABLES_RE}}",
-    "EXCLUDE_TABLES_RE": r"{{EXCLUDE_TABLES_RE}}",
-    "FAST_MODE": "{{FAST_MODE}}",
-    "ENABLE_VALUE_OVERLAP": "{{ENABLE_VALUE_OVERLAP}}",
-    "ENABLE_COMPOSITE_FK_INFERENCE": "{{ENABLE_COMPOSITE_FK_INFERENCE}}",
-    "INCLUDE_EXAMPLES": "{{INCLUDE_EXAMPLES}}",
-    "ROW_SAMPLE_FRACTION": "{{ROW_SAMPLE_FRACTION}}",
-    "ROW_SAMPLE_MAX": "{{ROW_SAMPLE_MAX}}",
-    "NULLABILITY_SAMPLE_ROWS": "{{NULLABILITY_SAMPLE_ROWS}}",
-    "VALUE_OVERLAP_SAMPLE_ROWS": "{{VALUE_OVERLAP_SAMPLE_ROWS}}",
-    "DISTINCT_COUNT_CAP": "{{DISTINCT_COUNT_CAP}}",
-    "MIN_REL_SCORE": "{{MIN_REL_SCORE}}",
-    "TOP_PK_CANDIDATES": "{{TOP_PK_CANDIDATES}}",
-    "MAX_COMPOSITE_K": "{{MAX_COMPOSITE_K}}",
-    "MAX_TABLES": "{{MAX_TABLES}}",
-    "WRITE_FILES": "{{WRITE_FILES}}",
-    "OUTPUT_BASE": "{{OUTPUT_DIR}}",
-    "USE_UC_VOLUME_OUTPUT": "{{USE_UC_VOLUME_OUTPUT}}",
-    "UC_VOLUME_PATH": "{{UC_VOLUME_PATH}}",
-    "EMIT_GRAPHML": "{{EMIT_GRAPHML}}",
-    "EMIT_MERMAID": "{{EMIT_MERMAID}}",
-    "MAX_MERMAID_TABLES": "{{MAX_MERMAID_TABLES}}",
-    "MERMAID_MAX_COLUMNS": "{{MERMAID_MAX_COLUMNS}}",
-    "MD_TRUNCATE_TYPE_CHARS": "{{MD_TRUNCATE_TYPE_CHARS}}",
-    "ENABLE_DATETIME_DETECTION": "{{ENABLE_DATETIME_DETECTION}}",
-    "DATETIME_SAMPLE_SIZE": "{{DATETIME_SAMPLE_SIZE}}",
-    "DATETIME_SUPPORT_MIN": "{{DATETIME_SUPPORT_MIN}}",
-    "VERBOSE_LOGS": "{{VERBOSE_LOGS}}",
-    "WRITE_CSVS": "{{WRITE_CSVS}}",
-    "WRITE_DELTA_SUMMARY": "{{WRITE_DELTA_SUMMARY}}",
-    "SKIP_INFORMATION_SCHEMA": "{{SKIP_INFORMATION_SCHEMA}}",
-    "MAX_RUNTIME_MINUTES": "{{MAX_RUNTIME_MINUTES}}",
-    "SESSION_TIMEZONE": "{{SESSION_TIMEZONE}}",
-}
-
-def _get_env(name, default=None):
-    try:
-        v = dbutils.widgets.get(name)
-        if v is not None and str(v).strip() != "":
-            return v
-    except Exception:
-        pass
-    v = PLACEHOLDERS.get(name, "")
-    if isinstance(v, str) and v.startswith("{{") and v.endswith("}}"):
-        return default
-    return v or default
-
-def _to_bool(x, default=False):
-    if x is None: return default
-    return str(x).strip().lower() in {"1","true","t","yes","y","on"}
-
-def _to_int(x, default=0):
-    try: return int(float(str(x)))
-    except: return default
-
-def _to_float(x, default=0.0):
-    try: return float(str(x))
-    except: return default
-
-# =========================
-# CONFIG
-# =========================
-CATALOG  = _get_env("CATALOG", _default_catalog)
-SCHEMA   = _get_env("SCHEMA", _default_schema)
-USE_LEGACY_DATABASE = _to_bool(_get_env("USE_LEGACY_DATABASE", "false"))
-DATABASE = _get_env("DATABASE", _default_db)
-
-INCLUDE_TABLES_RE = _get_env("INCLUDE_TABLES_RE", ".*")
-EXCLUDE_TABLES_RE = _get_env("EXCLUDE_TABLES_RE", "")
-
-FAST_MODE             = _to_bool(_get_env("FAST_MODE", "true"))
-ENABLE_VALUE_OVERLAP  = _to_bool(_get_env("ENABLE_VALUE_OVERLAP", "false")) and not FAST_MODE
-ENABLE_COMPOSITE_FK_INFERENCE = _to_bool(_get_env("ENABLE_COMPOSITE_FK_INFERENCE", "false")) and not FAST_MODE
-INCLUDE_EXAMPLES      = _to_bool(_get_env("INCLUDE_EXAMPLES", "false"))
-
-ROW_SAMPLE_FRACTION       = _to_float(_get_env("ROW_SAMPLE_FRACTION", "0.05"), 0.05)
-ROW_SAMPLE_MAX            = _to_int(_get_env("ROW_SAMPLE_MAX", "100000"), 100000)
-NULLABILITY_SAMPLE_ROWS   = _to_int(_get_env("NULLABILITY_SAMPLE_ROWS", "50000"), 50000)
-VALUE_OVERLAP_SAMPLE_ROWS = _to_int(_get_env("VALUE_OVERLAP_SAMPLE_ROWS", "50000"), 50000)
-DISTINCT_COUNT_CAP        = _to_int(_get_env("DISTINCT_COUNT_CAP", "5000000"), 5000000)
-
-MIN_REL_SCORE       = _to_float(_get_env("MIN_REL_SCORE", "0.55"), 0.55)
-TOP_PK_CANDIDATES   = _to_int(_get_env("TOP_PK_CANDIDATES", "6"), 6)
-MAX_COMPOSITE_K     = _to_int(_get_env("MAX_COMPOSITE_K", "3"), 3)
-MAX_TABLES          = _to_int(_get_env("MAX_TABLES", "10000"), 10000)
-
-WRITE_FILES         = _to_bool(_get_env("WRITE_FILES", "true"))
-OUTPUT_BASE         = _get_env("OUTPUT_BASE", "")  # no DBFS default
-USE_UC_VOLUME_OUT   = _to_bool(_get_env("USE_UC_VOLUME_OUTPUT", "true"))
-UC_VOLUME_PATH      = _get_env("UC_VOLUME_PATH", "")
-
-EMIT_GRAPHML        = _to_bool(_get_env("EMIT_GRAPHML", "true"))
-EMIT_MERMAID        = _to_bool(_get_env("EMIT_MERMAID", "true"))
-MAX_MERMAID_TABLES  = _to_int(_get_env("MAX_MERMAID_TABLES", "150"), 150)
-
-MERMAID_MAX_COLUMNS       = _to_int(_get_env("MERMAID_MAX_COLUMNS", "20"), 20)
-MD_TRUNCATE_TYPE_CHARS    = _to_int(_get_env("MD_TRUNCATE_TYPE_CHARS", "30"), 30)
-ENABLE_DATETIME_DETECTION = _to_bool(_get_env("ENABLE_DATETIME_DETECTION", "false"))
-DATETIME_SAMPLE_SIZE      = _to_int(_get_env("DATETIME_SAMPLE_SIZE", "100"), 100)
-DATETIME_SUPPORT_MIN      = _to_float(_get_env("DATETIME_SUPPORT_MIN", "0.50"), 0.50)
-VERBOSE_LOGS              = _to_bool(_get_env("VERBOSE_LOGS", "true"))
-
-WRITE_CSVS          = _to_bool(_get_env("WRITE_CSVS", "true"))
-WRITE_DELTA_SUMMARY = _to_bool(_get_env("WRITE_DELTA_SUMMARY", "false"))
-
-SKIP_INFORMATION_SCHEMA = _to_bool(_get_env("SKIP_INFORMATION_SCHEMA", "false"))
-MAX_RUNTIME_MINUTES     = _to_int(_get_env("MAX_RUNTIME_MINUTES", "30"), 30)
-
-SESSION_TIMEZONE_CFG = _get_env("SESSION_TIMEZONE", "UTC") or "UTC"
-
-RUN_ID   = _run_id
-VERSION  = "1.9.4"
-AUTHOR   = "Joshua Williamson (UC-safe, performance optimized)"
-
-# =========================
-# VALIDATION
-# =========================
-errors, warnings = [], []
-
-if USE_LEGACY_DATABASE and (CATALOG != _default_catalog or SCHEMA != _default_schema):
-    warnings.append("Using legacy DATABASE; CATALOG/SCHEMA parameters are ignored.")
-
-if not USE_LEGACY_DATABASE:
-    if not CATALOG or not SCHEMA:
-        errors.append("Unity Catalog mode requires both CATALOG and SCHEMA to be specified.")
-    if CATALOG == _default_catalog and SCHEMA == _default_schema:
-        warnings.append(f"Using default catalog/schema ({CATALOG}.{SCHEMA}). Is this intentional?")
-
-if MAX_COMPOSITE_K < 1 or MAX_COMPOSITE_K > 4:
-    warnings.append(f"MAX_COMPOSITE_K={MAX_COMPOSITE_K} is out of range [1..4]; adjusting.")
-    MAX_COMPOSITE_K = max(1, min(4, MAX_COMPOSITE_K))
-
-if ROW_SAMPLE_FRACTION < 0.0 or ROW_SAMPLE_FRACTION > 1.0:
-    warnings.append(f"ROW_SAMPLE_FRACTION={ROW_SAMPLE_FRACTION} invalid; adjusting.")
-    ROW_SAMPLE_FRACTION = max(0.0, min(1.0, ROW_SAMPLE_FRACTION))
-
-if MIN_REL_SCORE < 0.0 or MIN_REL_SCORE > 1.0:
-    warnings.append(f"MIN_REL_SCORE={MIN_REL_SCORE} invalid; adjusting.")
-    MIN_REL_SCORE = max(0.0, min(1.0, MIN_REL_SCORE))
-
-if DATETIME_SUPPORT_MIN < 0.0 or DATETIME_SUPPORT_MIN > 1.0:
-    warnings.append(f"DATETIME_SUPPORT_MIN={DATETIME_SUPPORT_MIN} invalid; adjusting.")
-    DATETIME_SUPPORT_MIN = max(0.0, min(1.0, DATETIME_SUPPORT_MIN))
-
-# =========================
-# TIMEZONE SAFETY
-# =========================
-def _safe_set_session_timezone():
-    tz = (SESSION_TIMEZONE_CFG or "UTC").strip()
-    try:
-        current = None
+    created = False
+    for spec in WIDGET_SPECS:
         try:
-            current = spark.conf.get("spark.sql.session.timeZone")
+            dbutils.widgets.text(spec.name, spec.default, spec.description)
+            created = True
         except Exception:
-            pass
-        if not current or str(current).strip().lower() in {"", "unknown", "null", "na"}:
-            spark.conf.set("spark.sql.session.timeZone", tz)
-            return tz
-        return current
-    except Exception as e:
-        warnings.append(f"Could not set spark.sql.session.timeZone; using 'UTC' in metadata only: {e}")
-        return "UTC"
+            # Widget likely already exists; ignore.
+            continue
+    return created
 
-SESSION_TIMEZONE_EFFECTIVE = _safe_set_session_timezone()
 
-# =========================
-# UTILS
-# =========================
+def _clean_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or (s.startswith("{{") and s.endswith("}}")):
+        return None
+    return s
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    s = _clean_string(value)
+    if s is None:
+        return default
+    return s.lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _as_int(value: Any, default: int) -> int:
+    s = _clean_string(value)
+    if s is None:
+        return default
+    try:
+        return int(float(s))
+    except Exception:
+        return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    s = _clean_string(value)
+    if s is None:
+        return default
+    try:
+        return float(s)
+    except Exception:
+        return default
+
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+@dataclass
+class ModelerConfig:
+    catalog: str = "main"
+    schema: str = "default"
+    use_legacy_database: bool = False
+    database: str = "default"
+    include_tables_re: str = ".*"
+    exclude_tables_re: str = ""
+    fast_mode: bool = True
+    enable_value_overlap: bool = False
+    enable_composite_fk: bool = False
+    enable_advanced_key_tests: bool = True
+    include_examples: bool = False
+    row_sample_fraction: float = 0.05
+    row_sample_max: int = 100_000
+    nullability_sample_rows: int = 50_000
+    value_overlap_sample_rows: int = 50_000
+    distinct_count_cap: int = 5_000_000
+    min_rel_score: float = 0.55
+    top_pk_candidates: int = 6
+    max_composite_k: int = 3
+    max_tables: int = 10_000
+    write_files: bool = True
+    output_base: Optional[str] = None
+    use_uc_volume_output: bool = True
+    uc_volume_path: Optional[str] = None
+    emit_graphml: bool = True
+    emit_mermaid: bool = True
+    emit_html: bool = True
+    max_mermaid_tables: int = 150
+    mermaid_max_columns: int = 20
+    md_truncate_type_chars: int = 30
+    html_max_columns: int = 30
+    enable_datetime_detection: bool = False
+    datetime_sample_size: int = 100
+    datetime_support_min: float = 0.50
+    verbose_logs: bool = True
+    write_csvs: bool = True
+    write_delta_summary: bool = False
+    skip_information_schema: bool = False
+    max_runtime_minutes: int = 30
+    session_timezone: str = "UTC"
+    pk_sample_rows: int = 20_000
+    pk_accept_threshold: float = 0.70
+    pk_high_confidence: float = 0.90
+    relationship_high_confidence: float = 0.75
+
+    @classmethod
+    def from_environment(cls, dbutils: Any) -> "ModelerConfig":
+        def _get(name: str) -> Optional[str]:
+            if dbutils is None:
+                return None
+            try:
+                return dbutils.widgets.get(name)
+            except Exception:
+                return None
+
+        values = {spec.name: _get(spec.name) for spec in WIDGET_SPECS}
+        return cls(
+            catalog=_clean_string(values["CATALOG"]) or "main",
+            schema=_clean_string(values["SCHEMA"]) or "default",
+            use_legacy_database=_as_bool(values["USE_LEGACY_DATABASE"], False),
+            database=_clean_string(values["DATABASE"]) or "default",
+            include_tables_re=_clean_string(values["INCLUDE_TABLES_RE"]) or ".*",
+            exclude_tables_re=_clean_string(values["EXCLUDE_TABLES_RE"]) or "",
+            fast_mode=_as_bool(values["FAST_MODE"], True),
+            enable_value_overlap=_as_bool(values["ENABLE_VALUE_OVERLAP"], False),
+            enable_composite_fk=_as_bool(values["ENABLE_COMPOSITE_FK_INFERENCE"], False),
+            enable_advanced_key_tests=_as_bool(values["ENABLE_ADVANCED_KEY_TESTS"], True),
+            include_examples=_as_bool(values["INCLUDE_EXAMPLES"], False),
+            row_sample_fraction=_as_float(values["ROW_SAMPLE_FRACTION"], 0.05),
+            row_sample_max=_as_int(values["ROW_SAMPLE_MAX"], 100_000),
+            nullability_sample_rows=_as_int(values["NULLABILITY_SAMPLE_ROWS"], 50_000),
+            value_overlap_sample_rows=_as_int(values["VALUE_OVERLAP_SAMPLE_ROWS"], 50_000),
+            distinct_count_cap=_as_int(values["DISTINCT_COUNT_CAP"], 5_000_000),
+            min_rel_score=_as_float(values["MIN_REL_SCORE"], 0.55),
+            top_pk_candidates=_as_int(values["TOP_PK_CANDIDATES"], 6),
+            max_composite_k=_as_int(values["MAX_COMPOSITE_K"], 3),
+            max_tables=_as_int(values["MAX_TABLES"], 10_000),
+            write_files=_as_bool(values["WRITE_FILES"], True),
+            output_base=_clean_string(values["OUTPUT_BASE"]),
+            use_uc_volume_output=_as_bool(values["USE_UC_VOLUME_OUTPUT"], True),
+            uc_volume_path=_clean_string(values["UC_VOLUME_PATH"]),
+            emit_graphml=_as_bool(values["EMIT_GRAPHML"], True),
+            emit_mermaid=_as_bool(values["EMIT_MERMAID"], True),
+            emit_html=_as_bool(values["EMIT_HTML"], True),
+            max_mermaid_tables=_as_int(values["MAX_MERMAID_TABLES"], 150),
+            mermaid_max_columns=_as_int(values["MERMAID_MAX_COLUMNS"], 20),
+            md_truncate_type_chars=_as_int(values["MD_TRUNCATE_TYPE_CHARS"], 30),
+            html_max_columns=_as_int(values["HTML_MAX_COLUMNS"], 30),
+            enable_datetime_detection=_as_bool(values["ENABLE_DATETIME_DETECTION"], False),
+            datetime_sample_size=_as_int(values["DATETIME_SAMPLE_SIZE"], 100),
+            datetime_support_min=_as_float(values["DATETIME_SUPPORT_MIN"], 0.50),
+            verbose_logs=_as_bool(values["VERBOSE_LOGS"], True),
+            write_csvs=_as_bool(values["WRITE_CSVS"], True),
+            write_delta_summary=_as_bool(values["WRITE_DELTA_SUMMARY"], False),
+            skip_information_schema=_as_bool(values["SKIP_INFORMATION_SCHEMA"], False),
+            max_runtime_minutes=_as_int(values["MAX_RUNTIME_MINUTES"], 30),
+            session_timezone=_clean_string(values["SESSION_TIMEZONE"]) or "UTC",
+            pk_sample_rows=_as_int(values["PK_SAMPLE_ROWS"], 20_000),
+            pk_accept_threshold=_as_float(values["PK_ACCEPT_THRESHOLD"], 0.70),
+            pk_high_confidence=_as_float(values["PK_HIGH_CONFIDENCE"], 0.90),
+            relationship_high_confidence=_as_float(values["RELATIONSHIP_HIGH_CONFIDENCE"], 0.75),
+        )
+
+    def sanitize(self) -> Tuple[List[str], List[str]]:
+        warnings: List[str] = []
+        errors: List[str] = []
+
+        if self.max_composite_k < 1 or self.max_composite_k > 4:
+            warnings.append(
+                f"MAX_COMPOSITE_K={self.max_composite_k} adjusted to range [1..4]."
+            )
+            self.max_composite_k = max(1, min(4, self.max_composite_k))
+
+        if self.row_sample_fraction < 0.0 or self.row_sample_fraction > 1.0:
+            warnings.append(
+                f"ROW_SAMPLE_FRACTION={self.row_sample_fraction} adjusted to [0..1]."
+            )
+            self.row_sample_fraction = max(0.0, min(1.0, self.row_sample_fraction))
+
+        if self.min_rel_score < 0.0 or self.min_rel_score > 1.0:
+            warnings.append(
+                f"MIN_REL_SCORE={self.min_rel_score} adjusted to [0..1]."
+            )
+            self.min_rel_score = max(0.0, min(1.0, self.min_rel_score))
+
+        if self.datetime_support_min < 0.0 or self.datetime_support_min > 1.0:
+            warnings.append(
+                f"DATETIME_SUPPORT_MIN={self.datetime_support_min} adjusted to [0..1]."
+            )
+            self.datetime_support_min = max(0.0, min(1.0, self.datetime_support_min))
+
+        if self.fast_mode:
+            if self.enable_value_overlap:
+                warnings.append(
+                    "ENABLE_VALUE_OVERLAP disabled because FAST_MODE=true."
+                )
+                self.enable_value_overlap = False
+            if self.enable_composite_fk:
+                warnings.append(
+                    "ENABLE_COMPOSITE_FK_INFERENCE disabled because FAST_MODE=true."
+                )
+                self.enable_composite_fk = False
+            if self.enable_advanced_key_tests:
+                warnings.append(
+                    "ENABLE_ADVANCED_KEY_TESTS disabled because FAST_MODE=true."
+                )
+                self.enable_advanced_key_tests = False
+
+        if self.pk_sample_rows < 1000:
+            warnings.append(
+                f"PK_SAMPLE_ROWS={self.pk_sample_rows} increased to 1000 for stability."
+            )
+            self.pk_sample_rows = 1000
+
+        if self.html_max_columns < -1:
+            warnings.append("HTML_MAX_COLUMNS raised to -1 (unlimited) minimum.")
+            self.html_max_columns = -1
+
+        for attr_name in ("pk_accept_threshold", "pk_high_confidence", "relationship_high_confidence"):
+            value = getattr(self, attr_name)
+            if value < 0.0 or value > 1.0:
+                warnings.append(f"{attr_name.upper()}={value} adjusted to [0..1].")
+                setattr(self, attr_name, max(0.0, min(1.0, value)))
+
+        if self.pk_high_confidence < self.pk_accept_threshold:
+            warnings.append(
+                "PK_HIGH_CONFIDENCE raised to match PK_ACCEPT_THRESHOLD."
+            )
+            self.pk_high_confidence = self.pk_accept_threshold
+
+        if self.relationship_high_confidence < self.min_rel_score:
+            warnings.append(
+                "RELATIONSHIP_HIGH_CONFIDENCE raised to match MIN_REL_SCORE."
+            )
+            self.relationship_high_confidence = self.min_rel_score
+
+        if self.use_legacy_database:
+            warnings.append(
+                "Legacy database mode active; Unity Catalog catalog/schema values are ignored."
+            )
+        else:
+            if not self.catalog or not self.schema:
+                errors.append(
+                    "Unity Catalog mode requires both catalog and schema to be specified."
+                )
+
+        if self.write_files and not (
+            (self.use_uc_volume_output and self.uc_volume_path)
+            or (self.output_base and len(self.output_base.strip()) > 0)
+        ):
+            warnings.append(
+                "WRITE_FILES=true but no UC_VOLUME_PATH or OUTPUT_BASE provided; writes will be skipped."
+            )
+            self.write_files = False
+
+        return warnings, errors
+
+    def resolve_output_dir(self, run_id: str) -> Optional[str]:
+        if not self.write_files:
+            return None
+        base = None
+        if self.use_uc_volume_output and self.uc_volume_path:
+            base = self.uc_volume_path
+        elif self.output_base:
+            base = self.output_base
+        if base:
+            return f"{base.rstrip('/')}/{run_id}"
+        return None
+
+
+# ------------------------------------------------------------------------------
+# Utility helpers
+# ------------------------------------------------------------------------------
 def fq_identifier(token: str) -> str:
     token = token.strip().strip("`")
     return f"`{token}`"
 
-def fq_table(t: str) -> str:
-    parts = [p for p in t.split(".") if p]
-    return ".".join(fq_identifier(p) for p in parts)
 
-def is_included(t: str) -> bool:
-    name = t.split(".")[-1]
-    if EXCLUDE_TABLES_RE:
-        try:
-            if re.match(EXCLUDE_TABLES_RE, name, flags=re.I):
-                return False
-        except re.error as e:
-            warnings.append(f"Invalid EXCLUDE_TABLES_RE pattern: {e}")
-    try:
-        return re.match(INCLUDE_TABLES_RE, name, flags=re.I) is not None
-    except re.error as e:
-        warnings.append(f"Invalid INCLUDE_TABLES_RE pattern: {e}")
-        return True
+def fq_table_name(parts: Iterable[str]) -> str:
+    tokens = [fq_identifier(p) for p in parts if p]
+    return ".".join(tokens)
+
 
 def dtype_family(dt: T.DataType) -> str:
     s = dt.simpleString().lower()
-    if s.startswith("array"):  return "array"
-    if s.startswith("map"):    return "map"
-    if s.startswith("struct"): return "struct"
-    if "decimal" in s or "numeric" in s: return "decimal"
-    if s in {"byte","short","int","integer","long","bigint"}: return "integral"
-    if s in {"double","float"}: return "floating"
-    if "string" in s or "char" in s or "varchar" in s: return "stringy"
-    if "boolean" in s or "bool" in s: return "boolean"
-    if "timestamp" in s or s == "date": return "dates"
+    if s.startswith("array"):
+        return "array"
+    if s.startswith("map"):
+        return "map"
+    if s.startswith("struct"):
+        return "struct"
+    if "decimal" in s or "numeric" in s:
+        return "decimal"
+    if s in {"byte", "short", "int", "integer", "long", "bigint"}:
+        return "integral"
+    if s in {"double", "float"}:
+        return "floating"
+    if "string" in s or "char" in s or "varchar" in s:
+        return "stringy"
+    if "boolean" in s or "bool" in s:
+        return "boolean"
+    if "timestamp" in s or s == "date":
+        return "dates"
     return s
 
-def families_compatible(f1, f2) -> bool:
-    if f1 == f2: return True
-    if {f1,f2} <= {"integral","decimal","floating"}: return True
-    if {f1,f2} <= {"stringy"}: return True
-    if {f1,f2} <= {"dates"}: return True
+
+def families_compatible(f1: str, f2: str) -> bool:
+    if f1 == f2:
+        return True
+    if {f1, f2} <= {"integral", "decimal", "floating"}:
+        return True
+    if {f1, f2} <= {"stringy"}:
+        return True
+    if {f1, f2} <= {"dates"}:
+        return True
     return False
 
-def safe_table(t: str):
-    try:
-        return spark.table(t)
-    except Exception as e:
-        warnings.append(f"Cannot load table {t}: {e}")
-        return None
 
-def sample_df(df, max_rows, frac):
-    if df is None: return None
-    try:
-        frac = max(0.0, min(1.0, frac))
-        sdf = df.sample(False, frac, seed=42) if frac < 1.0 else df
-        return sdf.limit(max_rows)
-    except Exception as e:
-        warnings.append(f"Sampling failed: {e}")
-        return None
+def walk_schema(prefix: str, dt: T.DataType, depth: int = 0, max_depth: int = 10) -> List[Dict[str, Any]]:
+    if depth > max_depth:
+        return []
+    out: List[Dict[str, Any]] = []
+    if isinstance(dt, T.StructType):
+        for f in dt.fields:
+            path = f"{prefix}.{f.name}" if prefix else f.name
+            out.append(
+                {
+                    "path": path,
+                    "type": f.dataType.simpleString(),
+                    "family": dtype_family(f.dataType),
+                    "nullable": f.nullable,
+                }
+            )
+            out += walk_schema(path, f.dataType, depth + 1, max_depth)
+    elif isinstance(dt, T.ArrayType):
+        elem = dt.elementType
+        path = prefix + "[]" if prefix else "[]"
+        out.append(
+            {
+                "path": path,
+                "type": f"array<{elem.simpleString()}>",
+                "family": "array",
+                "nullable": True,
+            }
+        )
+        out += walk_schema(prefix + "[]", elem, depth + 1, max_depth)
+    elif isinstance(dt, T.MapType):
+        out.append(
+            {
+                "path": prefix + "{}",
+                "type": f"map<{dt.keyType.simpleString()},{dt.valueType.simpleString()}>",
+                "family": "map",
+                "nullable": True,
+            }
+        )
+        out += walk_schema(prefix + "{}", dt.valueType, depth + 1, max_depth)
+    return out
 
-def approx_distinct_expr(cname: str):
-    return F.approx_count_distinct(F.col(cname)).alias(cname)
+
+def array_guidance(dtype: T.DataType) -> Optional[Dict[str, Any]]:
+    if not isinstance(dtype, T.ArrayType):
+        return None
+    elem = dtype.elementType
+    if isinstance(elem, T.StructType):
+        fields = ", ".join(
+            [f"{f.name}:{f.dataType.simpleString()}" for f in elem.fields[:10]]
+        )
+        if len(elem.fields) > 10:
+            fields += "..."
+        return {
+            "element_type": f"STRUCT<{fields}>",
+            "parse_hint": "explode()/posexplode(), then select elem.*",
+            "sql": "SELECT t.*, e.* FROM {{TABLE}} t LATERAL VIEW explode(t.{{ARRAY_COL}}) x AS e",
+            "pyspark": "df.select('*', F.explode(F.col('{{ARRAY_COL}}')).alias('e')).select('*','e.*')",
+        }
+    return {
+        "element_type": elem.simpleString(),
+        "parse_hint": "explode()/posexplode() to normalize to rows",
+        "sql": "SELECT t.*, e AS elem FROM {{TABLE}} t LATERAL VIEW explode(t.{{ARRAY_COL}}) x AS e",
+        "pyspark": "df.select('*', F.explode(F.col('{{ARRAY_COL}}')).alias('elem'))",
+    }
+
+
+def map_guidance(dtype: T.DataType) -> Optional[Dict[str, Any]]:
+    if not isinstance(dtype, T.MapType):
+        return None
+    return {
+        "key_type": dtype.keyType.simpleString(),
+        "value_type": dtype.valueType.simpleString(),
+        "parse_hint": "explode(map) to (key,value) rows",
+        "sql": "SELECT t.*, k, v FROM {{TABLE}} t LATERAL VIEW explode(t.{{MAP_COL}}) x AS k, v",
+        "pyspark": "df.select('*', F.explode(F.col('{{MAP_COL}}')).alias('k','v'))",
+    }
+
 
 ID_NAME_HINTS = [r".*\b(id|_id)\b", r".*\b(key|_key)\b", r".*\b(uuid|guid)\b"]
-FK_NAME_HINTS = [r".*\b.*_id\b", r".*\b(user|customer|account|client|order|product|parent|owner).*(id|_id)\b"]
+FK_NAME_HINTS = [
+    r".*\b.*_id\b",
+    r".*\b(user|customer|account|client|order|product|parent|owner).*(id|_id)\b",
+]
 
-def col_name_hints(name: str, patterns) -> bool:
-    try:
-        return any(re.match(p, name.lower()) for p in patterns)
-    except re.error:
-        return False
+
+def col_name_hints(name: str, patterns: Iterable[str]) -> bool:
+    lowered = name.lower()
+    for pattern in patterns:
+        try:
+            if re.match(pattern, lowered):
+                return True
+        except re.error:
+            continue
+    return False
+
 
 DATE_TIME_PATTERNS = [
     (r"^\d{4}-\d{2}-\d{2}$", "yyyy-MM-dd"),
@@ -352,1052 +521,1952 @@ DATE_TIME_PATTERNS = [
     (r"^\d{4}-\d{3}$", "yyyy-DDD (ordinal)"),
 ]
 
-def detect_string_datetime_format(samples: List[str]) -> Tuple[Optional[str], float, Dict[str,int]]:
-    if not samples: return None, 0.0, {}
-    counts, n = {}, 0
-    for s in samples:
-        if s is None: continue
+
+def detect_string_datetime_format(samples: List[str]) -> Tuple[Optional[str], float, Dict[str, int]]:
+    if not samples:
+        return None, 0.0, {}
+    counts: Dict[str, int] = {}
+    observed = 0
+    for sample in samples:
+        if sample is None:
+            continue
         try:
-            v = str(s).strip()
-            if not v: continue
-            n += 1
-            matched = False
-            for rx, label in DATE_TIME_PATTERNS:
-                try:
-                    if re.match(rx, v):
-                        counts[label] = counts.get(label, 0) + 1
-                        matched = True
-                        break
-                except re.error:
-                    continue
-            if not matched:
-                counts["unknown"] = counts.get("unknown", 0) + 1
+            val = str(sample).strip()
         except Exception:
             continue
-    if n == 0 or not counts: return None, 0.0, {}
-    top_label, top_cnt = max(counts.items(), key=lambda kv: kv[1])
-    return top_label, top_cnt/n, counts
+        if not val:
+            continue
+        observed += 1
+        matched = False
+        for pattern, label in DATE_TIME_PATTERNS:
+            try:
+                if re.match(pattern, val):
+                    counts[label] = counts.get(label, 0) + 1
+                    matched = True
+                    break
+            except re.error:
+                continue
+        if not matched:
+            counts["unknown"] = counts.get("unknown", 0) + 1
+    if observed == 0 or not counts:
+        return None, 0.0, {}
+    top_label, top_count = max(counts.items(), key=lambda kv: kv[1])
+    return top_label, top_count / observed, counts
 
-def walk_schema(prefix: str, dt: T.DataType, depth=0, max_depth=10) -> List[Dict[str, Any]]:
-    if depth > max_depth: return []
-    out = []
-    if isinstance(dt, T.StructType):
-        for f in dt.fields:
-            path = f"{prefix}.{f.name}" if prefix else f.name
-            out.append({"path": path, "type": f.dataType.simpleString(), "family": dtype_family(f.dataType), "nullable": f.nullable})
-            out += walk_schema(path, f.dataType, depth+1, max_depth)
-    elif isinstance(dt, T.ArrayType):
-        elem = dt.elementType
-        path = prefix + "[]" if prefix else "[]"
-        out.append({"path": path, "type": f"array<{elem.simpleString()}>", "family": "array", "nullable": True})
-        out += walk_schema(prefix + "[]", elem, depth+1, max_depth)
-    elif isinstance(dt, T.MapType):
-        out.append({"path": prefix + "{}", "type": f"map<{dt.keyType.simpleString()},{dt.valueType.simpleString()}>", "family": "map", "nullable": True})
-        out += walk_schema(prefix + "{}", dt.valueType, depth+1, max_depth)
-    return out
 
-def array_guidance(dtype: T.DataType):
-    if not isinstance(dtype, T.ArrayType): return None
-    elem = dtype.elementType
-    if isinstance(elem, T.StructType):
-        fields = ", ".join([f"{f.name}:{f.dataType.simpleString()}" for f in elem.fields[:10]])
-        if len(elem.fields) > 10: fields += "..."
-        return {"element_type": f"STRUCT<{fields}>", "parse_hint": "explode()/posexplode(), then select elem.*",
-                "sql": "SELECT t.*, e.* FROM {{TABLE}} t LATERAL VIEW explode(t.{{ARRAY_COL}}) x AS e",
-                "pyspark": "df.select('*', F.explode(F.col('{{ARRAY_COL}}')).alias('e')).select('*','e.*')"}
-    else:
-        return {"element_type": elem.simpleString(), "parse_hint": "explode()/posexplode() to normalize to rows",
-                "sql": "SELECT t.*, e AS elem FROM {{TABLE}} t LATERAL VIEW explode(t.{{ARRAY_COL}}) x AS e",
-                "pyspark": "df.select('*', F.explode(F.col('{{ARRAY_COL}}')).alias('elem'))"}
-
-def map_guidance(dtype: T.DataType):
-    if not isinstance(dtype, T.MapType): return None
-    return {"key_type": dtype.keyType.simpleString(), "value_type": dtype.valueType.simpleString(),
-            "parse_hint": "explode(map) to (key,value) rows",
-            "sql": "SELECT t.*, k, v FROM {{TABLE}} t LATERAL VIEW explode(t.{{MAP_COL}}) x AS k, v",
-            "pyspark": "df.select('*', F.explode(F.col('{{MAP_COL}}')).alias('k','v'))"}
-
-def name_match_score(fk_name, pk_name):
+def name_match_score(fk_name: str, pk_name: str) -> float:
     fk, pk = fk_name.lower(), pk_name.lower()
-    if fk == pk: return 1.0
-    if fk.endswith("_id") and pk in {"id","pk","pk_id"}: return 0.9
-    if fk.endswith(pk) or pk.endswith(fk): return 0.7
-    fk_tokens = set(re.split(r"[_\W]+", fk)); pk_tokens = set(re.split(r"[_\W]+", pk))
+    if fk == pk:
+        return 1.0
+    if fk.endswith("_id") and pk in {"id", "pk", "pk_id"}:
+        return 0.9
+    if fk.endswith(pk) or pk.endswith(fk):
+        return 0.7
+    fk_tokens = set(re.split(r"[_\W]+", fk))
+    pk_tokens = set(re.split(r"[_\W]+", pk))
     union_size = len(fk_tokens | pk_tokens)
-    if union_size == 0: return 0.3
-    j = len(fk_tokens & pk_tokens) / union_size
-    return max(0.3, j)
+    if union_size == 0:
+        return 0.3
+    jaccard = len(fk_tokens & pk_tokens) / union_size
+    return max(0.3, jaccard)
 
-def type_compat_score(fk_fam, pk_fam): return 1.0 if families_compatible(fk_fam, pk_fam) else 0.0
 
-def cardinality_score(fk_ad, pk_ad):
-    if fk_ad is None or pk_ad is None or pk_ad == 0: return 0.5
+def cardinality_score(fk_ad: Optional[int], pk_ad: Optional[int]) -> float:
+    if fk_ad is None or pk_ad is None or pk_ad == 0:
+        return 0.5
     ratio = fk_ad / max(1, pk_ad)
-    if ratio >= 1.0: return 1.0 if ratio <= 50 else 0.8
+    if ratio >= 1.0:
+        return 1.0 if ratio <= 50 else 0.8
     return 0.4
 
-def distinct_ratio_score(pk_ad, pk_rowcount):
-    if pk_ad is None or pk_rowcount in (None, 0): return 0.5
+
+def distinct_ratio_score(pk_ad: Optional[int], pk_rowcount: Optional[int]) -> float:
+    if pk_ad is None or pk_rowcount in (None, 0):
+        return 0.5
     return min(1.0, pk_ad / max(1, pk_rowcount))
 
-def null_ratio_score(fk_null): return 0.5 if fk_null is None else (1.0 - fk_null)
 
-# =========================
-# DISCOVERY
-# =========================
-def ns_tables_uc(catalog: str, schema: str) -> List[str]:
-    try:
-        df = spark.sql(f"SHOW TABLES IN {fq_identifier(catalog)}.{fq_identifier(schema)}")
-        rows = df.select("tableName").limit(MAX_TABLES + 1).collect()
-        if len(rows) > MAX_TABLES:
-            warnings.append(f"Table count exceeds MAX_TABLES ({MAX_TABLES}); truncated.")
-            rows = rows[:MAX_TABLES]
-        return [f"{catalog}.{schema}.{r.tableName}" for r in rows]
-    except AnalysisException as e:
-        errors.append(f"SHOW TABLES failed for {catalog}.{schema}: {e.desc if hasattr(e,'desc') else str(e)}")
-        return []
-    except Exception as e:
-        errors.append(f"Unexpected error discovering tables in {catalog}.{schema}: {e}")
-        return []
+def null_ratio_score(fk_null: Optional[float]) -> float:
+    if fk_null is None:
+        return 0.5
+    return 1.0 - fk_null
 
-def ns_tables_legacy(database: str) -> List[str]:
-    try:
-        df = spark.sql(f"SHOW TABLES IN {fq_identifier(database)}")
-        rows = df.select("tableName").limit(MAX_TABLES + 1).collect()
-        if len(rows) > MAX_TABLES:
-            warnings.append(f"Table count exceeds MAX_TABLES ({MAX_TABLES}); truncated.")
-            rows = rows[:MAX_TABLES]
-        return [f"{database}.{r.tableName}" for r in rows]
-    except AnalysisException as e:
-        errors.append(f"SHOW TABLES failed for database {database}: {e.desc if hasattr(e,'desc') else str(e)}")
-        return []
-    except Exception as e:
-        errors.append(f"Unexpected error discovering tables in {database}: {e}")
-        return []
 
-print("="*80)
-print(f"Starting ERD Generation v{VERSION}")
-print(f"Run ID: {RUN_ID}")
-print("="*80)
+def approx_distinct_expr(column_name: str):
+    return F.approx_count_distinct(F.col(column_name)).alias(column_name)
 
-start_time = time.time()
-tables = ns_tables_legacy(DATABASE) if USE_LEGACY_DATABASE else ns_tables_uc(CATALOG, SCHEMA)
-tables = [t for t in tables if is_included(t)]
-if not tables:
-    errors.append("No tables found matching the specified criteria.")
-    if VERBOSE_LOGS:
-        print("ERROR: No tables discovered. Check your catalog/schema/database configuration.")
 
-print(f"Discovered {len(tables)} tables in {time.time()-start_time:.1f}s")
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+class NotebookLogger:
+    def __init__(self, verbose: bool) -> None:
+        self.verbose = verbose
 
-# =========================
-# TABLE OVERVIEW (OPTIMIZED)
-# =========================
-table_overview = {}
-if not USE_LEGACY_DATABASE and tables and not SKIP_INFORMATION_SCHEMA:
-    try:
-        print("Querying information_schema.tables...")
-        ist_start = time.time()
-        ist = spark.sql(f"""
-            SELECT table_name, table_type, data_source_format
-            FROM {fq_identifier(CATALOG)}.information_schema.tables
-            WHERE table_schema = '{SCHEMA}'
-        """).cache()
-        
-        for r in ist.collect():
-            table_overview[f"{CATALOG}.{SCHEMA}.{r.table_name}"] = {
-                "table_type": r.table_type, 
-                "data_source_format": r.data_source_format
-            }
-        ist.unpersist()
-        print(f"information_schema query completed in {time.time()-ist_start:.1f}s")
-    except Exception as e:
-        warnings.append(f"information_schema.tables not accessible (continuing without): {e}")
+    def info(self, message: str) -> None:
+        if self.verbose:
+            print(message)
 
-# =========================
-# DECLARED CONSTRAINTS (OPTIMIZED)
-# =========================
-declared_constraints = {"pk": {}, "fk": [], "check": []}
-if not USE_LEGACY_DATABASE and tables and not SKIP_INFORMATION_SCHEMA:
-    try:
-        print("Querying declared constraints...")
-        const_start = time.time()
-        is_tc  = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.table_constraints WHERE table_schema = '{SCHEMA}'").cache()
-        is_kcu = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.key_column_usage WHERE table_schema = '{SCHEMA}'").cache()
-        
-        pk_names = [r.constraint_name for r in is_tc.filter(F.col("constraint_type")=="PRIMARY KEY").select("constraint_name").distinct().collect()]
-        for pk in pk_names:
-            cols = [r.column_name for r in is_kcu.filter(F.col("constraint_name")==pk).orderBy("ordinal_position").select("column_name").collect()]
-            tbl  = is_kcu.filter(F.col("constraint_name")==pk).select("table_name").first()
-            if tbl and cols:
-                full = f"{CATALOG}.{SCHEMA}.{tbl.table_name}"
-                declared_constraints["pk"][full] = cols
-        
-        is_rc  = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.referential_constraints WHERE constraint_schema = '{SCHEMA}'").cache()
-        fk_rows = is_tc.filter(F.col("constraint_type")=="FOREIGN KEY").select("constraint_name","table_name").collect()
-        for r in fk_rows:
-            fk_name = r.constraint_name
-            fk_tbl  = f"{CATALOG}.{SCHEMA}.{r.table_name}"
-            fk_cols = [x.column_name for x in is_kcu.filter(F.col("constraint_name")==fk_name).orderBy("ordinal_position").select("column_name").collect()]
-            ref = is_rc.filter(F.col("constraint_name")==fk_name).select("unique_constraint_name").first()
-            if ref:
-                pk_name = ref.unique_constraint_name
-                pk_tbl_row = is_kcu.filter(F.col("constraint_name")==pk_name).select("table_name").first()
-                if pk_tbl_row:
-                    pk_tbl = f"{CATALOG}.{SCHEMA}.{pk_tbl_row.table_name}"
-                    pk_cols = [x.column_name for x in is_kcu.filter(F.col("constraint_name")==pk_name).orderBy("ordinal_position").select("column_name").collect()]
-                    if fk_cols and pk_cols:
-                        declared_constraints["fk"].append({"fk_table": fk_tbl, "fk_cols": fk_cols, "pk_table": pk_tbl, "pk_cols": pk_cols, "name": fk_name})
-        
+    def banner(self, message: str) -> None:
+        line = "=" * 80
+        if self.verbose:
+            print(f"\n{line}\n{message}\n{line}")
+
+    def warn(self, message: str) -> None:
+        print(f"WARNING: {message}")
+
+    def error(self, message: str) -> None:
+        print(f"ERROR: {message}")
+
+
+# ------------------------------------------------------------------------------
+# Data modeler
+# ------------------------------------------------------------------------------
+class DataModeler:
+    def __init__(self, spark: SparkSession, dbutils: Any, config: ModelerConfig) -> None:
+        self.spark = spark
+        self.dbutils = dbutils
+        self.config = config
+        self.logger = NotebookLogger(config.verbose_logs)
+        self.run_id = dt.datetime.utcnow().strftime("run_%Y%m%d_%H%M%S_") + str(uuid.uuid4())[:8]
+        self.start_time = time.time()
+        self.deadline = (
+            self.start_time + (config.max_runtime_minutes * 60)
+            if config.max_runtime_minutes and config.max_runtime_minutes > 0
+            else None
+        )
+        self.warnings: List[str] = []
+        self.errors: List[str] = []
+        self.tables: List[str] = []
+        self.table_overview: Dict[str, Dict[str, Any]] = {}
+        self.declared_constraints: Dict[str, Any] = {"pk": {}, "fk": [], "check": []}
+        self.entities: Dict[str, Dict[str, Any]] = {}
+        self.relationships: List[Dict[str, Any]] = []
+        self.value_cache: Dict[Tuple[str, str], set] = {}
+        self.pk_uniqueness_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+        self.referential_metrics_cache: Dict[
+            Tuple[str, str, str, str], Optional[Dict[str, Any]]
+        ] = {}
+        self._df_cache: Dict[str, Optional[DataFrame]] = {}
+
+        cfg_warnings, cfg_errors = self.config.sanitize()
+        self.warnings.extend(cfg_warnings)
+        self.errors.extend(cfg_errors)
+
+    # ------------------------------
+    # Safety helpers
+    # ------------------------------
+    def _within_budget(self) -> bool:
+        if self.deadline is None:
+            return True
+        return time.time() <= self.deadline
+
+    def warn(self, message: str) -> None:
+        self.warnings.append(message)
+        self.logger.warn(message)
+
+    def error(self, message: str) -> None:
+        self.errors.append(message)
+        self.logger.error(message)
+
+    def safe_table(self, table: str) -> Optional[DataFrame]:
+        if table in self._df_cache:
+            return self._df_cache[table]
         try:
-            is_cc = spark.sql(f"SELECT * FROM {fq_identifier(CATALOG)}.information_schema.check_constraints WHERE constraint_schema = '{SCHEMA}'")
-            for r in is_cc.collect():
-                declared_constraints["check"].append({"constraint_name": r.constraint_name, "check_clause": r.check_clause})
-        except Exception:
-            pass
-        
-        is_tc.unpersist()
-        is_kcu.unpersist()
-        is_rc.unpersist()
-        print(f"Constraint discovery completed in {time.time()-const_start:.1f}s")
-        print(f"  - PKs: {len(declared_constraints['pk'])}, FKs: {len(declared_constraints['fk'])}, Checks: {len(declared_constraints['check'])}")
-    except Exception as e:
-        warnings.append(f"information_schema constraint discovery limited/unavailable: {e}")
+            df = self.spark.table(table)
+            self._df_cache[table] = df
+            return df
+        except Exception as exc:
+            self.warn(f"Cannot load table {table}: {exc}")
+            self._df_cache[table] = None
+            return None
 
-# =========================
-# METADATA + FAST ROW COUNTS
-# =========================
-def get_row_count_fast(t: str, df) -> Optional[int]:
-    try:
-        d = spark.sql(f"DESCRIBE DETAIL {fq_table(t)}").select("numRows").first()
-        if d and d[0] is not None: return int(d[0])
-    except Exception:
-        pass
-    if not FAST_MODE and df is not None:
-        try: return df.count()
-        except Exception: pass
-    return None
-
-entities: Dict[str, Dict[str, Any]] = {}
-print("\nPhase 1: Gathering table metadata...")
-meta_start = time.time()
-
-for idx, t in enumerate(tables, 1):
-    # Progress tracking
-    if VERBOSE_LOGS and idx % 5 == 0:
-        elapsed = time.time() - meta_start
-        rate = idx / elapsed if elapsed > 0 else 0
-        est_remaining = (len(tables) - idx) / rate if rate > 0 else 0
-        print(f"  [{idx}/{len(tables)}] Processing {t} - {elapsed:.1f}s elapsed, ~{est_remaining:.1f}s remaining")
-    
-    # Timeout check
-    if (time.time() - start_time) > (MAX_RUNTIME_MINUTES * 60):
-        warnings.append(f"Exceeded MAX_RUNTIME_MINUTES ({MAX_RUNTIME_MINUTES}), stopping table discovery early")
-        tables = tables[:idx]
-        break
-    
-    df = safe_table(t)
-    if df is None:
-        entities[t] = {"table": t, "columns": [], "row_count": None, "props": {}, "is_view": False, "partial": True}
-        continue
-    
-    props = {}
-    try:
-        desc = spark.sql(f"DESCRIBE EXTENDED {fq_table(t)}").collect()
-        props = {r.col_name: r.data_type for r in desc if r.col_name and r.col_name != ""}
-    except Exception as e:
-        warnings.append(f"DESCRIBE EXTENDED failed for {t}: {e}")
-    
-    cols = []
-    for f in df.schema.fields:
-        fam = dtype_family(f.dataType)
-        struct_fields = []
+    def sample_df(self, df: Optional[DataFrame], max_rows: int, fraction: float) -> Optional[DataFrame]:
+        if df is None:
+            return None
         try:
-            nested = walk_schema("", f.dataType)
-            struct_fields = [{"name": sf["path"], "type": sf["type"], "nullable": sf["nullable"]}
-                             for sf in nested if sf["path"] and ("." in sf["path"] or "[]" in sf["path"] or "{}" in sf["path"])]
-            struct_fields = struct_fields[:200]
-        except Exception as e:
-            warnings.append(f"Schema walking failed for {t}.{f.name}: {e}")
-        
-        cols.append({
-            "name": f.name,
-            "data_type": f.dataType.simpleString(),
-            "family": fam,
-            "nullable": f.nullable,
-            "is_id_name": col_name_hints(f.name, ID_NAME_HINTS),
-            "is_fk_name": col_name_hints(f.name, FK_NAME_HINTS),
-            "struct_fields": struct_fields,
-            "array_guidance": array_guidance(f.dataType),
-            "map_guidance": map_guidance(f.dataType),
-        })
-    
-    rc = get_row_count_fast(t, df)
-    is_view = "Type" in props and "VIEW" in str(props.get("Type","")).upper()
-    ov = table_overview.get(t, {})
-    entities[t] = {
-        "table": t,
-        "columns": cols,
-        "row_count": rc,
-        "props": props,
-        "is_view": is_view or (ov.get("table_type") == "VIEW"),
-        "table_type": ov.get("table_type"),
-        "data_source_format": ov.get("data_source_format"),
-        "partial": False
-    }
+            frac = max(0.0, min(1.0, fraction))
+            sampled = df.sample(False, frac, seed=42) if frac < 1.0 else df
+            return sampled.limit(max_rows)
+        except Exception as exc:
+            self.warn(f"Sampling failed: {exc}")
+            return None
 
-print(f"Phase 1 completed in {time.time()-meta_start:.1f}s")
+    def classify_pk_confidence(self, score: float, candidate: bool) -> str:
+        if not candidate:
+            return "low"
+        if score >= self.config.pk_high_confidence:
+            return "high"
+        if score >= self.config.pk_accept_threshold:
+            return "medium"
+        return "low"
 
-# =========================
-# STATS + DATETIME INFERENCE (OPTIMIZED)
-# =========================
-value_sets_cache = {}
+    def classify_fk_confidence(self, score: float) -> str:
+        if score >= self.config.relationship_high_confidence:
+            return "high"
+        if score >= self.config.min_rel_score:
+            return "medium"
+        return "low"
 
-def _df_cache_key(df, col: str):
-    if df is None: return None
-    try:
-        return (df._jdf.toString(), col)
-    except Exception:
-        return (id(df), col)
+    def classify_relationship_confidence(self, score: float, declared: bool) -> str:
+        if declared or score >= self.config.relationship_high_confidence:
+            return "high"
+        if score >= self.config.min_rel_score:
+            return "medium"
+        return "low"
 
-def sampled_distinct_values(df, col: str, max_rows: int) -> set:
-    cache_key = _df_cache_key(df, col)
-    if cache_key and cache_key in value_sets_cache:
-        return value_sets_cache[cache_key]
-    out = set()
-    if df is None:
-        if cache_key: value_sets_cache[cache_key] = out
-        return out
-    try:
-        sdf = sample_df(df.select(F.col(col)).where(F.col(col).isNotNull()), max_rows, min(1.0, ROW_SAMPLE_FRACTION))
-        if sdf is not None:
-            vals = [r[0] for r in sdf.distinct().limit(200000).collect()]
-            out = set(str(v) for v in vals if v is not None)
-    except Exception as e:
-        warnings.append(f"Value sampling failed for column {col}: {e}")
-        out = set()
-    if cache_key:
-        value_sets_cache[cache_key] = out
-    return out
-
-def collect_examples(df, cols, n=3):
-    if not INCLUDE_EXAMPLES or df is None or not cols: return []
-    try:
-        rows = df.select(*[F.col(c) for c in cols]).limit(n).collect()
-        return [{c: r[i] for i, c in enumerate(cols)} for r in rows]
-    except Exception:
-        return []
-
-print("\nPhase 2: Computing statistics and datetime patterns...")
-stats_start = time.time()
-
-for idx, (t, meta) in enumerate(entities.items(), 1):
-    # Progress tracking
-    if VERBOSE_LOGS and idx % 5 == 0:
-        elapsed = time.time() - stats_start
-        rate = idx / elapsed if elapsed > 0 else 0
-        est_remaining = (len(entities) - idx) / rate if rate > 0 else 0
-        print(f"  [{idx}/{len(entities)}] Stats for {t} - {elapsed:.1f}s elapsed, ~{est_remaining:.1f}s remaining")
-    
-    # Timeout check
-    if (time.time() - start_time) > (MAX_RUNTIME_MINUTES * 60):
-        warnings.append(f"Exceeded MAX_RUNTIME_MINUTES ({MAX_RUNTIME_MINUTES}), stopping stats computation early")
-        break
-    
-    df = safe_table(t)
-    if df is None or len(meta["columns"]) == 0:
-        meta["stats"] = {"null_ratio": {}, "approx_distinct": {}, "examples": []}
-        meta["datetime_inference"] = {}
-        continue
-    
-    # Adaptive sampling for very large tables
-    eff_frac = ROW_SAMPLE_FRACTION
-    if meta["row_count"] and meta["row_count"] > 50_000_000:
-        eff_frac = min(eff_frac, 0.03)
-    
-    s_df = sample_df(df, NULLABILITY_SAMPLE_ROWS, eff_frac)
-    null_ratio, approx_distinct, ex_rows, dt_info = {}, {}, [], {}
-
-    # NULL RATIO
-    try:
-        if s_df is not None:
-            exprs = [F.avg(F.when(F.col(c["name"]).isNull(), 1).otherwise(0)).alias(c["name"]) for c in meta["columns"]]
-            result = s_df.select(*exprs).first()
-            if result: null_ratio = result.asDict()
-    except Exception as e:
-        warnings.append(f"Null ratio calculation failed for {t}: {e}")
-
-    # APPROX DISTINCT (BATCHED FOR PERFORMANCE)
-    try:
-        if not FAST_MODE and df is not None:
-            eligible_cols = [c["name"] for c in meta["columns"] 
-                            if c["family"] in {"integral","decimal","floating","stringy","dates","boolean"}]
-            if eligible_cols:
-                # Process in batches of 50 to avoid huge queries
-                for i in range(0, len(eligible_cols), 50):
-                    batch = eligible_cols[i:i+50]
-                    exprs = [approx_distinct_expr(cname) for cname in batch]
-                    row = df.select(*exprs).first()
-                    if row:
-                        approx_distinct.update(row.asDict())
-    except Exception as e:
-        warnings.append(f"Approx distinct calculation failed for {t}: {e}")
-
-    # EXAMPLES
-    ex_rows = collect_examples(df, [c["name"] for c in meta["columns"]], 3)
-
-    # DATETIME DETECTION (ONLY IF ENABLED, MUCH SMALLER SAMPLES)
-    if ENABLE_DATETIME_DETECTION and not FAST_MODE:
-        for f in meta["columns"]:
-            cname, fam = f["name"], f["family"]
-            fmt, support, counts = None, 0.0, None
+    def estimate_pk_uniqueness(self, table: str, column: str) -> Optional[Dict[str, Any]]:
+        if not self.config.enable_advanced_key_tests:
+            return None
+        cache_key = (table, column)
+        if cache_key in self.pk_uniqueness_cache:
+            return self.pk_uniqueness_cache[cache_key]
+        df = self.safe_table(table)
+        metrics: Optional[Dict[str, Any]] = None
+        if df is not None:
             try:
-                if fam == "dates":
-                    fmt = "spark_date_or_timestamp"
-                    support = 1.0
-                elif fam == "stringy" and s_df is not None:
-                    try:
-                        # MUCH SMALLER sample for datetime detection
-                        rows = s_df.select(F.col(cname)).where(F.col(cname).isNotNull()).limit(DATETIME_SAMPLE_SIZE).collect()
-                        sample_vals = [str(v[0]) for v in rows if v[0] is not None]
-                        if len(sample_vals) >= 10:  # Only detect if sufficient samples
-                            fmt, support, counts = detect_string_datetime_format(sample_vals)
-                    except Exception:
-                        pass
+                sample = self.sample_df(
+                    df.select(F.col(column)).where(F.col(column).isNotNull()),
+                    self.config.pk_sample_rows,
+                    max(self.config.row_sample_fraction, 0.05),
+                )
+                if sample is not None:
+                    total = sample.count()
+                    if total > 0:
+                        distinct = sample.distinct().count()
+                        unique_fraction = distinct / total if total else 0.0
+                        metrics = {
+                            "sample_size": int(total),
+                            "distinct_values": int(distinct),
+                            "unique_fraction": round(float(unique_fraction), 3),
+                            "duplicate_fraction": round(float(1.0 - unique_fraction), 3),
+                        }
+            except Exception as exc:
+                self.warn(f"PK uniqueness sampling failed for {table}.{column}: {exc}")
+        self.pk_uniqueness_cache[cache_key] = metrics
+        return metrics
+
+    def referential_support(
+        self,
+        fk_table: str,
+        fk_column: str,
+        pk_table: str,
+        pk_column: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not (self.config.enable_advanced_key_tests or self.config.enable_value_overlap):
+            return None
+        cache_key = (fk_table, fk_column, pk_table, pk_column)
+        if cache_key in self.referential_metrics_cache:
+            return self.referential_metrics_cache[cache_key]
+        metrics: Optional[Dict[str, Any]] = None
+        try:
+            df_fk = self.safe_table(fk_table)
+            df_pk = self.safe_table(pk_table)
+            if df_fk is not None and df_pk is not None:
+                fk_vals = self.sampled_distinct_values(
+                    fk_table,
+                    df_fk,
+                    fk_column,
+                    self.config.value_overlap_sample_rows,
+                )
+                pk_vals = self.sampled_distinct_values(
+                    pk_table,
+                    df_pk,
+                    pk_column,
+                    self.config.value_overlap_sample_rows,
+                )
+                if fk_vals:
+                    matched = len(fk_vals & pk_vals)
+                    coverage = matched / len(fk_vals)
+                    metrics = {
+                        "fk_sample_values": len(fk_vals),
+                        "pk_sample_values": len(pk_vals),
+                        "matched_values": matched,
+                        "coverage": round(float(coverage), 3),
+                    }
+                    if pk_vals:
+                        metrics["pk_capture"] = round(float(matched / len(pk_vals)), 3)
+        except Exception as exc:
+            self.warn(
+                f"Referential sampling failed for {fk_table}.{fk_column} -> {pk_table}.{pk_column}: {exc}"
+            )
+        self.referential_metrics_cache[cache_key] = metrics
+        return metrics
+
+    # ------------------------------
+    # Discovery
+    # ------------------------------
+    def discover_tables(self) -> None:
+        if self.errors:
+            return
+        cfg = self.config
+        discovery_start = time.time()
+
+        try:
+            if cfg.use_legacy_database:
+                query = f"SHOW TABLES IN {fq_identifier(cfg.database)}"
+                df = self.spark.sql(query)
+                rows = df.select("tableName").limit(cfg.max_tables + 1).collect()
+                if len(rows) > cfg.max_tables:
+                    self.warn(f"Table count exceeds MAX_TABLES ({cfg.max_tables}); truncated.")
+                    rows = rows[:cfg.max_tables]
+                self.tables = [f"{cfg.database}.{r.tableName}" for r in rows]
+            else:
+                query = f"SHOW TABLES IN {fq_identifier(cfg.catalog)}.{fq_identifier(cfg.schema)}"
+                df = self.spark.sql(query)
+                rows = df.select("tableName").limit(cfg.max_tables + 1).collect()
+                if len(rows) > cfg.max_tables:
+                    self.warn(f"Table count exceeds MAX_TABLES ({cfg.max_tables}); truncated.")
+                    rows = rows[:cfg.max_tables]
+                self.tables = [f"{cfg.catalog}.{cfg.schema}.{r.tableName}" for r in rows]
+        except AnalysisException as exc:
+            detail = getattr(exc, "desc", str(exc))
+            self.error(f"SHOW TABLES failed: {detail}")
+            self.tables = []
+        except Exception as exc:
+            self.error(f"Unexpected error during table discovery: {exc}")
+            self.tables = []
+
+        include_re = cfg.include_tables_re
+        exclude_re = cfg.exclude_tables_re
+        filtered: List[str] = []
+        for table in self.tables:
+            tbl_name = table.split(".")[-1]
+            excluded = False
+            if exclude_re:
+                try:
+                    if re.match(exclude_re, tbl_name, flags=re.I):
+                        excluded = True
+                except re.error as exc:
+                    self.warn(f"Invalid EXCLUDE_TABLES_RE '{exclude_re}': {exc}")
+                    exclude_re = ""
+            if excluded:
+                continue
+            try:
+                if re.match(include_re, tbl_name, flags=re.I):
+                    filtered.append(table)
+            except re.error as exc:
+                self.warn(f"Invalid INCLUDE_TABLES_RE '{include_re}': {exc}")
+                filtered.append(table)
+        self.tables = filtered
+
+        self.logger.banner(f"ERD Generation v{VERSION}")
+        self.logger.info(f"Author        : {AUTHOR}")
+        self.logger.info(f"Run ID        : {self.run_id}")
+        self.logger.info(f"Namespace     : {'legacy DB ' + cfg.database if cfg.use_legacy_database else cfg.catalog + '.' + cfg.schema}")
+        self.logger.info(f"Tables found  : {len(self.tables)} in {time.time() - discovery_start:.1f}s")
+        if not self.tables:
+            self.error("No tables found matching the specified criteria.")
+
+    # ------------------------------
+    # information_schema metadata
+    # ------------------------------
+    def fetch_information_schema(self) -> None:
+        cfg = self.config
+        if cfg.use_legacy_database or cfg.skip_information_schema or not self.tables:
+            return
+        try:
+            ist = self.spark.sql(
+                f"""
+                SELECT table_name, table_type, data_source_format
+                FROM {fq_identifier(cfg.catalog)}.information_schema.tables
+                WHERE table_schema = '{cfg.schema}'
+                """
+            ).cache()
+            for row in ist.collect():
+                key = f"{cfg.catalog}.{cfg.schema}.{row.table_name}"
+                self.table_overview[key] = {
+                    "table_type": row.table_type,
+                    "data_source_format": row.data_source_format,
+                }
+            ist.unpersist()
+        except Exception as exc:
+            self.warn(f"information_schema.tables not accessible: {exc}")
+
+        try:
+            is_tc = self.spark.sql(
+                f"""
+                SELECT * FROM {fq_identifier(cfg.catalog)}.information_schema.table_constraints
+                WHERE table_schema = '{cfg.schema}'
+                """
+            ).cache()
+            is_kcu = self.spark.sql(
+                f"""
+                SELECT * FROM {fq_identifier(cfg.catalog)}.information_schema.key_column_usage
+                WHERE table_schema = '{cfg.schema}'
+                """
+            ).cache()
+            pk_rows = (
+                is_tc.filter(F.col("constraint_type") == "PRIMARY KEY")
+                .select("constraint_name")
+                .distinct()
+                .collect()
+            )
+            for pk in pk_rows:
+                pk_name = pk.constraint_name
+                columns = [
+                    r.column_name
+                    for r in is_kcu.filter(F.col("constraint_name") == pk_name)
+                    .orderBy("ordinal_position")
+                    .select("column_name")
+                    .collect()
+                ]
+                tbl_row = (
+                    is_kcu.filter(F.col("constraint_name") == pk_name)
+                    .select("table_name")
+                    .first()
+                )
+                if tbl_row and columns:
+                    tbl = f"{cfg.catalog}.{cfg.schema}.{tbl_row.table_name}"
+                    self.declared_constraints["pk"][tbl] = columns
+
+            is_rc = self.spark.sql(
+                f"""
+                SELECT * FROM {fq_identifier(cfg.catalog)}.information_schema.referential_constraints
+                WHERE constraint_schema = '{cfg.schema}'
+                """
+            ).cache()
+            fk_rows = (
+                is_tc.filter(F.col("constraint_type") == "FOREIGN KEY")
+                .select("constraint_name", "table_name")
+                .collect()
+            )
+            for row in fk_rows:
+                fk_name = row.constraint_name
+                fk_table = f"{cfg.catalog}.{cfg.schema}.{row.table_name}"
+                fk_cols = [
+                    r.column_name
+                    for r in is_kcu.filter(F.col("constraint_name") == fk_name)
+                    .orderBy("ordinal_position")
+                    .select("column_name")
+                    .collect()
+                ]
+                ref = (
+                    is_rc.filter(F.col("constraint_name") == fk_name)
+                    .select("unique_constraint_name")
+                    .first()
+                )
+                if ref:
+                    pk_name = ref.unique_constraint_name
+                    pk_table_row = (
+                        is_kcu.filter(F.col("constraint_name") == pk_name)
+                        .select("table_name")
+                        .first()
+                    )
+                    pk_cols = [
+                        r.column_name
+                        for r in is_kcu.filter(F.col("constraint_name") == pk_name)
+                        .orderBy("ordinal_position")
+                        .select("column_name")
+                        .collect()
+                    ]
+                    if pk_table_row and fk_cols and pk_cols:
+                        pk_table = f"{cfg.catalog}.{cfg.schema}.{pk_table_row.table_name}"
+                        self.declared_constraints["fk"].append(
+                            {
+                                "fk_table": fk_table,
+                                "fk_cols": fk_cols,
+                                "pk_table": pk_table,
+                                "pk_cols": pk_cols,
+                                "name": fk_name,
+                            }
+                        )
+
+            try:
+                is_cc = self.spark.sql(
+                    f"""
+                    SELECT * FROM {fq_identifier(cfg.catalog)}.information_schema.check_constraints
+                    WHERE constraint_schema = '{cfg.schema}'
+                    """
+                )
+                for row in is_cc.collect():
+                    self.declared_constraints["check"].append(
+                        {
+                            "constraint_name": row.constraint_name,
+                            "check_clause": row.check_clause,
+                        }
+                    )
             except Exception:
                 pass
-            
-            if fmt and support >= DATETIME_SUPPORT_MIN:
-                dt_info[cname] = {
-                    "inferred_format": fmt,
-                    "support_fraction": round(float(support), 3),
-                    "pattern_counts": counts,
-                    "parse_howto": ("STRING→to_date/to_timestamp with detected pattern; "
-                                    "epoch_seconds→to_timestamp(col); epoch_millis→to_timestamp(col/1000.0). "
-                                    "DATE/TIMESTAMP are typed; use date_format for display.")
-                }
 
-    meta["stats"] = {"null_ratio": null_ratio, "approx_distinct": approx_distinct, "examples": ex_rows}
-    meta["datetime_inference"] = dt_info
+            is_tc.unpersist()
+            is_kcu.unpersist()
+            is_rc.unpersist()
+        except Exception as exc:
+            self.warn(f"information_schema constraint discovery limited: {exc}")
 
-print(f"Phase 2 completed in {time.time()-stats_start:.1f}s")
-
-# Enrich column metadata
-for t, meta in entities.items():
-    nr = meta["stats"].get("null_ratio", {})
-    ad = meta["stats"].get("approx_distinct", {})
-    for c in meta["columns"]:
-        cname = c["name"]
-        c["null_ratio"] = float(nr.get(cname)) if cname in nr and nr[cname] is not None else None
-        c["approx_distinct"] = int(ad.get(cname)) if cname in ad and ad[cname] is not None else None
-        if cname in meta["datetime_inference"]:
-            di = meta["datetime_inference"][cname]
-            c["inferred_datetime_format"] = di["inferred_format"]
-            c["inferred_datetime_support"] = di["support_fraction"]
-            c["datetime_parse_howto"] = di["parse_howto"]
-            c["datetime_pattern_counts"] = di.get("pattern_counts")
-
-# =========================
-# PK/FK CANDIDATES + COMPOSITES
-# =========================
-print("\nPhase 3: Identifying PK/FK candidates...")
-pk_start = time.time()
-
-def is_candidate_pk(col_meta, row_count):
-    if row_count in (None, 0): return (False, 0.0)
-    s = 0.0
-    ad = col_meta.get("approx_distinct")
-    if ad is not None and row_count > 0: s += 0.6 * min(1.0, ad / row_count)
-    nr = col_meta.get("null_ratio")
-    if nr is not None: s += 0.2 * (1.0 - nr)
-    if col_meta.get("is_id_name"): s += 0.2
-    return (s >= 0.65), round(s, 3)
-
-def is_candidate_fk(col_meta):
-    s = 0.0
-    nr = col_meta.get("null_ratio")
-    if nr is not None: s += 0.3 * (1.0 - nr)
-    if col_meta.get("is_fk_name") or col_meta.get("is_id_name"): s += 0.4
-    if col_meta.get("family","") in {"integral","decimal","floating","stringy","dates"}: s += 0.3
-    return (s >= 0.55), round(s, 3)
-
-for t, meta in entities.items():
-    rc = meta.get("row_count")
-    for c in meta["columns"]:
-        pkf, pks = is_candidate_pk(c, rc)
-        fkf, fks = is_candidate_fk(c)
-        c["candidate_pk"] = pkf
-        c["candidate_pk_score"] = pks
-        c["candidate_fk"] = fkf
-        c["candidate_fk_score"] = fks
-
-# Apply declared constraints
-for tbl, cols in declared_constraints["pk"].items():
-    if tbl in entities:
-        for c in entities[tbl]["columns"]:
-            if c["name"] in cols:
-                c["candidate_pk"] = True
-                c["candidate_pk_score"] = 1.0
-
-def best_composite_pk(df, cols_meta, row_count, top_n=6, max_k=3):
-    if df is None or not cols_meta or row_count in (None, 0): return None, 0.0
-    cols_meta = sorted(cols_meta, key=lambda c: c.get("candidate_pk_score", 0), reverse=True)[:top_n]
-    names = [c["name"] for c in cols_meta]
-    if len(names) < 2: return None, 0.0
-    sdf = sample_df(df.select(*[F.col(n) for n in names]), 200_000, 0.2 if not FAST_MODE else 0.05)
-    if sdf is None: return None, 0.0
-    best, best_score = None, 0.0
-    for k in range(2, min(max_k + 1, len(names) + 1)):
-        for combo in itertools.combinations(names, k):
-            try:
-                ad = sdf.select(
-                    F.approx_count_distinct(
-                        F.sha2(F.concat_ws("||", *[F.coalesce(F.col(x).cast("string"), F.lit("NULL")) for x in combo]), 256)
-                    )
-                ).first()[0]
-                if ad is None or ad == 0: continue
-                distinct_ratio = ad / max(1, row_count)
-                avg_col_score = sum(next(cm for cm in cols_meta if cm["name"] == x)["candidate_pk_score"] for x in combo) / k
-                score = 0.75 * distinct_ratio + 0.25 * avg_col_score
-                if score > best_score:
-                    best, best_score = combo, score
-            except Exception as e:
-                warnings.append(f"Composite PK test failed for {combo}: {e}")
-                continue
-    return best, round(float(best_score), 3)
-
-pk_registry = {}
-for t, meta in entities.items():
-    if t in declared_constraints["pk"] and declared_constraints["pk"][t]:
-        pk_registry[t] = declared_constraints["pk"][t]
-        continue
-    cands = [c for c in meta["columns"] if c.get("candidate_pk")]
-    if not cands:
-        pk_registry[t] = []
-        continue
-    df = safe_table(t)
-    combo, score = (None, 0.0)
-    if not FAST_MODE and len(cands) >= 2:
-        combo, score = best_composite_pk(df, cands, meta.get("row_count"), TOP_PK_CANDIDATES, MAX_COMPOSITE_K)
-    if combo and score >= 0.80:
-        pk_registry[t] = list(combo)
-    elif cands:
-        best_single = sorted([(c["name"], c["candidate_pk_score"]) for c in cands], key=lambda x: x[1], reverse=True)[0][0]
-        pk_registry[t] = [best_single]
-    else:
-        pk_registry[t] = []
-
-print(f"Phase 3 completed in {time.time()-pk_start:.1f}s")
-print(f"  - Identified PKs for {len([k for k,v in pk_registry.items() if v])} tables")
-
-# =========================
-# RELATIONSHIPS
-# =========================
-print("\nPhase 4: Inferring relationships...")
-rel_start = time.time()
-
-relationships = []
-
-# Declared relationships
-for fk in declared_constraints["fk"]:
-    fk_cols_str = " + ".join(fk["fk_cols"]) if len(fk["fk_cols"]) > 1 else fk["fk_cols"][0] if fk["fk_cols"] else "UNKNOWN"
-    pk_cols_str = " + ".join(fk["pk_cols"]) if len(fk["pk_cols"]) > 1 else fk["pk_cols"][0] if fk["pk_cols"] else "UNKNOWN"
-    if len(fk["fk_cols"]) == 1 and len(fk["pk_cols"]) == 1:
-        join_sql = f"SELECT * FROM {fq_table(fk['fk_table'])} f JOIN {fq_table(fk['pk_table'])} p ON f.`{fk['fk_cols'][0]}` = p.`{fk['pk_cols'][0]}`"
-        join_pyspark = f"fk.join(pk, F.col('f.`{fk['fk_cols'][0]}`') == F.col('p.`{fk['pk_cols'][0]}`'), 'left')"
-    else:
-        conditions = [f"f.`{fc}` = p.`{pc}`" for fc, pc in zip(fk['fk_cols'], fk['pk_cols'])]
-        join_sql = f"SELECT * FROM {fq_table(fk['fk_table'])} f JOIN {fq_table(fk['pk_table'])} p ON " + " AND ".join(conditions)
-        join_pyspark = "fk.join(pk, " + " & ".join([f"(F.col('f.`{fc}`') == F.col('p.`{pc}`'))" for fc, pc in zip(fk['fk_cols'], fk['pk_cols'])]) + ", 'left')"
-    relationships.append({
-        "fk_table": fk["fk_table"], "fk_column": fk_cols_str,
-        "pk_table": fk["pk_table"], "pk_column": pk_cols_str,
-        "score": 1.0, "evidence": {"declared_constraint": fk["name"]},
-        "cardinality": "many-to-one", "declared": True,
-        "join_example_sql": join_sql, "join_example_pyspark": join_pyspark
-    })
-
-# Inferred relationships
-rel_checked = 0
-for fk_table, fk_meta in entities.items():
-    df_fk = safe_table(fk_table)
-    for fk_col in [c for c in fk_meta["columns"] if c.get("candidate_fk")]:
-        fk_name = fk_col["name"]; fk_fam = fk_col["family"]; fk_null = fk_col.get("null_ratio"); fk_ad = fk_col.get("approx_distinct")
-        for pk_table, pk_cols in pk_registry.items():
-            if not pk_cols: continue
-            if any(r.get("declared") and r["fk_table"] == fk_table and r["pk_table"] == pk_table for r in relationships):
-                continue
-            
-            # Timeout check
-            rel_checked += 1
-            if rel_checked % 100 == 0 and (time.time() - start_time) > (MAX_RUNTIME_MINUTES * 60):
-                warnings.append(f"Exceeded MAX_RUNTIME_MINUTES ({MAX_RUNTIME_MINUTES}), stopping relationship inference early")
+    # ------------------------------
+    # Metadata collection
+    # ------------------------------
+    def collect_table_metadata(self) -> None:
+        phase_start = time.time()
+        for idx, table in enumerate(self.tables, 1):
+            if not self._within_budget():
+                self.warn(
+                    f"Exceeded MAX_RUNTIME_MINUTES during metadata collection after {idx-1} tables."
+                )
                 break
-            
-            best_name, best_score, best_ev = None, 0.0, None
-            for pk_name in pk_cols:
-                pk_col = next((c for c in entities[pk_table]["columns"] if c["name"] == pk_name), None)
-                if pk_col is None: continue
-                sc_name = name_match_score(fk_name, pk_name)
-                sc_type = type_compat_score(fk_fam, pk_col["family"])
-                if sc_type <= 0.0: continue
-                sc_null = null_ratio_score(fk_null)
-                sc_dr   = distinct_ratio_score(pk_col.get("approx_distinct"), entities[pk_table].get("row_count"))
-                sc_card = cardinality_score(fk_ad, pk_col.get("approx_distinct"))
-                sc_overlap = 0.0
-                if ENABLE_VALUE_OVERLAP:
-                    try:
-                        fk_vals = sampled_distinct_values(df_fk, fk_name, VALUE_OVERLAP_SAMPLE_ROWS)
-                        pk_vals = sampled_distinct_values(safe_table(pk_table), pk_name, VALUE_OVERLAP_SAMPLE_ROWS)
-                        if fk_vals:
-                            sc_overlap = min(1.0, len(fk_vals & pk_vals) / max(1, len(fk_vals)))
-                    except Exception as e:
-                        warnings.append(f"Overlap check failed {fk_table}.{fk_name} -> {pk_table}.{pk_name}: {e}")
-                        sc_overlap = 0.0
-                total = (0.20*sc_name + 0.10*sc_type + 0.20*sc_dr + 0.10*sc_null + 0.35*sc_overlap + 0.05*sc_card)
-                if total > best_score:
-                    best_score = total; best_name = pk_name
-                    best_ev = {"name_match": round(sc_name,3), "type_compat": sc_type,
-                               "pk_distinct_ratio": round(sc_dr,3), "fk_null_complement": round(sc_null,3),
-                               "value_overlap": round(sc_overlap,3), "cardinality_shape": round(sc_card,3),
-                               "fk_ad": fk_ad, "pk_ad": pk_col.get("approx_distinct")}
-            if best_name and best_score >= MIN_REL_SCORE:
-                card = "many-to-one"
+
+            if self.config.verbose_logs and idx % 5 == 0:
+                elapsed = time.time() - phase_start
+                rate = idx / elapsed if elapsed > 0 else 0
+                remaining = (
+                    (len(self.tables) - idx) / rate if rate > 0 else float("inf")
+                )
+                self.logger.info(
+                    f"[Meta {idx}/{len(self.tables)}] {table} "
+                    f"elapsed={elapsed:.1f}s est_remaining={remaining:.1f}s"
+                )
+
+            df = self.safe_table(table)
+            if df is None:
+                self.entities[table] = {
+                    "table": table,
+                    "columns": [],
+                    "row_count": None,
+                    "props": {},
+                    "is_view": False,
+                    "table_type": None,
+                    "data_source_format": None,
+                    "partial": True,
+                }
+                continue
+
+            props: Dict[str, Any] = {}
+            try:
+                desc = self.spark.sql(f"DESCRIBE EXTENDED {fq_table_name(table.split('.'))}").collect()
+                props = {
+                    row.col_name: row.data_type
+                    for row in desc
+                    if row.col_name and row.col_name.strip()
+                }
+            except Exception as exc:
+                self.warn(f"DESCRIBE EXTENDED failed for {table}: {exc}")
+
+            columns: List[Dict[str, Any]] = []
+            for field in df.schema.fields:
+                family = dtype_family(field.dataType)
                 try:
-                    pk_ad = next((c for c in entities[pk_table]["columns"] if c["name"] == best_name), {}).get("approx_distinct")
-                    if fk_ad is not None and pk_ad is not None and pk_ad > 0 and abs(fk_ad - pk_ad)/pk_ad < 0.05:
-                        card = "one-to-one"
+                    nested = walk_schema("", field.dataType)
+                    struct_fields = [
+                        {
+                            "name": c["path"],
+                            "type": c["type"],
+                            "nullable": c["nullable"],
+                        }
+                        for c in nested
+                        if c["path"]
+                        and ("." in c["path"] or "[]" in c["path"] or "{}" in c["path"])
+                    ][:200]
+                except Exception as exc:
+                    self.warn(f"Schema walking failed for {table}.{field.name}: {exc}")
+                    struct_fields = []
+                columns.append(
+                    {
+                        "name": field.name,
+                        "type": field.dataType.simpleString(),
+                        "family": family,
+                        "nullable": field.nullable,
+                        "is_id_name": col_name_hints(field.name, ID_NAME_HINTS),
+                        "is_fk_name": col_name_hints(field.name, FK_NAME_HINTS),
+                        "struct_fields": struct_fields,
+                        "array_guidance": array_guidance(field.dataType),
+                        "map_guidance": map_guidance(field.dataType),
+                    }
+                )
+
+            row_count = self.get_row_count_fast(table, df)
+            overview = self.table_overview.get(table, {})
+            is_view = "Type" in props and "VIEW" in str(props.get("Type", "")).upper()
+            self.entities[table] = {
+                "table": table,
+                "columns": columns,
+                "row_count": row_count,
+                "props": props,
+                "is_view": is_view or (overview.get("table_type") == "VIEW"),
+                "table_type": overview.get("table_type"),
+                "data_source_format": overview.get("data_source_format"),
+                "partial": False,
+            }
+
+    def get_row_count_fast(self, table: str, df: Optional[DataFrame]) -> Optional[int]:
+        try:
+            detail = (
+                self.spark.sql(f"DESCRIBE DETAIL {fq_table_name(table.split('.'))}")
+                .select("numRows")
+                .first()
+            )
+            if detail and detail[0] is not None:
+                return int(detail[0])
+        except Exception:
+            pass
+        if not self.config.fast_mode and df is not None:
+            try:
+                return df.count()
+            except Exception:
+                pass
+        return None
+
+    # ------------------------------
+    # Statistics
+    # ------------------------------
+    def compute_statistics(self) -> None:
+        cfg = self.config
+        phase_start = time.time()
+        for idx, (table, meta) in enumerate(self.entities.items(), 1):
+            if not self._within_budget():
+                self.warn(
+                    f"Exceeded MAX_RUNTIME_MINUTES during statistics phase after {idx-1} tables."
+                )
+                break
+
+            if cfg.verbose_logs and idx % 5 == 0:
+                elapsed = time.time() - phase_start
+                rate = idx / elapsed if elapsed > 0 else 0
+                remaining = (
+                    (len(self.entities) - idx) / rate if rate > 0 else float("inf")
+                )
+                self.logger.info(
+                    f"[Stats {idx}/{len(self.entities)}] {table} "
+                    f"elapsed={elapsed:.1f}s est_remaining={remaining:.1f}s"
+                )
+
+            df = self.safe_table(table)
+            if df is None or not meta["columns"]:
+                meta["stats"] = {"null_ratio": {}, "approx_distinct": {}, "examples": []}
+                meta["datetime_inference"] = {}
+                continue
+
+            effective_fraction = cfg.row_sample_fraction
+            if meta.get("row_count") and meta["row_count"] > 50_000_000:
+                effective_fraction = min(effective_fraction, 0.03)
+
+            sampled_for_nulls = self.sample_df(
+                df, cfg.nullability_sample_rows, effective_fraction
+            )
+            null_ratio: Dict[str, Optional[float]] = {}
+            approx_distinct: Dict[str, Optional[int]] = {}
+            examples: List[Dict[str, Any]] = []
+            datetime_info: Dict[str, Dict[str, Any]] = {}
+
+            try:
+                if sampled_for_nulls is not None:
+                    exprs = [
+                        F.avg(F.when(F.col(col["name"]).isNull(), 1).otherwise(0)).alias(col["name"])
+                        for col in meta["columns"]
+                    ]
+                    result = sampled_for_nulls.select(*exprs).first()
+                    if result:
+                        null_ratio = result.asDict()
+            except Exception as exc:
+                self.warn(f"Null ratio calculation failed for {table}: {exc}")
+
+            if not cfg.fast_mode:
+                eligible = [
+                    col["name"]
+                    for col in meta["columns"]
+                    if col["family"]
+                    in {"integral", "decimal", "floating", "stringy", "dates", "boolean"}
+                ]
+                try:
+                    for batch_start in range(0, len(eligible), 50):
+                        batch = eligible[batch_start : batch_start + 50]
+                        exprs = [approx_distinct_expr(c) for c in batch]
+                        row = df.select(*exprs).first()
+                        if row:
+                            approx_distinct.update(row.asDict())
+                except Exception as exc:
+                    self.warn(f"Approx distinct calculation failed for {table}: {exc}")
+
+            if cfg.include_examples:
+                try:
+                    sample_cols = [c["name"] for c in meta["columns"]]
+                    rows = df.select(*[F.col(c) for c in sample_cols]).limit(3).collect()
+                    for row in rows:
+                        examples.append({c: row[i] for i, c in enumerate(sample_cols)})
                 except Exception:
                     pass
-                relationships.append({
-                    "fk_table": fk_table, "fk_column": fk_name,
-                    "pk_table": pk_table, "pk_column": best_name,
-                    "score": round(best_score, 3), "evidence": best_ev,
-                    "cardinality": card, "declared": False,
-                    "join_example_sql": f"SELECT * FROM {fq_table(fk_table)} f JOIN {fq_table(pk_table)} p ON f.`{fk_name}` = p.`{best_name}`",
-                    "join_example_pyspark": f"fk.join(pk, F.col('f.`{fk_name}`') == F.col('p.`{best_name}`'), 'left')"
-                })
 
-# Composite FK inference
-if ENABLE_COMPOSITE_FK_INFERENCE:
-    for pk_table, pk_cols in pk_registry.items():
-        if len(pk_cols) < 2: continue
-        for fk_table, fk_meta in entities.items():
-            if fk_table == pk_table: continue
-            fk_names = [c["name"] for c in fk_meta["columns"]]
-            if all(any(fn.lower()==pc.lower() or fn.lower().endswith("_"+pc.lower()) for fn in fk_names) for pc in pk_cols):
-                passes_overlap = True
-                if ENABLE_VALUE_OVERLAP:
+            if cfg.enable_datetime_detection and not cfg.fast_mode:
+                for col in meta["columns"]:
+                    if col["family"] == "dates":
+                        datetime_info[col["name"]] = {
+                            "inferred_format": "spark_date_or_timestamp",
+                            "support_fraction": 1.0,
+                            "parse_howto": "Already typed as DATE/TIMESTAMP.",
+                            "pattern_counts": {"native": cfg.datetime_sample_size},
+                        }
+                        continue
+                    if col["family"] != "stringy":
+                        continue
                     try:
-                        df_fk = safe_table(fk_table); df_pk = safe_table(pk_table)
-                        if df_fk is not None and df_pk is not None:
-                            fk_sdf = sample_df(df_fk.select(*[F.col(c).cast("string") for c in pk_cols]), VALUE_OVERLAP_SAMPLE_ROWS, min(1.0, ROW_SAMPLE_FRACTION))
-                            pk_sdf = sample_df(df_pk.select(*[F.col(c).cast("string") for c in pk_cols]), VALUE_OVERLAP_SAMPLE_ROWS, min(1.0, ROW_SAMPLE_FRACTION))
-                            if fk_sdf is not None and pk_sdf is not None:
-                                fk_hash = {r[0] for r in fk_sdf.select(F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c), F.lit("NULL")) for c in pk_cols]), 256)).distinct().limit(200000).collect()}
-                                pk_hash = {r[0] for r in pk_sdf.select(F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c), F.lit("NULL")) for c in pk_cols]), 256)).distinct().limit(200000).collect()}
-                                if fk_hash:
-                                    overlap = len(fk_hash & pk_hash) / max(1, len(fk_hash))
-                                    passes_overlap = overlap >= 0.5
-                    except Exception as e:
-                        warnings.append(f"Composite FK overlap failed {fk_table}->{pk_table}: {e}")
-                if passes_overlap:
-                    conditions = [f"f.`{c}` = p.`{c}`" for c in pk_cols]
-                    join_sql = f"SELECT * FROM {fq_table(fk_table)} f JOIN {fq_table(pk_table)} p ON " + " AND ".join(conditions)
-                    join_pyspark = "fk.join(pk, " + " & ".join([f"(F.col('f.`{c}`') == F.col('p.`{c}`'))" for c in pk_cols]) + ", 'left')"
-                    relationships.append({
-                        "fk_table": fk_table, "fk_column": " + ".join(pk_cols),
-                        "pk_table": pk_table, "pk_column": " + ".join(pk_cols),
-                        "score": 0.85 if ENABLE_VALUE_OVERLAP else 0.70,
-                        "evidence": {"composite_match_on_names": True, "overlap_checked": ENABLE_VALUE_OVERLAP},
-                        "cardinality": "many-to-one", "declared": False,
-                        "join_example_sql": join_sql, "join_example_pyspark": join_pyspark
-                    })
+                        subset = (
+                            sampled_for_nulls or df
+                        ).select(F.col(col["name"])).where(F.col(col["name"]).isNotNull())
+                        rows = subset.limit(cfg.datetime_sample_size).collect()
+                        sample_vals = [str(r[0]) for r in rows if r[0] is not None]
+                        if len(sample_vals) >= 10:
+                            fmt, support, counts = detect_string_datetime_format(sample_vals)
+                            if fmt and support >= cfg.datetime_support_min:
+                                datetime_info[col["name"]] = {
+                                    "inferred_format": fmt,
+                                    "support_fraction": round(float(support), 3),
+                                    "pattern_counts": counts,
+                                    "parse_howto": f"to_timestamp(col, '{fmt}')",
+                                }
+                    except Exception as exc:
+                        self.warn(f"Datetime detection failed for {table}.{col['name']}: {exc}")
 
-print(f"Phase 4 completed in {time.time()-rel_start:.1f}s")
-print(f"  - Found {len(relationships)} relationships ({len([r for r in relationships if r.get('declared')])} declared, {len([r for r in relationships if not r.get('declared')])} inferred)")
+            meta["stats"] = {
+                "null_ratio": null_ratio,
+                "approx_distinct": approx_distinct,
+                "examples": examples,
+            }
+            meta["datetime_inference"] = datetime_info
 
-# =========================
-# MODEL
-# =========================
-model = {
-    "version": VERSION,
-    "author": AUTHOR,
-    "run_id": RUN_ID,
-    "namespace": {
-        "type": "database" if USE_LEGACY_DATABASE else "unity_catalog",
-        "catalog": None if USE_LEGACY_DATABASE else CATALOG,
-        "schema":  None if USE_LEGACY_DATABASE else SCHEMA,
-        "database": DATABASE if USE_LEGACY_DATABASE else None
-    },
-    "spark_env": {
-        "spark_version": spark.version,
-        "session_timezone": SESSION_TIMEZONE_EFFECTIVE,
-        "ansi": spark.conf.get("spark.sql.ansi.enabled", "unknown")
-    },
-    "entities": [],
-    "relationships": relationships,
-    "warnings": warnings,
-    "errors": errors
-}
+        # Enrich columns with stats
+        for table, meta in self.entities.items():
+            nr = meta.get("stats", {}).get("null_ratio", {})
+            ad = meta.get("stats", {}).get("approx_distinct", {})
+            for column in meta["columns"]:
+                cname = column["name"]
+                column["null_ratio"] = float(nr.get(cname)) if cname in nr and nr[cname] is not None else None
+                column["approx_distinct"] = int(ad.get(cname)) if cname in ad and ad[cname] is not None else None
+                if cname in meta.get("datetime_inference", {}):
+                    di = meta["datetime_inference"][cname]
+                    column["inferred_datetime_format"] = di["inferred_format"]
+                    column["inferred_datetime_support"] = di["support_fraction"]
+                    column["datetime_parse_howto"] = di.get("parse_howto")
+                    column["datetime_pattern_counts"] = di.get("pattern_counts")
 
-for t, meta in sorted(entities.items(), key=lambda kv: kv[0].lower()):
-    model["entities"].append({
-        "name": t,
-        "row_count": meta.get("row_count"),
-        "is_view": meta.get("is_view", False),
-        "table_type": meta.get("table_type"),
-        "data_source_format": meta.get("data_source_format"),
-        "partial": meta.get("partial", False),
-        "columns": [
-            {
-                "name": c["name"], "type": c["data_type"], "family": c["family"], "nullable": c["nullable"],
-                "approx_distinct": c.get("approx_distinct"), "null_ratio": c.get("null_ratio"),
-                "candidate_pk": c.get("candidate_pk"), "candidate_pk_score": c.get("candidate_pk_score"),
-                "candidate_fk": c.get("candidate_fk"), "candidate_fk_score": c.get("candidate_fk_score"),
-                "inferred_datetime_format": c.get("inferred_datetime_format"),
-                "inferred_datetime_support": c.get("inferred_datetime_support"),
-                "datetime_parse_howto": c.get("datetime_parse_howto"),
-                "datetime_pattern_counts": c.get("datetime_pattern_counts"),
-                "struct_fields": c.get("struct_fields"),
-                "array_guidance": c.get("array_guidance"),
-                "map_guidance": c.get("map_guidance"),
-            } for c in meta["columns"]
-        ],
-        "examples": meta.get("stats", {}).get("examples", [])
-    })
+    # ------------------------------
+    # Key candidate scoring
+    # ------------------------------
+    def identify_key_candidates(self) -> Dict[str, List[str]]:
+        cfg = self.config
 
-# =========================
-# RENDER (Markdown + Mermaid)
-# =========================
-def md_escape(s): 
-    if s is None: return ""
-    return str(s).replace("|", "\\|").replace("\n", " ").replace("\r", "")
+        def is_candidate_pk(col_meta: Dict[str, Any], row_count: Optional[int]) -> float:
+            if row_count in (None, 0):
+                return 0.0
+            score = 0.0
+            ad = col_meta.get("approx_distinct")
+            if ad is not None and row_count > 0:
+                score += 0.6 * min(1.0, ad / row_count)
+            nr = col_meta.get("null_ratio")
+            if nr is not None:
+                score += 0.2 * (1.0 - nr)
+            if col_meta.get("is_id_name"):
+                score += 0.2
+            return round(score, 3)
 
-def xml_escape(s):
-    if s is None: return ""
-    return html.escape(str(s))
+        def is_candidate_fk(col_meta: Dict[str, Any]) -> Tuple[bool, float]:
+            score = 0.0
+            nr = col_meta.get("null_ratio")
+            if nr is not None:
+                score += 0.3 * (1.0 - nr)
+            if col_meta.get("is_fk_name") or col_meta.get("is_id_name"):
+                score += 0.4
+            if col_meta.get("family", "") in {
+                "integral",
+                "decimal",
+                "floating",
+                "stringy",
+                "dates",
+            }:
+                score += 0.3
+            return score >= 0.55, round(score, 3)
 
-def mermaid_safe(s):
-    if s is None: return ""
-    return str(s).replace("`", "").replace('"', "'").replace("\n", " ").replace(".", "_")
+        pk_registry: Dict[str, List[str]] = {}
+        for table, meta in self.entities.items():
+            row_count = meta.get("row_count")
+            for column in meta["columns"]:
+                pk_score = is_candidate_pk(column, row_count)
+                uniqueness = self.estimate_pk_uniqueness(table, column["name"])
+                if uniqueness:
+                    column["pk_uniqueness"] = uniqueness
+                    pk_score = round(
+                        (pk_score * 0.6) + (uniqueness["unique_fraction"] * 0.4), 3
+                    )
+                pk_flag = pk_score >= cfg.pk_accept_threshold
+                column["candidate_pk"] = pk_flag
+                column["candidate_pk_score"] = pk_score
+                column["pk_confidence"] = self.classify_pk_confidence(pk_score, pk_flag)
 
-def render_mermaid(model) -> str:
-    if len(model["entities"]) > MAX_MERMAID_TABLES:
-        return "_Mermaid diagram omitted (too many tables for readable rendering)._"
+                fk_flag, fk_score = is_candidate_fk(column)
+                fk_score = round(fk_score, 3)
+                fk_flag = fk_score >= cfg.min_rel_score
+                column["candidate_fk"] = fk_flag
+                column["candidate_fk_score"] = fk_score
+                column["fk_confidence"] = self.classify_fk_confidence(fk_score)
+
+        for table, columns in self.declared_constraints["pk"].items():
+            if table in self.entities:
+                for column in self.entities[table]["columns"]:
+                    if column["name"] in columns:
+                        column["candidate_pk"] = True
+                        column["candidate_pk_score"] = 1.0
+                        column["pk_confidence"] = "high"
+
+        for table, meta in self.entities.items():
+            if table in self.declared_constraints["pk"] and self.declared_constraints["pk"][table]:
+                pk_registry[table] = self.declared_constraints["pk"][table]
+                continue
+            candidates = [c for c in meta["columns"] if c.get("candidate_pk")]
+            if not candidates:
+                pk_registry[table] = []
+                continue
+            df = self.safe_table(table)
+            combo: Optional[Tuple[str, ...]] = None
+            score = 0.0
+            if not cfg.fast_mode and len(candidates) >= 2:
+                combo, score = self.best_composite_pk(
+                    df,
+                    candidates,
+                    meta.get("row_count"),
+                    cfg.top_pk_candidates,
+                    cfg.max_composite_k,
+                )
+            required_score = max(0.80, cfg.pk_high_confidence)
+            if combo and score >= required_score:
+                pk_registry[table] = list(combo)
+            else:
+                best_single = max(
+                    ((c["name"], c.get("candidate_pk_score", 0.0)) for c in candidates),
+                    key=lambda item: item[1],
+                )[0]
+                pk_registry[table] = [best_single]
+        return pk_registry
+
+    def best_composite_pk(
+        self,
+        df: Optional[DataFrame],
+        columns: List[Dict[str, Any]],
+        row_count: Optional[int],
+        top_n: int,
+        max_k: int,
+    ) -> Tuple[Optional[Tuple[str, ...]], float]:
+        if df is None or row_count in (None, 0):
+            return None, 0.0
+        sorted_cols = sorted(
+            columns, key=lambda c: c.get("candidate_pk_score", 0.0), reverse=True
+        )[:top_n]
+        names = [c["name"] for c in sorted_cols]
+        if len(names) < 2:
+            return None, 0.0
+        sample_frac = 0.05 if self.config.fast_mode else 0.2
+        sdf = self.sample_df(df.select(*[F.col(n) for n in names]), 200_000, sample_frac)
+        if sdf is None:
+            return None, 0.0
+        best_combo: Optional[Tuple[str, ...]] = None
+        best_score = 0.0
+        for k in range(2, min(max_k + 1, len(names) + 1)):
+            for combo in itertools.combinations(names, k):
+                try:
+                    ad = sdf.select(
+                        F.approx_count_distinct(
+                            F.sha2(
+                                F.concat_ws(
+                                    "||",
+                                    *[
+                                        F.coalesce(F.col(c).cast("string"), F.lit("NULL"))
+                                        for c in combo
+                                    ],
+                                ),
+                                256,
+                            )
+                        )
+                    ).first()[0]
+                    if ad is None or ad == 0:
+                        continue
+                    distinct_ratio = ad / max(1, row_count)
+                    avg_score = sum(
+                        next(col for col in sorted_cols if col["name"] == c)["candidate_pk_score"]
+                        for c in combo
+                    ) / k
+                    score = 0.75 * distinct_ratio + 0.25 * avg_score
+                    if score > best_score:
+                        best_combo, best_score = combo, score
+                except Exception as exc:
+                    self.warn(f"Composite PK evaluation failed for {combo}: {exc}")
+                    continue
+        return best_combo, round(float(best_score), 3)
+
+    # ------------------------------
+    # Relationship inference
+    # ------------------------------
+    def infer_relationships(self, pk_registry: Dict[str, List[str]]) -> None:
+        cfg = self.config
+        relationships: List[Dict[str, Any]] = []
+
+        # Declared relationships
+        for fk in self.declared_constraints["fk"]:
+            fk_cols = fk["fk_cols"]
+            pk_cols = fk["pk_cols"]
+            fk_cols_str = " + ".join(fk_cols) if len(fk_cols) > 1 else fk_cols[0]
+            pk_cols_str = " + ".join(pk_cols) if len(pk_cols) > 1 else pk_cols[0]
+            if len(fk_cols) == 1 and len(pk_cols) == 1:
+                join_sql = (
+                    f"SELECT * FROM {fq_table_name(fk['fk_table'].split('.'))} f "
+                    f"JOIN {fq_table_name(fk['pk_table'].split('.'))} p "
+                    f"ON f.`{fk_cols[0]}` = p.`{pk_cols[0]}`"
+                )
+                join_pyspark = (
+                    f"fk.join(pk, F.col('f.`{fk_cols[0]}`') == F.col('p.`{pk_cols[0]}`'), 'left')"
+                )
+            else:
+                conditions = [
+                    f"f.`{fc}` = p.`{pc}`" for fc, pc in itertools.zip_longest(fk_cols, pk_cols, fillvalue="")
+                ]
+                join_sql = (
+                    f"SELECT * FROM {fq_table_name(fk['fk_table'].split('.'))} f "
+                    f"JOIN {fq_table_name(fk['pk_table'].split('.'))} p "
+                    f"ON " + " AND ".join(conditions)
+                )
+                join_pyspark = (
+                    "fk.join(pk, "
+                    + " & ".join(
+                        [
+                            f"(F.col('f.`{fc}`') == F.col('p.`{pc}`'))"
+                            for fc, pc in zip(fk_cols, pk_cols)
+                        ]
+                    )
+                    + ", 'left')"
+                )
+            relationships.append(
+                {
+                    "fk_table": fk["fk_table"],
+                    "fk_column": fk_cols_str,
+                    "pk_table": fk["pk_table"],
+                    "pk_column": pk_cols_str,
+                    "score": 1.0,
+                    "evidence": {"declared_constraint": fk["name"]},
+                    "cardinality": "many-to-one",
+                    "declared": True,
+                    "join_example_sql": join_sql,
+                    "join_example_pyspark": join_pyspark,
+                    "confidence": "high",
+                }
+            )
+            if fk["fk_table"] in self.entities:
+                for fk_col_name in fk_cols:
+                    fk_column_meta = next(
+                        (
+                            c
+                            for c in self.entities[fk["fk_table"]]["columns"]
+                            if c["name"] == fk_col_name
+                        ),
+                        None,
+                    )
+                    if fk_column_meta is not None:
+                        fk_column_meta["candidate_fk"] = True
+                        fk_column_meta["candidate_fk_score"] = 1.0
+                        fk_column_meta["fk_confidence"] = "high"
+
+        processed = 0
+        for fk_table, fk_meta in self.entities.items():
+            df_fk = self.safe_table(fk_table)
+            for fk_col in [c for c in fk_meta["columns"] if c.get("candidate_fk")]:
+                fk_name = fk_col["name"]
+                for pk_table, pk_cols in pk_registry.items():
+                    if not pk_cols:
+                        continue
+                    if any(
+                        r.get("declared")
+                        and r["fk_table"] == fk_table
+                        and r["pk_table"] == pk_table
+                        for r in relationships
+                    ):
+                        continue
+                    processed += 1
+                    if not self._within_budget():
+                        self.warn(
+                            f"Exceeded MAX_RUNTIME_MINUTES during relationship inference after {processed} checks."
+                        )
+                        break
+                    best_name: Optional[str] = None
+                    best_score = 0.0
+                    best_evidence: Optional[Dict[str, Any]] = None
+                    for pk_name in pk_cols:
+                        pk_col = next(
+                            (c for c in self.entities[pk_table]["columns"] if c["name"] == pk_name),
+                            None,
+                        )
+                        if pk_col is None:
+                            continue
+                        sc_name = name_match_score(fk_name, pk_name)
+                        sc_type = 1.0 if families_compatible(fk_col["family"], pk_col["family"]) else 0.0
+                        if sc_type <= 0.0:
+                            continue
+                        sc_null = null_ratio_score(fk_col.get("null_ratio"))
+                        sc_dr = distinct_ratio_score(pk_col.get("approx_distinct"), self.entities[pk_table].get("row_count"))
+                        sc_card = cardinality_score(fk_col.get("approx_distinct"), pk_col.get("approx_distinct"))
+                        metrics = self.referential_support(fk_table, fk_name, pk_table, pk_name)
+                        sc_overlap = metrics["coverage"] if metrics else 0.0
+                        total = (
+                            0.20 * sc_name
+                            + 0.10 * sc_type
+                            + 0.20 * sc_dr
+                            + 0.10 * sc_null
+                            + 0.35 * sc_overlap
+                            + 0.05 * sc_card
+                        )
+                        if total > best_score:
+                            best_score = total
+                            best_name = pk_name
+                            best_evidence = {
+                                "name_match": round(sc_name, 3),
+                                "type_compat": sc_type,
+                                "pk_distinct_ratio": round(sc_dr, 3),
+                                "fk_null_complement": round(sc_null, 3),
+                                "value_overlap": round(sc_overlap, 3),
+                                "cardinality_shape": round(sc_card, 3),
+                                "fk_ad": fk_col.get("approx_distinct"),
+                                "pk_ad": pk_col.get("approx_distinct"),
+                            }
+                            if metrics:
+                                best_evidence["referential_sample"] = metrics
+                    if best_name and best_score >= cfg.min_rel_score:
+                        cardinality = "many-to-one"
+                        try:
+                            fk_ad = fk_col.get("approx_distinct")
+                            pk_ad = next(
+                                (c for c in self.entities[pk_table]["columns"] if c["name"] == best_name),
+                                {},
+                            ).get("approx_distinct")
+                            if (
+                                fk_ad is not None
+                                and pk_ad is not None
+                                and pk_ad > 0
+                                and abs(fk_ad - pk_ad) / pk_ad < 0.05
+                            ):
+                                cardinality = "one-to-one"
+                        except Exception:
+                            pass
+                        rel_score = round(best_score, 3)
+                        relationships.append(
+                            {
+                                "fk_table": fk_table,
+                                "fk_column": fk_name,
+                                "pk_table": pk_table,
+                                "pk_column": best_name,
+                                "score": rel_score,
+                                "evidence": best_evidence,
+                                "cardinality": cardinality,
+                                "declared": False,
+                                "join_example_sql": f"SELECT * FROM {fq_table_name(fk_table.split('.'))} f JOIN {fq_table_name(pk_table.split('.'))} p ON f.`{fk_name}` = p.`{best_name}`",
+                                "join_example_pyspark": f"fk.join(pk, F.col('f.`{fk_name}`') == F.col('p.`{best_name}`'), 'left')",
+                                "confidence": self.classify_relationship_confidence(rel_score, False),
+                            }
+                        )
+
+        if cfg.enable_composite_fk:
+            for pk_table, pk_cols in pk_registry.items():
+                if len(pk_cols) < 2:
+                    continue
+                for fk_table, fk_meta in self.entities.items():
+                    if fk_table == pk_table:
+                        continue
+                    fk_columns = [c["name"] for c in fk_meta["columns"]]
+                    if not all(
+                        any(
+                            fn.lower() == pk_col.lower()
+                            or fn.lower().endswith(f"_{pk_col.lower()}")
+                            for fn in fk_columns
+                        )
+                        for pk_col in pk_cols
+                    ):
+                        continue
+                    passes_overlap = True
+                    overlap_ratio: Optional[float] = None
+                    if cfg.enable_value_overlap:
+                        try:
+                            df_fk = self.safe_table(fk_table)
+                            df_pk = self.safe_table(pk_table)
+                            if df_fk is not None and df_pk is not None:
+                                fk_sample = self.sample_df(
+                                    df_fk.select(
+                                        *[F.col(c).cast("string") for c in pk_cols]
+                                    ),
+                                    cfg.value_overlap_sample_rows,
+                                    cfg.row_sample_fraction,
+                                )
+                                pk_sample = self.sample_df(
+                                    df_pk.select(
+                                        *[F.col(c).cast("string") for c in pk_cols]
+                                    ),
+                                    cfg.value_overlap_sample_rows,
+                                    cfg.row_sample_fraction,
+                                )
+                                if fk_sample is not None and pk_sample is not None:
+                                    fk_hash = {
+                                        r[0]
+                                        for r in fk_sample.select(
+                                            F.sha2(
+                                                F.concat_ws(
+                                                    "||",
+                                                    *[
+                                                        F.coalesce(
+                                                            F.col(c), F.lit("NULL")
+                                                        )
+                                                        for c in pk_cols
+                                                    ],
+                                                ),
+                                                256,
+                                            )
+                                        )
+                                        .distinct()
+                                        .limit(200000)
+                                        .collect()
+                                    }
+                                    pk_hash = {
+                                        r[0]
+                                        for r in pk_sample.select(
+                                            F.sha2(
+                                                F.concat_ws(
+                                                    "||",
+                                                    *[
+                                                        F.coalesce(
+                                                            F.col(c), F.lit("NULL")
+                                                        )
+                                                        for c in pk_cols
+                                                    ],
+                                                ),
+                                                256,
+                                            )
+                                        )
+                                        .distinct()
+                                        .limit(200000)
+                                        .collect()
+                                    }
+                                    if fk_hash:
+                                        overlap = len(fk_hash & pk_hash) / max(
+                                            1, len(fk_hash)
+                                        )
+                                        overlap_ratio = overlap
+                                        passes_overlap = overlap >= 0.5
+                        except Exception as exc:
+                            self.warn(f"Composite FK overlap check failed {fk_table}->{pk_table}: {exc}")
+                    if passes_overlap:
+                        conditions = [f"f.`{c}` = p.`{c}`" for c in pk_cols]
+                        join_sql = (
+                            f"SELECT * FROM {fq_table_name(fk_table.split('.'))} f "
+                            f"JOIN {fq_table_name(pk_table.split('.'))} p ON "
+                            + " AND ".join(conditions)
+                        )
+                        join_pyspark = (
+                            "fk.join(pk, "
+                            + " & ".join(
+                                [f"(F.col('f.`{c}`') == F.col('p.`{c}`'))" for c in pk_cols]
+                            )
+                            + ", 'left')"
+                        )
+                        rel_score = 0.85 if cfg.enable_value_overlap else 0.70
+                        evidence = {
+                            "composite_match_on_names": True,
+                            "overlap_checked": cfg.enable_value_overlap,
+                        }
+                        if overlap_ratio is not None:
+                            evidence["composite_overlap_ratio"] = round(float(overlap_ratio), 3)
+                        relationships.append(
+                            {
+                                "fk_table": fk_table,
+                                "fk_column": " + ".join(pk_cols),
+                                "pk_table": pk_table,
+                                "pk_column": " + ".join(pk_cols),
+                                "score": rel_score,
+                                "evidence": evidence,
+                                "cardinality": "many-to-one",
+                                "declared": False,
+                                "join_example_sql": join_sql,
+                                "join_example_pyspark": join_pyspark,
+                                "confidence": self.classify_relationship_confidence(rel_score, False),
+                            }
+                        )
+
+        self.relationships = relationships
+
+    def sampled_distinct_values(
+        self,
+        table: str,
+        df: Optional[DataFrame],
+        column: str,
+        max_rows: int,
+    ) -> set:
+        key = (table, column)
+        if key in self.value_cache:
+            return self.value_cache[key]
+        if df is None:
+            self.value_cache[key] = set()
+            return set()
+        try:
+            fraction = max(0.02, self.config.row_sample_fraction)
+            sample = self.sample_df(
+                df.select(F.col(column)).where(F.col(column).isNotNull()),
+                max_rows,
+                min(1.0, fraction),
+            )
+            values: set = set()
+            if sample is not None:
+                collected = sample.distinct().limit(200000).collect()
+                values = {str(row[0]) for row in collected if row[0] is not None}
+        except Exception as exc:
+            self.warn(f"Value sampling failed for {table}.{column}: {exc}")
+            values = set()
+        self.value_cache[key] = values
+        return values
+
+    # ------------------------------
+    # Model & rendering
+    # ------------------------------
+    def build_model(self) -> Dict[str, Any]:
+        cfg = self.config
+        model = {
+            "version": VERSION,
+            "author": AUTHOR,
+            "run_id": self.run_id,
+            "namespace": {
+                "type": "database" if cfg.use_legacy_database else "unity_catalog",
+                "catalog": None if cfg.use_legacy_database else cfg.catalog,
+                "schema": None if cfg.use_legacy_database else cfg.schema,
+                "database": cfg.database if cfg.use_legacy_database else None,
+            },
+            "spark_env": {
+                "spark_version": self.spark.version,
+                "session_timezone": self.spark.conf.get("spark.sql.session.timeZone", "unknown"),
+                "ansi": self.spark.conf.get("spark.sql.ansi.enabled", "unknown"),
+            },
+            "entities": [],
+            "relationships": [],
+            "warnings": self.warnings,
+            "errors": self.errors,
+            "generated_at_utc": dt.datetime.utcnow().isoformat() + "Z",
+        }
+
+        for table, meta in sorted(self.entities.items()):
+            entity = {
+                "name": table,
+                "row_count": meta.get("row_count"),
+                "props": meta.get("props", {}),
+                "is_view": meta.get("is_view"),
+                "table_type": meta.get("table_type"),
+                "data_source_format": meta.get("data_source_format"),
+                "partial": meta.get("partial", False),
+                "columns": [],
+            }
+            for column in meta.get("columns", []):
+                entity["columns"].append(
+                    {
+                        "name": column["name"],
+                        "type": column["type"],
+                        "family": column["family"],
+                        "nullable": column["nullable"],
+                        "approx_distinct": column.get("approx_distinct"),
+                        "null_ratio": column.get("null_ratio"),
+                        "candidate_pk": column.get("candidate_pk"),
+                        "candidate_pk_score": column.get("candidate_pk_score"),
+                        "pk_confidence": column.get("pk_confidence"),
+                        "candidate_fk": column.get("candidate_fk"),
+                        "candidate_fk_score": column.get("candidate_fk_score"),
+                        "fk_confidence": column.get("fk_confidence"),
+                        "pk_uniqueness": column.get("pk_uniqueness"),
+                        "struct_fields": column.get("struct_fields"),
+                        "array_guidance": column.get("array_guidance"),
+                        "map_guidance": column.get("map_guidance"),
+                        "inferred_datetime_format": column.get("inferred_datetime_format"),
+                        "inferred_datetime_support": column.get("inferred_datetime_support"),
+                        "datetime_parse_howto": column.get("datetime_parse_howto"),
+                        "datetime_pattern_counts": column.get("datetime_pattern_counts"),
+                    }
+                )
+            model["entities"].append(entity)
+
+        for relationship in sorted(
+            self.relationships, key=lambda r: (r["fk_table"], r["fk_column"])
+        ):
+            model["relationships"].append(relationship)
+
+        return model
+
+    # ------------------------------
+    # Persistence and summary
+    # ------------------------------
+    def persist_outputs(self, model: Dict[str, Any], markdown_report: str) -> Optional[str]:
+        cfg = self.config
+        output_dir = cfg.resolve_output_dir(self.run_id)
+        if not cfg.write_files:
+            return None
+        if output_dir is None:
+            return None
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as exc:
+            self.error(f"Cannot create output directory {output_dir}: {exc}")
+            return None
+
+        self._safe_write_text(f"{output_dir}/data_model.json", json.dumps(model, indent=2))
+        self._safe_write_text(f"{output_dir}/data_model.md", markdown_report)
+
+        if cfg.emit_html:
+            html_report = render_html(model, cfg)
+            self._safe_write_text(f"{output_dir}/data_model.html", html_report)
+
+        if cfg.emit_graphml:
+            graphml = build_graphml(model)
+            self._safe_write_text(f"{output_dir}/data_model.graphml", graphml)
+
+        if cfg.write_csvs:
+            entity_rows = [
+                (
+                    e["name"],
+                    e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE"),
+                    e.get("data_source_format") or "",
+                    e.get("row_count"),
+                )
+                for e in model["entities"]
+            ]
+            self._safe_write_csv(
+                f"{output_dir}/entities.csv",
+                entity_rows,
+                ["table", "table_type", "data_source_format", "row_count"],
+            )
+
+            column_rows = []
+            for entity in model["entities"]:
+                for column in entity["columns"]:
+                    pk_uniqueness = column.get("pk_uniqueness") or {}
+                    column_rows.append(
+                        [
+                            entity["name"],
+                            column["name"],
+                            column["type"],
+                            column["family"],
+                            column["nullable"],
+                            column.get("approx_distinct"),
+                            column.get("null_ratio"),
+                            column.get("candidate_pk"),
+                            column.get("candidate_pk_score"),
+                            column.get("pk_confidence"),
+                            column.get("candidate_fk"),
+                            column.get("candidate_fk_score"),
+                            column.get("fk_confidence"),
+                            pk_uniqueness.get("unique_fraction"),
+                            pk_uniqueness.get("sample_size"),
+                            column.get("inferred_datetime_format") or "",
+                            column.get("inferred_datetime_support") or "",
+                        ]
+                    )
+            self._safe_write_csv(
+                f"{output_dir}/columns.csv",
+                column_rows,
+                [
+                    "table",
+                    "column",
+                    "type",
+                    "family",
+                    "nullable",
+                    "approx_distinct",
+                    "null_ratio",
+                    "candidate_pk",
+                    "candidate_pk_score",
+                    "pk_confidence",
+                    "candidate_fk",
+                    "candidate_fk_score",
+                    "fk_confidence",
+                    "pk_unique_fraction",
+                    "pk_uniqueness_sample_size",
+                    "inferred_datetime_format",
+                    "format_support",
+                ],
+            )
+
+            relationship_rows = [
+                (
+                    r["fk_table"],
+                    r["fk_column"],
+                    r["pk_table"],
+                    r["pk_column"],
+                    r["score"],
+                    r.get("declared", False),
+                    r.get("cardinality", "many-to-one"),
+                    r.get("confidence"),
+                )
+                for r in model["relationships"]
+            ]
+            self._safe_write_csv(
+                f"{output_dir}/relationships.csv",
+                relationship_rows,
+                ["fk_table", "fk_column", "pk_table", "pk_column", "score", "declared", "cardinality", "confidence"],
+            )
+
+        manifest = {
+            "version": VERSION,
+            "author": AUTHOR,
+            "run_id": self.run_id,
+            "namespace": model["namespace"],
+            "counts": {
+                "tables": len(model["entities"]),
+                "relationships": len(model["relationships"]),
+                "declared_relationships": len([r for r in model["relationships"] if r.get("declared")]),
+                "inferred_relationships": len([r for r in model["relationships"] if not r.get("declared")]),
+                "high_confidence_relationships": len([
+                    r for r in model["relationships"] if r.get("confidence") == "high"
+                ]),
+                "medium_confidence_relationships": len([
+                    r for r in model["relationships"] if r.get("confidence") == "medium"
+                ]),
+                "warnings": len(self.warnings),
+                "errors": len(self.errors),
+            },
+            "params": asdict(self.config),
+            "output_dir": output_dir,
+            "spark_env": model["spark_env"],
+            "timestamp_utc": dt.datetime.utcnow().isoformat() + "Z",
+            "warnings": self.warnings[:100],
+            "errors": self.errors,
+        }
+        self._safe_write_text(f"{output_dir}/run_manifest.json", json.dumps(manifest, indent=2))
+
+        if self.config.write_delta_summary and self.config.write_files:
+            try:
+                self.write_delta_summaries(output_dir, model)
+            except Exception as exc:
+                self.warn(f"Delta summary write failed: {exc}")
+
+        return output_dir
+
+    def write_delta_summaries(self, output_dir: str, model: Dict[str, Any]) -> None:
+        columns_rows = []
+        for entity in model["entities"]:
+            for column in entity["columns"]:
+                columns_rows.append(
+                    (
+                        self.run_id,
+                        entity["name"],
+                        entity.get("table_type") or ("VIEW" if entity.get("is_view") else "TABLE"),
+                        column["name"],
+                        column["type"],
+                        column["family"],
+                        column["nullable"],
+                        column.get("approx_distinct"),
+                        column.get("null_ratio"),
+                        column.get("candidate_pk"),
+                        column.get("candidate_fk"),
+                        column.get("inferred_datetime_format") or None,
+                    )
+                )
+        relationships_rows = [
+            (
+                self.run_id,
+                r["fk_table"],
+                r["fk_column"],
+                r["pk_table"],
+                r["pk_column"],
+                r["score"],
+                r.get("declared", False),
+                r.get("cardinality", "many-to-one"),
+            )
+            for r in model["relationships"]
+        ]
+        df_cols = self.spark.createDataFrame(
+            columns_rows,
+            schema="run_id string, table string, table_type string, column string, type string, family string, nullable boolean, approx_distinct long, null_ratio double, candidate_pk boolean, candidate_fk boolean, inferred_datetime_format string",
+        )
+        df_rels = self.spark.createDataFrame(
+            relationships_rows,
+            schema="run_id string, fk_table string, fk_column string, pk_table string, pk_column string, score double, declared boolean, cardinality string",
+        )
+        df_cols.write.mode("overwrite").format("delta").save(f"{output_dir}/delta_columns")
+        df_rels.write.mode("overwrite").format("delta").save(f"{output_dir}/delta_relationships")
+
+    def _safe_write_text(self, path: str, content: str) -> None:
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        except Exception as exc:
+            self.warn(f"Write failed: {path}: {exc}")
+
+    def _safe_write_csv(self, path: str, rows: List[Iterable[Any]], header: List[str]) -> None:
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(header)
+                for row in rows:
+                    writer.writerow(row)
+        except Exception as exc:
+            self.warn(f"CSV write failed: {path}: {exc}")
+
+    # ------------------------------
+    # Reporting
+    # ------------------------------
+    def log_summary(self, model: Dict[str, Any], markdown_report: str, output_dir: Optional[str]) -> None:
+        elapsed = time.time() - self.start_time
+        if self.config.verbose_logs:
+            self.logger.banner("ERD GENERATION COMPLETE")
+            self.logger.info(f"Version           : {VERSION}")
+            self.logger.info(f"Run ID            : {self.run_id}")
+            self.logger.info(f"Total runtime     : {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
+            self.logger.info(f"Tables analyzed   : {len(model['entities'])}")
+            declared_count = len([r for r in model["relationships"] if r.get("declared")])
+            inferred_count = len(model["relationships"]) - declared_count
+            high_conf = len([r for r in model["relationships"] if r.get("confidence") == "high"])
+            medium_conf = len([r for r in model["relationships"] if r.get("confidence") == "medium"])
+            self.logger.info(
+                f"Relationships     : {len(model['relationships'])} (declared={declared_count}, inferred={inferred_count})"
+            )
+            self.logger.info(
+                f"  • Confidence     : high={high_conf}, medium={medium_conf}, low={len(model['relationships']) - high_conf - medium_conf}"
+            )
+            self.logger.info(f"Warnings          : {len(self.warnings)}")
+            self.logger.info(f"Errors            : {len(self.errors)}")
+            if output_dir:
+                self.logger.info("Output directory  : " + output_dir)
+                artifacts = ["data_model.json", "data_model.md"]
+                if self.config.emit_html:
+                    artifacts.append("data_model.html")
+                if self.config.emit_graphml:
+                    artifacts.append("data_model.graphml")
+                if self.config.write_csvs:
+                    artifacts.extend(["entities.csv", "columns.csv", "relationships.csv"])
+                artifacts.append("run_manifest.json")
+                self.logger.info("Artifacts         : " + ", ".join(artifacts))
+                if self.config.write_delta_summary:
+                    self.logger.info("Delta outputs     : delta_columns, delta_relationships")
+            else:
+                self.logger.info("File persistence  : disabled (provide UC_VOLUME_PATH or OUTPUT_BASE to enable)")
+            preview = markdown_report[:4000]
+            self.logger.info("\nMarkdown preview (first 4000 chars)\n" + "-" * 80 + "\n")
+            print(preview)
+            if len(markdown_report) > 4000:
+                self.logger.info(f"\n... ({len(markdown_report) - 4000} more characters)")
+
+        print("\n📊 Quick Summary:")
+        print(f"  • Processed {len(model['entities'])} tables in {elapsed:.1f}s")
+        declared_count = len([r for r in model["relationships"] if r.get("declared")])
+        inferred_count = len(model["relationships"]) - declared_count
+        high_conf = len([r for r in model["relationships"] if r.get("confidence") == "high"])
+        medium_conf = len([r for r in model["relationships"] if r.get("confidence") == "medium"])
+        print(f"  • Identified {declared_count} declared + {inferred_count} inferred relationships")
+        print(f"  • Confidence mix: high={high_conf}, medium={medium_conf}, low={len(model['relationships']) - high_conf - medium_conf}")
+        if self.config.enable_datetime_detection:
+            detections = sum(
+                1
+                for entity in model["entities"]
+                for column in entity["columns"]
+                if column.get("inferred_datetime_format")
+            )
+            print(f"  • Detected datetime patterns in {detections} columns")
+        if elapsed > 0:
+            print(f"  • Throughput ~{len(model['entities'])/(elapsed/60):.1f} tables/minute")
+
+    # ------------------------------
+    # Driver
+    # ------------------------------
+    def run(self) -> Dict[str, Any]:
+        try:
+            self.spark.conf.set("spark.sql.session.timeZone", self.config.session_timezone)
+        except Exception as exc:
+            self.warn(f"Could not set spark.sql.session.timeZone: {exc}")
+
+        self.discover_tables()
+        if not self.tables:
+            model = self.build_model()
+            markdown = render_markdown(model, self.config)
+            self.log_summary(model, markdown, None)
+            return model
+
+        self.fetch_information_schema()
+        self.collect_table_metadata()
+        self.compute_statistics()
+        pk_registry = self.identify_key_candidates()
+        self.infer_relationships(pk_registry)
+        model = self.build_model()
+        markdown_report = render_markdown(model, self.config)
+        output_dir = self.persist_outputs(model, markdown_report)
+        self.log_summary(model, markdown_report, output_dir)
+        return model
+
+
+# ------------------------------------------------------------------------------
+# Rendering helpers
+# ------------------------------------------------------------------------------
+def md_escape(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("_", "\\_")
+
+
+def xml_escape(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return html.escape(text, quote=True)
+
+
+def mermaid_safe(value: str) -> str:
+    return value.replace(".", "_").replace("`", "")
+
+
+def render_mermaid(model: Dict[str, Any], config: ModelerConfig) -> str:
+    if len(model["entities"]) > config.max_mermaid_tables:
+        return (
+            "```mermaid\n"
+            "erDiagram\n"
+            "  %% Mermaid diagram omitted: table count exceeds MAX_MERMAID_TABLES\n"
+            "```\n"
+        )
     lines = ["```mermaid", "erDiagram"]
-    for e in model["entities"]:
-        entity_name = mermaid_safe(e["name"])
-        lines.append(f"  {entity_name} {{")
-        max_cols = MERMAID_MAX_COLUMNS
-        cols = e["columns"] if max_cols is None or max_cols < 0 else e["columns"][:max_cols]
-        for c in cols:
-            lines.append(f"    {mermaid_safe(c['type'])} {mermaid_safe(c['name'])}")
-        if max_cols is not None and max_cols >= 0 and len(e["columns"]) > max_cols:
-            lines.append("    ... more_columns")
+    for entity in model["entities"]:
+        name = mermaid_safe(entity["name"])
+        lines.append(f"  {name} {{")
+        for column in entity["columns"][: max(0, config.mermaid_max_columns) or len(entity["columns"])]:
+            col_type = column["type"]
+            if config.md_truncate_type_chars and config.md_truncate_type_chars > 0:
+                col_type = (
+                    col_type[: config.md_truncate_type_chars] + "..."
+                    if len(col_type) > config.md_truncate_type_chars
+                    else col_type
+                )
+            lines.append(f"    {col_type} {column['name']}")
         lines.append("  }")
-    for r in model["relationships"]:
-        pk_entity = mermaid_safe(r["pk_table"]); fk_entity = mermaid_safe(r["fk_table"])
-        pk_col = mermaid_safe(r["pk_column"]);   fk_col = mermaid_safe(r["fk_column"])
-        label = f"{pk_col}_{fk_col}"
-        lines.append(f"  {pk_entity} ||--o{{ {fk_entity} : \"{label}\"")
+    for relation in model["relationships"]:
+        fk = mermaid_safe(relation["fk_table"])
+        pk = mermaid_safe(relation["pk_table"])
+        rel = "||--o{" if relation.get("cardinality") == "one-to-one" else "}o--||"
+        confidence = relation.get("confidence", "unknown")
+        lines.append(
+            f"  {fk} {rel} {pk} : \"{relation['fk_column']} → {relation['pk_column']} [{confidence}] ({relation['score']:.2f})\""
+        )
     lines.append("```")
     return "\n".join(lines)
 
-def render_markdown(model) -> str:
-    ns = model["namespace"]; nsname = ns["database"] or f"{ns['catalog']}.{ns['schema']}"
-    lines = []
-    lines.append(f"# ERD / Data Model Report — {nsname}")
-    lines.append(f"_Author: {AUTHOR}_  ")
-    lines.append(f"_Version: {VERSION}_  ")
-    lines.append(f"_Run ID: {RUN_ID}_  ")
-    lines.append(f"_Spark: {model['spark_env']['spark_version']}; Timezone: {model['spark_env']['session_timezone']}_\n")
-    lines.append("## Summary")
-    lines.append(f"- **Tables discovered**: {len(model['entities'])}")
-    lines.append(f"- **Relationships identified**: {len(model['relationships'])}")
-    lines.append(f"- **Declared constraints**: {len([r for r in model['relationships'] if r.get('declared')])}")
-    lines.append(f"- **Inferred relationships**: {len([r for r in model['relationships'] if not r.get('declared')])}")
+
+def render_markdown(model: Dict[str, Any], config: ModelerConfig) -> str:
+    lines: List[str] = []
+    lines.append(f"# Universal ERD & Data Model Generator (v{VERSION})")
     lines.append("")
-    lines.append("## Entities\n")
-    for e in model["entities"]:
-        lines.append(f"### {md_escape(e['name'])}")
-        tt = e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE")
-        dsf = e.get("data_source_format") or "unknown"
-        lines.append(f"- **Type**: {tt}  ")
-        lines.append(f"- **Data source**: {dsf}  ")
-        lines.append(f"- **Approx rows**: {e.get('row_count') or 'unknown'}  ")
-        if e.get("partial"):
-            lines.append(f"- ⚠️ **Note**: Partial metadata (access limits or load failures)  ")
-        lines.append("\n#### Columns")
-        lines.append("| Name | Type | Nullable | ~Distinct | Null% | PK? | FK? | Date/Time Format | Complex |")
-        lines.append("|------|------|----------|-----------|-------|-----|-----|------------------|---------|")
-        for c in e["columns"]:
-            dt_fmt = c.get("inferred_datetime_format"); support_pct = int((c.get('inferred_datetime_support') or 0)*100)
-            dt_str = f"{dt_fmt} ({support_pct}%)" if dt_fmt else ""
-            complex_str = ""
-            if c.get("struct_fields"):
-                complex_str = f"STRUCT ({len(c['struct_fields'])} nested)"
-            elif c.get("array_guidance"):
-                complex_str = f"ARRAY→{c['array_guidance']['element_type']}"
-            elif c.get("map_guidance"):
-                complex_str = f"MAP<{c['map_guidance']['key_type']},{c['map_guidance']['value_type']}>"
-            null_pct = f"{c.get('null_ratio')*100:.1f}%" if c.get('null_ratio') is not None else ""
-            pk_str = f"✓ ({c.get('candidate_pk_score')})" if c.get("candidate_pk") else ""
-            fk_str = f"✓ ({c.get('candidate_fk_score')})" if c.get("candidate_fk") else ""
-            t_str = c["type"]
-            if MD_TRUNCATE_TYPE_CHARS is not None and MD_TRUNCATE_TYPE_CHARS >= 0 and len(t_str) > MD_TRUNCATE_TYPE_CHARS:
-                t_str = t_str[:MD_TRUNCATE_TYPE_CHARS] + "…"
-            lines.append("| {n} | {t} | {nu} | {ad} | {nr} | {pk} | {fk} | {df} | {cx} |".format(
-                n=md_escape(c["name"]), t=md_escape(t_str), nu="Y" if c["nullable"] else "N",
-                ad=md_escape(c.get("approx_distinct","")), nr=md_escape(null_pct),
-                pk=md_escape(pk_str), fk=md_escape(fk_str), df=md_escape(dt_str), cx=md_escape(complex_str)
-            ))
-        if e.get("examples"):
-            lines.append("\n**Example rows** (up to 3):")
-            for i, r in enumerate(e["examples"][:3], 1):
-                lines.append(f"{i}. `{md_escape(str(r)[:200])}`")
-        lines.append("\n")
+    lines.append(f"- **Run ID:** `{model['run_id']}`")
+    namespace = model["namespace"]
+    if namespace["type"] == "unity_catalog":
+        ns_label = f"{namespace['catalog']}.{namespace['schema']}"
+    else:
+        ns_label = namespace.get("database") or "unknown"
+    lines.append(f"- **Namespace:** `{ns_label}`")
+    lines.append(f"- **Tables:** {len(model['entities'])}")
+    lines.append(f"- **Relationships:** {len(model['relationships'])}")
+    lines.append("")
+    lines.append("## Table Inventory")
+    for entity in model["entities"]:
+        lines.append(f"### {entity['name']}")
+        lines.append(f"- Rows: `{entity.get('row_count')}`")
+        lines.append(f"- Type: `{entity.get('table_type') or ('VIEW' if entity.get('is_view') else 'TABLE')}`")
+        lines.append(f"- Source: `{entity.get('data_source_format') or 'unknown'}`")
+        lines.append("")
+        lines.append("| Column | Type | Nullable | Approx Distinct | Null Ratio | PK (score/conf) | FK (score/conf) |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for column in entity["columns"]:
+            col_type = column["type"]
+            if (
+                config.md_truncate_type_chars
+                and config.md_truncate_type_chars > 0
+                and len(col_type) > config.md_truncate_type_chars
+            ):
+                col_type = col_type[: config.md_truncate_type_chars] + "..."
+            pk_score = column.get("candidate_pk_score")
+            pk_conf = column.get("pk_confidence")
+            pk_flag = column.get("candidate_pk")
+            pk_display = "Yes" if pk_flag else "No"
+            if pk_score is not None:
+                pk_display += f" ({pk_score:.2f})"
+            if pk_conf:
+                pk_display += f" [{pk_conf}]"
+            fk_score = column.get("candidate_fk_score")
+            fk_conf = column.get("fk_confidence")
+            fk_flag = column.get("candidate_fk")
+            fk_display = "Yes" if fk_flag else "No"
+            if fk_score is not None:
+                fk_display += f" ({fk_score:.2f})"
+            if fk_conf:
+                fk_display += f" [{fk_conf}]"
+            lines.append(
+                f"| `{column['name']}` | `{col_type}` | `{column['nullable']}` | `{column.get('approx_distinct')}` | "
+                f"`{column.get('null_ratio')}` | `{pk_display}` | `{fk_display}` |"
+            )
+        lines.append("")
     lines.append("## Relationships")
     if model["relationships"]:
-        lines.append("\n### Relationship Catalog")
-        lines.append("| FK Table | FK Column(s) | PK Table | PK Column(s) | Score | Declared? | Cardinality | Evidence |")
-        lines.append("|----------|--------------|----------|--------------|-------|-----------|-------------|----------|")
-        for r in sorted(model["relationships"], key=lambda x: (-x["score"], x["fk_table"], x["pk_table"])):
-            ev = r.get("evidence", {})
-            evs = f"Declared: {ev.get('declared_constraint','constraint')}" if r.get("declared") else f"name:{ev.get('name_match','?')}, type:{ev.get('type_compat','?')}, overlap:{ev.get('value_overlap','?')}"
-            lines.append(f"| {md_escape(r['fk_table'])} | {md_escape(r['fk_column'])} | {md_escape(r['pk_table'])} | {md_escape(r['pk_column'])} | {r['score']:.3f} | {r.get('declared',False)} | {r.get('cardinality','?')} | {md_escape(evs)} |")
-        lines.append("\n### Join Examples")
-        lines.append("Sample SQL and PySpark code for top relationships:\n")
-        for r in model["relationships"][:min(15, len(model["relationships"]))]:
-            lines.append(f"**{md_escape(r['fk_table'])}** → **{md_escape(r['pk_table'])}**")
-            lines.append(f"- Columns: `{md_escape(r['fk_column'])}` = `{md_escape(r['pk_column'])}`")
-            lines.append(f"- SQL: `{md_escape(r['join_example_sql'])}`")
-            lines.append(f"- PySpark: `{md_escape(r['join_example_pyspark'])}`")
-            lines.append("")
+        for relation in model["relationships"]:
+            lines.append(
+                f"- **{relation['fk_table']}**.`{relation['fk_column']}` → **{relation['pk_table']}**.`{relation['pk_column']}` "
+                f"(score={relation['score']}, declared={relation.get('declared', False)}, confidence={relation.get('confidence', 'unknown')})"
+            )
     else:
         lines.append("_No relationships found above the threshold._")
-    lines.append("\n## How to Parse Complex Types")
-    lines.append("- **ARRAY**: Use `explode()` or `posexplode()`, then `SELECT elem` or `elem.*` for STRUCT elements")
-    lines.append("- **MAP**: Use `explode(map_col)` to get (key, value) rows; `map_keys()` / `map_values()` for projections")
-    lines.append("- **STRUCT**: Use `col.*` to flatten one level; recurse for nested structures")
     lines.append("")
-    lines.append("## Date/Time Parsing Guidance")
-    lines.append("- **STRING with pattern** → `to_date()` / `to_timestamp()` with the detected pattern")
-    lines.append("- **epoch_seconds** → `to_timestamp(col)`")
-    lines.append("- **epoch_millis** → `to_timestamp(col / 1000.0)`")
-    lines.append("- **Native DATE/TIMESTAMP** → Already typed; use `date_format()` for display")
+    lines.append("## Complex Type Guidance")
+    lines.append("- ARRAY → `explode()` / `posexplode()` then project `elem` or `elem.*`")
+    lines.append("- MAP   → `explode(map_col)` for `(key, value)` pairs; `map_keys` / `map_values` helpers")
+    lines.append("- STRUCT → `col.*` to expand one level; recurse for nested struct fields")
     lines.append("")
-    if EMIT_MERMAID:
+    if config.emit_mermaid:
         lines.append("## Entity Relationship Diagram")
-        lines.append(render_mermaid(model))
+        lines.append(render_mermaid(model, config))
         lines.append("")
-    if warnings:
+    if model["warnings"]:
         lines.append("## ⚠️ Warnings")
-        for w in warnings[:50]:
-            lines.append(f"- {md_escape(w)}")
-        if len(warnings) > 50:
-            lines.append(f"- ... and {len(warnings) - 50} more warnings")
+        for warning in model["warnings"][:50]:
+            lines.append(f"- {md_escape(warning)}")
+        if len(model["warnings"]) > 50:
+            lines.append(f"- ... and {len(model['warnings']) - 50} more warnings")
         lines.append("")
-    if errors:
+    if model["errors"]:
         lines.append("## ❌ Errors")
-        for e in errors:
-            lines.append(f"- {md_escape(e)}")
+        for error in model["errors"]:
+            lines.append(f"- {md_escape(error)}")
         lines.append("")
     return "\n".join(lines)
 
-print("\nPhase 5: Rendering reports...")
-render_start = time.time()
-markdown_report = render_markdown(model)
-print(f"Phase 5 completed in {time.time()-render_start:.1f}s")
 
-# =========================
-# OUTPUTS (UC-first; no DBFS default)
-# =========================
-def _compute_out_dir():
-    if USE_UC_VOLUME_OUT and UC_VOLUME_PATH:
-        return UC_VOLUME_PATH.rstrip("/") + f"/{RUN_ID}"
-    if OUTPUT_BASE:
-        return OUTPUT_BASE.rstrip("/") + f"/{RUN_ID}"
-    return None
+def render_html(model: Dict[str, Any], config: ModelerConfig) -> str:
+    confidence_colors = {
+        "high": "#2E7D32",
+        "medium": "#F9A825",
+        "low": "#C62828",
+    }
 
-out_dir = _compute_out_dir()
-if WRITE_FILES and out_dir is None:
-    warnings.append("WRITE_FILES requested but no UC_VOLUME_PATH or OUTPUT_BASE provided. File writing disabled (UC-first, no DBFS default).")
-    WRITE_FILES = False
+    nodes_payload: List[Dict[str, Any]] = []
+    max_cols = config.html_max_columns
+    for entity in model["entities"]:
+        columns_rendered: List[str] = []
+        for idx, column in enumerate(entity.get("columns", [])):
+            if max_cols != -1 and idx >= max_cols:
+                columns_rendered.append(f"… {len(entity['columns']) - max_cols} more")
+                break
+            col_name = html.escape(column["name"])
+            col_type = html.escape(column["type"])
+            pk_flag = "high" if column.get("pk_confidence") == "high" else column.get("pk_confidence")
+            fk_flag = column.get("fk_confidence")
+            badges: List[str] = []
+            if pk_flag and pk_flag != "low":
+                badges.append(f"<span class=\"badge pk {pk_flag}\">PK {pk_flag}</span>")
+            if fk_flag and fk_flag != "low":
+                badges.append(f"<span class=\"badge fk {fk_flag}\">FK {fk_flag}</span>")
+            badge_html = "" if not badges else " " + "".join(badges)
+            columns_rendered.append(f"{col_name} <span class=\"col-type\">({col_type})</span>{badge_html}")
 
-def _safe_write_text(path, txt):
+        label_html = "<b>{}</b>".format(html.escape(entity["name"]))
+        if columns_rendered:
+            label_html += "<br/>" + "<br/>".join(columns_rendered)
+
+        tooltip = [f"Rows: {entity.get('row_count')}"]
+        tooltip.append(
+            f"Type: {entity.get('table_type') or ('VIEW' if entity.get('is_view') else 'TABLE')}"
+        )
+        nodes_payload.append(
+            {
+                "id": entity["name"],
+                "label": label_html,
+                "title": html.escape("\n".join(filter(None, tooltip))),
+            }
+        )
+
+    edges_payload: List[Dict[str, Any]] = []
+    for rel in model["relationships"]:
+        confidence = rel.get("confidence", "medium")
+        color = confidence_colors.get(confidence, "#546E7A")
+        label = f"{rel['fk_column']} → {rel['pk_column']}"
+        title_lines = [
+            f"Confidence: {confidence}",
+            f"Score: {rel['score']}",
+        ]
+        evidence = rel.get("evidence")
+        if isinstance(evidence, dict):
+            for key, value in evidence.items():
+                title_lines.append(f"{key}: {value}")
+        edges_payload.append(
+            {
+                "from": rel["fk_table"],
+                "to": rel["pk_table"],
+                "label": label,
+                "title": "\n".join(title_lines),
+                "color": color,
+                "dashes": confidence == "low",
+            }
+        )
+
+    nodes_json = json.dumps(nodes_payload, indent=2).replace("</", "<\/")
+    edges_json = json.dumps(edges_payload, indent=2).replace("</", "<\/")
+
+    entity_details: List[str] = []
+    for entity in model["entities"]:
+        entity_details.append("<details>")
+        entity_details.append(
+            f"<summary><strong>{html.escape(entity['name'])}</strong> — Rows: {entity.get('row_count')}</summary>"
+        )
+        entity_details.append("<table class=\"entity-table\">")
+        entity_details.append(
+            "<thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>PK</th><th>FK</th><th>Confidence</th></tr></thead><tbody>"
+        )
+        for column in entity.get("columns", []):
+            entity_details.append(
+                "<tr>"
+                f"<td>{html.escape(column['name'])}</td>"
+                f"<td>{html.escape(column['type'])}</td>"
+                f"<td>{column.get('nullable')}</td>"
+                f"<td>{column.get('candidate_pk')}</td>"
+                f"<td>{column.get('candidate_fk')}</td>"
+                f"<td>PK {column.get('pk_confidence', 'low')}, FK {column.get('fk_confidence', 'low')}</td>"
+                "</tr>"
+            )
+        entity_details.append("</tbody></table>")
+        entity_details.append("</details>")
+
+    relationships_rows: List[str] = []
+    for rel in model["relationships"]:
+        relationships_rows.append(
+            "<tr>"
+            f"<td>{html.escape(rel['fk_table'])}</td>"
+            f"<td>{html.escape(rel['fk_column'])}</td>"
+            f"<td>{html.escape(rel['pk_table'])}</td>"
+            f"<td>{html.escape(rel['pk_column'])}</td>"
+            f"<td>{rel['score']}</td>"
+            f"<td>{rel.get('confidence', 'medium')}</td>"
+            "</tr>"
+        )
+
+    html_output = f"""<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>ERD — {html.escape(model['namespace'].get('catalog') or model['namespace'].get('database') or 'dataset')}</title>
+  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\" />
+  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin />
+  <link href=\"https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap\" rel=\"stylesheet\" />
+  <link rel=\"stylesheet\" href=\"https://unpkg.com/vis-network/styles/vis-network.min.css\" />
+  <style>
+    body {{ font-family: 'Inter', sans-serif; margin: 24px; color: #1f2933; background: #fafbfc; }}
+    h1 {{ margin-bottom: 0; }}
+    .meta {{ color: #52606d; margin-bottom: 24px; }}
+    #network {{ height: 720px; border: 1px solid #d2d6dc; border-radius: 8px; background: #ffffff; margin-bottom: 32px; }}
+    .badge {{ display: inline-block; padding: 0 6px; margin-left: 4px; border-radius: 4px; font-size: 10px; font-weight: 600; color: #ffffff; text-transform: uppercase; letter-spacing: 0.5px; }}
+    .badge.pk.high {{ background: #2E7D32; }}
+    .badge.pk.medium {{ background: #558B2F; }}
+    .badge.fk.high {{ background: #1565C0; }}
+    .badge.fk.medium {{ background: #0277BD; }}
+    .col-type {{ color: #52606d; }}
+    details {{ margin-bottom: 16px; background: #ffffff; border: 1px solid #d2d6dc; border-radius: 8px; padding: 12px 16px; }}
+    details > summary {{ cursor: pointer; font-weight: 600; outline: none; }}
+    .entity-table {{ width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }}
+    .entity-table th, .entity-table td {{ border: 1px solid #e4e7eb; padding: 8px 10px; text-align: left; }}
+    .relationships-table {{ width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; background: #ffffff; }}
+    .relationships-table th, .relationships-table td {{ border: 1px solid #e4e7eb; padding: 10px 12px; text-align: left; }}
+    .legend span {{ display: inline-flex; align-items: center; margin-right: 12px; font-size: 13px; }}
+    .legend span::before {{ content: ''; display: inline-block; width: 12px; height: 12px; border-radius: 999px; margin-right: 6px; }}
+    .legend .high::before {{ background: #2E7D32; }}
+    .legend .medium::before {{ background: #F9A825; }}
+    .legend .low::before {{ background: #C62828; }}
+    @media (max-width: 768px) {{ #network {{ height: 480px; }} }}
+  </style>
+</head>
+<body>
+  <h1>Universal ERD &amp; Data Model Generator</h1>
+  <div class=\"meta\">
+    <div><strong>Run ID:</strong> {html.escape(model['run_id'])}</div>
+    <div><strong>Namespace:</strong> {html.escape(str(model['namespace']))}</div>
+    <div><strong>Tables:</strong> {len(model['entities'])} &nbsp;|&nbsp; <strong>Relationships:</strong> {len(model['relationships'])}</div>
+  </div>
+  <div class=\"legend\">
+    <span class=\"high\">High confidence</span>
+    <span class=\"medium\">Medium confidence</span>
+    <span class=\"low\">Low confidence / dashed</span>
+  </div>
+  <div id=\"network\"></div>
+
+  <h2>Entities</h2>
+  {''.join(entity_details)}
+
+  <h2>Relationships</h2>
+  <table class=\"relationships-table\">
+    <thead><tr><th>FK Table</th><th>FK Column</th><th>PK Table</th><th>PK Column</th><th>Score</th><th>Confidence</th></tr></thead>
+    <tbody>{''.join(relationships_rows)}</tbody>
+  </table>
+
+  <script src=\"https://unpkg.com/vis-network/standalone/umd/vis-network.min.js\"></script>
+  <script>
+    const nodes = new vis.DataSet({nodes_json});
+    const edges = new vis.DataSet({edges_json});
+    const container = document.getElementById('network');
+    const data = {{ nodes, edges }};
+    const options = {{
+      layout: {{
+        hierarchical: {{
+          enabled: true,
+          direction: 'LR',
+          levelSeparation: 220,
+          nodeSpacing: 180,
+          treeSpacing: 200,
+          sortMethod: 'directed'
+        }}
+      }},
+      physics: false,
+      edges: {{
+        arrows: {{ to: {{ enabled: true, scaleFactor: 0.8 }} }},
+        smooth: {{ type: 'cubicBezier', forceDirection: 'horizontal', roundness: 0.45 }},
+        font: {{ face: 'Inter', size: 12, align: 'top' }}
+      }},
+      nodes: {{
+        shape: 'box',
+        font: {{ multi: 'html', face: 'Inter', size: 12 }},
+        margin: 12,
+        widthConstraint: {{ maximum: 320 }},
+        color: {{ background: '#ffffff', border: '#98a7b3', highlight: {{ background: '#f5f7fa', border: '#1f7aec' }} }}
+      }},
+      interaction: {{ hover: true, tooltipDelay: 100, zoomView: true, dragView: true }}
+    }};
+    const network = new vis.Network(container, data, options);
+    network.once('stabilized', () => network.fit({{ animation: false }}));
+  </script>
+</body>
+</html>
+"""
+    return html_output
+
+
+def build_graphml(model: Dict[str, Any]) -> str:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
+        '  <key id="label" for="edge" attr.name="label" attr.type="string"/>',
+        '  <graph edgedefault="directed">',
+    ]
+    for entity in sorted(model["entities"], key=lambda e: e["name"]):
+        lines.append(f'    <node id="{xml_escape(entity["name"])}"/>')
+    for relation in model["relationships"]:
+        confidence = relation.get("confidence", "unknown")
+        label = f"{relation['fk_column']}→{relation['pk_column']} [{confidence}] ({relation['score']:.2f})"
+        lines.append(
+            f'    <edge source="{xml_escape(relation["fk_table"])}" target="{xml_escape(relation["pk_table"])}">'
+        )
+        lines.append(f'      <data key="label">{xml_escape(label)}</data>')
+        lines.append("    </edge>")
+    lines.append("  </graph>")
+    lines.append("</graphml>")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------------------
+# Entry point
+# ------------------------------------------------------------------------------
+def run_notebook() -> Dict[str, Any]:
     try:
-        with open(path, "w", encoding="utf-8") as f: f.write(txt)
-        return True
-    except Exception as e:
-        warnings.append(f"Write failed: {path}: {e}")
-        return False
-
-def _safe_write_csv(path, rows, header):
-    try:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            for r in rows: w.writerow(r)
-        return True
-    except Exception as e:
-        warnings.append(f"CSV write failed: {path}: {e}")
-        return False
-
-if WRITE_FILES:
-    try:
-        print(f"\nPhase 6: Writing outputs to {out_dir}...")
-        write_start = time.time()
-        os.makedirs(out_dir, exist_ok=True)
-    except Exception as e:
-        errors.append(f"Cannot create output directory: {e}")
-        WRITE_FILES = False
-
-    if WRITE_FILES:
-        _safe_write_text(f"{out_dir}/data_model.json", json.dumps(model, indent=2))
-        _safe_write_text(f"{out_dir}/data_model.md", markdown_report)
-
-        if EMIT_GRAPHML:
-            gml = ['<?xml version="1.0" encoding="UTF-8"?>',
-                   '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
-                   '  <key id="label" for="edge" attr.name="label" attr.type="string"/>',
-                   '  <graph edgedefault="directed">']
-            nodes = sorted([e["name"] for e in model["entities"]])
-            for n in nodes: gml.append(f'    <node id="{xml_escape(n)}"/>')
-            for r in model["relationships"]:
-                edge_label = f"{r['fk_column']}→{r['pk_column']} ({r['score']:.2f})"
-                gml.append(f'    <edge source="{xml_escape(r["fk_table"])}" target="{xml_escape(r["pk_table"])}">')
-                gml.append(f'      <data key="label">{xml_escape(edge_label)}</data>')
-                gml.append('    </edge>')
-            gml += ['  </graph>', '</graphml>']
-            _safe_write_text(f"{out_dir}/data_model.graphml", "\n".join(gml))
-
-        if WRITE_CSVS:
-            ent_rows = [(e["name"], e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE"), e.get("data_source_format") or "", e.get("row_count")) for e in model["entities"]]
-            _safe_write_csv(f"{out_dir}/entities.csv", ent_rows, ["table", "table_type", "data_source_format", "row_count"])
-
-            col_rows = []
-            for e in model["entities"]:
-                for c in e["columns"]:
-                    col_rows.append([e["name"], c["name"], c["type"], c["family"], c["nullable"],
-                                     c.get("approx_distinct"), c.get("null_ratio"),
-                                     c.get("candidate_pk"), c.get("candidate_fk"),
-                                     c.get("inferred_datetime_format") or "", c.get("inferred_datetime_support") or ""])
-            _safe_write_csv(f"{out_dir}/columns.csv", col_rows, ["table","column","type","family","nullable","approx_distinct","null_ratio","candidate_pk","candidate_fk","inferred_datetime_format","format_support"])
-
-            rel_rows = [(r["fk_table"], r["fk_column"], r["pk_table"], r["pk_column"], r["score"], r.get("declared", False), r.get("cardinality","many-to-one")) for r in model["relationships"]]
-            _safe_write_csv(f"{out_dir}/relationships.csv", rel_rows, ["fk_table","fk_column","pk_table","pk_column","score","declared","cardinality"])
-
-        manifest = {
-            "version": VERSION, "author": AUTHOR, "run_id": RUN_ID, "namespace": model["namespace"],
-            "counts": {
-                "tables": len(model["entities"]), "relationships": len(model["relationships"]),
-                "declared_relationships": len([r for r in model["relationships"] if r.get("declared")]),
-                "inferred_relationships": len([r for r in model["relationships"] if not r.get("declared")]),
-                "warnings": len(warnings), "errors": len(errors),
-            },
-            "params": {
-                "FAST_MODE": FAST_MODE, "ENABLE_VALUE_OVERLAP": ENABLE_VALUE_OVERLAP,
-                "ENABLE_COMPOSITE_FK_INFERENCE": ENABLE_COMPOSITE_FK_INFERENCE, "INCLUDE_EXAMPLES": INCLUDE_EXAMPLES,
-                "ROW_SAMPLE_FRACTION": ROW_SAMPLE_FRACTION, "ROW_SAMPLE_MAX": ROW_SAMPLE_MAX,
-                "NULLABILITY_SAMPLE_ROWS": NULLABILITY_SAMPLE_ROWS, "VALUE_OVERLAP_SAMPLE_ROWS": VALUE_OVERLAP_SAMPLE_ROWS,
-                "DISTINCT_COUNT_CAP": DISTINCT_COUNT_CAP, "MIN_REL_SCORE": MIN_REL_SCORE,
-                "TOP_PK_CANDIDATES": TOP_PK_CANDIDATES, "MAX_COMPOSITE_K": MAX_COMPOSITE_K, "MAX_TABLES": MAX_TABLES,
-                "EMIT_GRAPHML": EMIT_GRAPHML, "EMIT_MERMAID": EMIT_MERMAID, "MAX_MERMAID_TABLES": MAX_MERMAID_TABLES,
-                "MERMAID_MAX_COLUMNS": MERMAID_MAX_COLUMNS, "MD_TRUNCATE_TYPE_CHARS": MD_TRUNCATE_TYPE_CHARS,
-                "ENABLE_DATETIME_DETECTION": ENABLE_DATETIME_DETECTION, "DATETIME_SAMPLE_SIZE": DATETIME_SAMPLE_SIZE,
-                "DATETIME_SUPPORT_MIN": DATETIME_SUPPORT_MIN, "VERBOSE_LOGS": VERBOSE_LOGS,
-                "WRITE_CSVS": WRITE_CSVS, "WRITE_DELTA_SUMMARY": WRITE_DELTA_SUMMARY,
-                "SKIP_INFORMATION_SCHEMA": SKIP_INFORMATION_SCHEMA, "MAX_RUNTIME_MINUTES": MAX_RUNTIME_MINUTES,
-                "SESSION_TIMEZONE": SESSION_TIMEZONE_EFFECTIVE
-            },
-            "output_dir": out_dir, "spark_env": model["spark_env"],
-            "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
-            "warnings": warnings[:100], "errors": errors
-        }
-        _safe_write_text(f"{out_dir}/run_manifest.json", json.dumps(manifest, indent=2))
-        print(f"Phase 6 completed in {time.time()-write_start:.1f}s")
-
-# =========================
-# OPTIONAL DELTA SUMMARY
-# =========================
-if WRITE_DELTA_SUMMARY and WRITE_FILES:
-    try:
-        print("\nWriting Delta summary tables...")
-        delta_start = time.time()
-        cols_rows = []
-        for e in model["entities"]:
-            for c in e["columns"]:
-                cols_rows.append((RUN_ID, e["name"], e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE"),
-                                  c["name"], c["type"], c["family"], c["nullable"],
-                                  c.get("approx_distinct"), c.get("null_ratio"),
-                                  c.get("candidate_pk"), c.get("candidate_fk"),
-                                  c.get("inferred_datetime_format") or None))
-        rel_rows = [(RUN_ID, r["fk_table"], r["fk_column"], r["pk_table"], r["pk_column"], r["score"], r.get("declared", False), r.get("cardinality","many-to-one")) for r in model["relationships"]]
-        df_cols = spark.createDataFrame(cols_rows, schema="run_id string, table string, table_type string, column string, type string, family string, nullable boolean, approx_distinct long, null_ratio double, candidate_pk boolean, candidate_fk boolean, inferred_datetime_format string")
-        df_rels = spark.createDataFrame(rel_rows, schema="run_id string, fk_table string, fk_column string, pk_table string, pk_column string, score double, declared boolean, cardinality string")
-        out_delta_base = out_dir
-        df_cols.write.mode("overwrite").format("delta").save(out_delta_base + "/delta_columns")
-        df_rels.write.mode("overwrite").format("delta").save(out_delta_base + "/delta_relationships")
-        print(f"Delta tables written in {time.time()-delta_start:.1f}s")
-    except Exception as e:
-        warnings.append(f"Delta summary write failed: {e}")
-        errors.append(f"Could not write Delta tables: {e}")
-
-# =========================
-# FINAL OUTPUT
-# =========================
-total_time = time.time() - start_time
-
-if VERBOSE_LOGS:
-    print("\n" + "="*80)
-    print("ERD GENERATION COMPLETE")
-    print("="*80)
-    print(f"Version: {VERSION}")
-    print(f"Run ID: {RUN_ID}")
-    print(f"Total runtime: {total_time:.1f}s ({total_time/60:.1f} minutes)")
-    print(f"Tables analyzed: {len(model['entities'])}")
-    print(f"Relationships found: {len(model['relationships'])}")
-    print(f"  - Declared: {len([r for r in model['relationships'] if r.get('declared')])}")
-    print(f"  - Inferred: {len([r for r in model['relationships'] if not r.get('declared')])}")
-    print(f"Warnings: {len(warnings)}")
-    print(f"Errors: {len(errors)}")
-    if WRITE_FILES:
-        print(f"\nOutput directory: {out_dir}")
-        print("Files generated:")
-        print("  - data_model.json (complete model)")
-        print("  - data_model.md (human-readable report)")
-        if EMIT_GRAPHML: print("  - data_model.graphml (graph format)")
-        if WRITE_CSVS: print("  - entities.csv, columns.csv, relationships.csv")
-        if WRITE_DELTA_SUMMARY: print("  - Delta tables: delta_columns, delta_relationships")
-        print("  - run_manifest.json (execution metadata)")
+        dbutils  # type: ignore  # noqa: F821
+    except NameError:
+        dbutils_local = None
     else:
-        print("\nFile writing disabled. Provide UC_VOLUME_PATH or OUTPUT_BASE to enable writes.")
-    print("\n" + "="*80)
-    print("MARKDOWN REPORT PREVIEW (first 4000 chars)")
-    print("="*80 + "\n")
-    print(markdown_report[:4000])
-    if len(markdown_report) > 4000:
-        print(f"\n... ({len(markdown_report) - 4000} more characters)")
-    print("\n" + "="*80)
+        dbutils_local = dbutils  # type: ignore  # noqa: F821
 
-if errors and VERBOSE_LOGS:
-    print("\n⚠️  CRITICAL ERRORS:")
-    for e in errors:
-        print(f"  - {e}")
-    print()
+    _bootstrap_widgets(dbutils_local)
+    config = ModelerConfig.from_environment(dbutils_local)
+    modeler = DataModeler(spark, dbutils_local, config)
+    return modeler.run()
 
-if not VERBOSE_LOGS:
-    print(f"\nERD Generation Complete - Runtime: {total_time:.1f}s")
-    print(f"Tables: {len(model['entities'])} | Relationships: {len(model['relationships'])} | Warnings: {len(warnings)} | Errors: {len(errors)}")
-    if WRITE_FILES:
-        print(f"Output: {out_dir}")
 
-# Display key results
-print("\n📊 Quick Summary:")
-print(f"  • Processed {len(model['entities'])} tables in {total_time:.1f}s")
-print(f"  • Identified {len([r for r in model['relationships'] if r.get('declared')])} declared + {len([r for r in model['relationships'] if not r.get('declared')])} inferred relationships")
-if ENABLE_DATETIME_DETECTION:
-    dt_detected = sum(1 for e in model['entities'] for c in e['columns'] if c.get('inferred_datetime_format'))
-    print(f"  • Detected datetime patterns in {dt_detected} columns")
-print(f"  • Performance: ~{len(model['entities'])/(total_time/60):.1f} tables/minute")
+# Execute immediately when the cell runs.
+MODEL = run_notebook()

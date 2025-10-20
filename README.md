@@ -1,245 +1,244 @@
-# Universal ERD & Data Model Generator (Databricks / PySpark)
+# Universal ERD & Data Model Generator (Databricks / Unity Catalog)
 
-**Version:** 1.9.2 (Best-of-Both)  
+**Version:** 2.1.0  
 **Author:** Joshua Williamson
 
-> Generate a complete, portable data model from your Databricks environment (Unity Catalog–first, legacy DB optional) with safe defaults, bounded sampling, and clean artifacts (JSON, Markdown + Mermaid ERD, GraphML, CSVs, optional Delta tables).
+This repository ships a single Databricks-ready notebook (`Notebook`) that reverse-engineers the schema of a catalog or legacy database and materialises a complete entity relationship model. The implementation favours Unity Catalog, performs bounded sampling for statistics, infers missing keys/relationships, and emits clean artefacts (JSON, Markdown + Mermaid ERD, GraphML, CSVs, optional Delta tables) suitable for documentation and governance.
 
 ---
 
-## Table of Contents
+## Contents
 
-- [What This Is (Plain Language)](#what-this-is-plain-language)
-- [Key Features](#key-features)
-- [How It Works — Phase by Phase](#how-it-works--phase-by-phase)
-- [Requirements & Dependencies](#requirements--dependencies)
+- [Overview](#overview)
+- [Key Capabilities](#key-capabilities)
+- [Platform Requirements](#platform-requirements)
 - [Quick Start](#quick-start)
-  - [Unity Catalog](#unity-catalog)
-  - [Legacy Database](#legacy-database)
-- [Configuration](#configuration)
-- [Output Artifacts](#output-artifacts)
-- [Typical Modes](#typical-modes)
-  - [Fast Survey](#fast-survey)
-  - [Deep Inference](#deep-inference)
-- [Using in a Databricks Job](#using-in-a-databricks-job)
-- [Best Practices](#best-practices)
+  - [Unity Catalog Workflow](#unity-catalog-workflow)
+  - [Legacy Database Workflow](#legacy-database-workflow)
+- [Configuration Reference](#configuration-reference)
+- [Execution Flow](#execution-flow)
+- [Output Artefacts](#output-artefacts)
+- [Operational Modes](#operational-modes)
+- [Running in Databricks Jobs](#running-in-databricks-jobs)
+- [Operational Guardrails & Security](#operational-guardrails--security)
 - [Troubleshooting](#troubleshooting)
-- [Examples](#examples)
-  - [Minimal UC Run](#minimal-uc-run)
-  - [Deep Inference Profile](#deep-inference-profile)
-- [Versioning & Changelog (Highlights)](#versioning--changelog-highlights)
-- [Contributing](#contributing)
-- [FAQ](#faq)
+- [Change Log](#change-log)
 
 ---
 
-## What This Is (Plain Language)
+## Overview
 
-This script scans your Databricks namespace, discovers tables and columns, identifies (or infers) keys and relationships, and produces a **complete data model**:
+The notebook orchestrates six disciplined phases:
 
-- **JSON** (machine-readable canonical model)
-- **Markdown** report with optional **Mermaid ERD**
-- **GraphML** for graph tools (yEd, Gephi)
-- **CSVs** (entities, columns, relationships)
-- Optional **Delta tables** for governance/BI
+1. Parameter bootstrap from Databricks widgets (with safe defaults)  
+2. Table discovery in Unity Catalog (or legacy databases) with regex filters and safety caps  
+3. Table metadata capture (`DESCRIBE DETAIL`, `DESCRIBE EXTENDED`, `information_schema`)  
+4. Targeted sampling for column statistics, hints, and optional datetime heuristics  
+5. Primary/foreign key candidate scoring with declared constraint lift, sampled uniqueness checks, referential coverage, and optional composite inference  
+6. Report rendering + confidence labelling, followed by output persistence to UC Volumes or an explicitly supplied path
 
-It avoids full table scans by default, works even with partial permissions, and includes guidance for parsing nested types (STRUCT/ARRAY/MAP).
+All work is confined to a single notebook file to ease review and deployment. The code is defensive, logs progress, honours runtime ceilings, and gracefully degrades when optional metadata (e.g., `information_schema`) is unavailable.
 
----
+## Key Capabilities
 
-## Key Features
-
-- **Unity Catalog first**: Leverages `information_schema` where available; safe fallbacks elsewhere.
-- **Fail-open ERD**: Emits entities/columns even with limited access; infers relationships best-effort.
-- **Bounded performance**: Sampling is capped and configurable; `DESCRIBE DETAIL` used for fast row counts.
-- **Relationship inference**: Respects declared PK/FK; infers single-column FKs and optional composite FKs.
-- **Nested type support**: Walks STRUCT/ARRAY/MAP; provides SQL/PySpark parsing hints.
-- **Hardened outputs**: XML-escaped GraphML, validated params/regex, divide-by-zero guards, explicit "no tables" checks.
-- **Config toggles**: Diagram readability caps, type truncation, datetime detection threshold, verbose logging.
+- **Unity Catalog–first discovery** with legacy fallbacks, regex filters, and strict safety caps.
+- **Advanced key analytics** that blend declared constraints, distinct ratios, nullity, naming hints, and sampled duplicate detection to emit PK confidence bands.
+- **Relationship inference with confidence scoring** using name similarity, family compatibility, cardinality heuristics, and sampled referential coverage (high/medium/low labels).
+- **Composite key support** for both primary and foreign keys, including hashed overlap checks when enabled.
+- **Performance-aware sampling** with bounded row/column operations so the notebook scales across large domains without exhausting cluster resources.
+- **Audit-friendly artefacts** (JSON, Markdown + Mermaid ERD, HTML ERD, GraphML, CSV, optional Delta tables) enriched with per-relationship evidence and per-column confidence metrics.
 
 ---
 
-## How It Works — Phase by Phase
+## Platform Requirements
 
-1. **Configuration Load**  
-   Reads widgets/placeholders, validates ranges (fractions, thresholds) and regex patterns.
-
-2. **Namespace Discovery**  
-   UC: `SHOW TABLES` + `information_schema.tables`; Legacy: `SHOW TABLES`. Applies include/exclude regex and `MAX_TABLES`.
-
-3. **Constraint Lift (UC)**  
-   Attempts to load PRIMARY KEY, FOREIGN KEY, and CHECK constraints from `information_schema.*`.
-
-4. **Entity Metadata & Fast Counts**  
-   Reads schemas and `DESCRIBE DETAIL` for fast `numRows`. Captures `DESCRIBE EXTENDED` props (best-effort).
-
-5. **Sampling & Statistics**  
-   Null ratios (sampled), optional approx distinct (off in FAST mode), optional example rows, datetime format detection with configurable support threshold.
-
-6. **Key Candidates & Composites**  
-   Scores PK/FK candidates; honors declared PKs; optionally searches composite PKs via NULL-safe hashed combos.
-
-7. **Relationships**  
-   Adds declared FKs first (single & multi-column) with join examples; infers single-column FKs; optional composite FK inference.
-
-8. **Model & Rendering**  
-   Assembles a single JSON model; renders Markdown (+Mermaid), GraphML, CSVs, and optional Delta tables.
-
-9. **Output & Manifest**  
-   Writes to DBFS or UC Volume; emits a run manifest (parameters, counts, env, warnings, errors).
-
----
-
-## Requirements & Dependencies
-
-- **Platform:** Databricks (Unity Catalog recommended; legacy DB supported)  
-- **Spark:** Apache Spark 3.x (Databricks Runtime 11+ recommended)  
-- **Language:** Python (Databricks notebook/Job with PySpark)  
-- **Permissions:** Read access to schemas/tables; UC `information_schema` access recommended  
-- **Storage:** DBFS or UC Volume for outputs  
-- **Optional:** GraphML viewer (yEd/Gephi), Markdown viewer
-
-> No additional PyPI dependencies beyond Databricks/PySpark.
+- Databricks workspace with **Unity Catalog** enabled (legacy databases supported as a fallback)
+- Runtime: Databricks Runtime 11.x (Spark 3.3) or newer
+- Cluster with PySpark (no external libraries required)
+- Read access to the target catalog/schema (and `information_schema` for richer metadata)
+- Storage location for outputs: UC Volume or a pre-provisioned DBFS / external path
+- Optional: GraphML viewer (yEd, Gephi) for visualising exported graphs
 
 ---
 
 ## Quick Start
 
-### Unity Catalog
+### Unity Catalog Workflow
 
-1. Add the script to a Databricks notebook cell.  
-2. Set widgets (auto-created by the script):
-   - `CATALOG = your_catalog`
-   - `SCHEMA  = your_schema`
-3. Run the notebook.  
-4. Open printed output path (e.g., `/dbfs/tmp/datamodeler/run_...`) → `data_model.md` and `data_model.json`.
+1. Import the `Notebook` file into Databricks (Repos, Workspace, or directly into a notebook).  
+2. Attach the notebook to a cluster with appropriate UC privileges.  
+3. Execute the first cell. Widgets are created automatically for catalog, schema, and tuning parameters.  
+4. Provide values for `CATALOG`, `SCHEMA`, and output location (`UC_VOLUME_PATH` or `OUTPUT_BASE`).  
+5. Click **Run All**.  
+6. Upon completion, the final cell prints a summary and the output directory containing all artefacts.
 
-### Legacy Database
+### Legacy Database Workflow
 
-- Set `USE_LEGACY_DATABASE=true` and `DATABASE=<db_name>`.  
-- `CATALOG/SCHEMA` are ignored in this mode.
-
----
-
-## Configuration
-
-Set via widgets or by replacing placeholders for non-interactive runs.
-
-| Param | Type | Default | Purpose |
-|---|---|---:|---|
-| `CATALOG` | string | `main` | UC catalog to scan |
-| `SCHEMA` | string | `default` | UC schema to scan |
-| `USE_LEGACY_DATABASE` | bool | `false` | Use legacy database instead of UC |
-| `DATABASE` | string | `default` | Legacy DB name (if used) |
-| `INCLUDE_TABLES_RE` | regex | `.*` | Include tables matching regex |
-| `EXCLUDE_TABLES_RE` | regex | `` | Exclude tables matching regex |
-| `FAST_MODE` | bool | `true` | Skip heavy stats/overlap (faster) |
-| `ENABLE_VALUE_OVERLAP` | bool | `false` | Sampled FK⊆PK overlap (requires `FAST_MODE=false`) |
-| `ENABLE_COMPOSITE_FK_INFERENCE` | bool | `false` | Composite FK inference (requires `FAST_MODE=false`) |
-| `INCLUDE_EXAMPLES` | bool | `false` | Include up to 3 example rows |
-| `ROW_SAMPLE_FRACTION` | float | `0.10` | Sample fraction (0–1) |
-| `ROW_SAMPLE_MAX` | int | `500000` | Row cap per table sample |
-| `NULLABILITY_SAMPLE_ROWS` | int | `300000` | Rows for null% calc |
-| `VALUE_OVERLAP_SAMPLE_ROWS` | int | `150000` | Rows per side for overlap |
-| `MIN_REL_SCORE` | float | `0.55` | Threshold for inferred FKs |
-| `TOP_PK_CANDIDATES` | int | `6` | Top-N columns for composite PK |
-| `MAX_COMPOSITE_K` | int | `3` | Max columns in composite PK (1–4) |
-| `MAX_TABLES` | int | `10000` | Safety cap for discovery |
-| `WRITE_FILES` | bool | `true` | Write artifacts to disk |
-| `OUTPUT_BASE` | path | `/dbfs/tmp/datamodeler/<run_id>` | Base output folder |
-| `USE_UC_VOLUME_OUTPUT` | bool | `false` | Write into a UC Volume |
-| `UC_VOLUME_PATH` | path | `` | `/Volumes/<cat>/<schema>/<vol>/erd` |
-| `EMIT_GRAPHML` | bool | `true` | Write GraphML |
-| `EMIT_MERMAID` | bool | `true` | Add Mermaid ERD to Markdown |
-| `MAX_MERMAID_TABLES` | int | `150` | Omit Mermaid above this table count |
-| `MERMAID_MAX_COLUMNS` | int | `20` | Max columns/entity in Mermaid (`-1` unlimited) |
-| `MD_TRUNCATE_TYPE_CHARS` | int | `30` | Truncate type strings in MD (`-1` unlimited) |
-| `DATETIME_SUPPORT_MIN` | float | `0.50` | Min support to emit detected datetime (0–1) |
-| `VERBOSE_LOGS` | bool | `true` | Print run summary and preview |
-| `WRITE_CSVS` | bool | `true` | Emit entities/columns/relationships CSVs |
-| `WRITE_DELTA_SUMMARY` | bool | `false` | Write Delta summary tables |
-
-> **Tips:**  
-> • `ENABLE_VALUE_OVERLAP` & `ENABLE_COMPOSITE_FK_INFERENCE` require `FAST_MODE=false`.  
-> • For maximum inference quality, set `FAST_MODE=false` (heavier, smarter).
+1. Set widget `USE_LEGACY_DATABASE = true` and `DATABASE = <database_name>`.  
+2. Leave `CATALOG` / `SCHEMA` as defaults (they are ignored in this mode).  
+3. Provide an output path (e.g., `/dbfs/tmp/datamodeler`).  
+4. Execute the notebook; legacy-compatible logic is invoked automatically.
 
 ---
 
-## Output Artifacts
+## Configuration Reference
 
-- `data_model.json` — canonical model (entities, columns, stats, relationships, warnings, errors)
-- `data_model.md` — human-readable report (summary, entities, relationships, parsing guidance, optional Mermaid)
-- `data_model.graphml` — nodes (tables) and edges (FKs), XML-escaped
-- `entities.csv`, `columns.csv`, `relationships.csv` — spreadsheet-friendly summaries
-- `delta_columns`, `delta_relationships` — optional Delta datasets for BI/governance
-- `run_manifest.json` — parameters, counts, env, warnings/errors, output dir
+All parameters are available as Databricks widgets and can be overwritten in Jobs or via the REST API. Defaults favour quick surveys.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `CATALOG` | string | `main` | Unity Catalog to inspect |
+| `SCHEMA` | string | `default` | Unity Catalog schema |
+| `USE_LEGACY_DATABASE` | bool | `false` | Use legacy schema discovery (`DATABASE`) instead of UC |
+| `DATABASE` | string | `default` | Legacy database name when the above is `true` |
+| `INCLUDE_TABLES_RE` | regex | `.*` | Tables to include (regex on table name) |
+| `EXCLUDE_TABLES_RE` | regex | `` | Tables to exclude (regex on table name) |
+| `MAX_TABLES` | int | `10000` | Hard cap to prevent runaway discovery |
+| `FAST_MODE` | bool | `true` | Skip heavy computations (overlap, composite inference, deep stats) |
+| `ENABLE_VALUE_OVERLAP` | bool | `false` | Sample FK⊆PK value overlap (requires `FAST_MODE=false`) |
+| `ENABLE_COMPOSITE_FK_INFERENCE` | bool | `false` | Infer composite FKs via hashed sampling (requires `FAST_MODE=false`) |
+| `ENABLE_ADVANCED_KEY_TESTS` | bool | `true` | Run sampled PK uniqueness and referential coverage scoring (disabled automatically in `FAST_MODE`) |
+| `ROW_SAMPLE_FRACTION` | float | `0.05` | Fraction sampled for stats (bounded by `ROW_SAMPLE_MAX`) |
+| `ROW_SAMPLE_MAX` | int | `100000` | Maximum sampled rows per table |
+| `NULLABILITY_SAMPLE_ROWS` | int | `50000` | Rows inspected for null ratio |
+| `VALUE_OVERLAP_SAMPLE_ROWS` | int | `50000` | Rows per table for overlap checks |
+| `MIN_REL_SCORE` | float | `0.55` | Minimum score to emit inferred relationships |
+| `TOP_PK_CANDIDATES` | int | `6` | Candidate columns considered for composite PK search |
+| `MAX_COMPOSITE_K` | int | `3` | Maximum size of composite PKs (1–4 supported) |
+| `INCLUDE_EXAMPLES` | bool | `false` | Capture up to three example rows per table |
+| `ENABLE_DATETIME_DETECTION` | bool | `false` | Detect datetime patterns in string columns (slow) |
+| `DATETIME_SAMPLE_SIZE` | int | `100` | String samples to test for datetime detection |
+| `DATETIME_SUPPORT_MIN` | float | `0.50` | Support threshold to emit a detected datetime pattern |
+| `PK_SAMPLE_ROWS` | int | `20000` | Rows sampled to validate PK uniqueness |
+| `PK_ACCEPT_THRESHOLD` | float | `0.70` | Minimum PK score to treat a column as a key |
+| `PK_HIGH_CONFIDENCE` | float | `0.90` | PK score required for a “high” confidence label |
+| `RELATIONSHIP_HIGH_CONFIDENCE` | float | `0.75` | Relationship score required for a “high” confidence label |
+| `WRITE_FILES` | bool | `true` | Persist artefacts to storage; disabled when no path supplied |
+| `USE_UC_VOLUME_OUTPUT` | bool | `true` | Prefer UC Volume paths (recommended) |
+| `UC_VOLUME_PATH` | string | `` | Destination, e.g. `/Volumes/<catalog>/<schema>/<volume>/erd` |
+| `OUTPUT_BASE` | string | `` | Alternative base path (e.g. `/dbfs/...` or external mount) |
+| `EMIT_GRAPHML` | bool | `true` | Export GraphML for external tooling |
+| `EMIT_MERMAID` | bool | `true` | Embed Mermaid ERD in Markdown output |
+| `EMIT_HTML` | bool | `true` | Emit standalone interactive HTML ERD |
+| `MAX_MERMAID_TABLES` | int | `150` | Skip Mermaid when table count exceeds this cap |
+| `MERMAID_MAX_COLUMNS` | int | `20` | Columns per entity in Mermaid (`-1` for unlimited) |
+| `HTML_MAX_COLUMNS` | int | `30` | Columns per entity in the HTML ERD (`-1` for unlimited) |
+| `MD_TRUNCATE_TYPE_CHARS` | int | `30` | Truncate long type strings in Markdown (`-1` for unlimited) |
+| `WRITE_CSVS` | bool | `true` | Emit `entities.csv`, `columns.csv`, `relationships.csv` |
+| `WRITE_DELTA_SUMMARY` | bool | `false` | Write Delta tables (`delta_columns`, `delta_relationships`) |
+| `SKIP_INFORMATION_SCHEMA` | bool | `false` | Force discovery without `information_schema` |
+| `MAX_RUNTIME_MINUTES` | int | `30` | Soft runtime guard; phases stop once exceeded |
+| `SESSION_TIMEZONE` | string | `UTC` | Applied to `spark.sql.session.timeZone` |
+| `VERBOSE_LOGS` | bool | `true` | Print banners, progress, and Markdown preview |
+
+> **Sanity checks:** Booleans are normalised, numeric inputs are clamped to safe ranges, and incompatible toggles (e.g. overlap inference in fast mode) are automatically disabled with warnings.
 
 ---
 
-## Typical Modes
+## Execution Flow
 
-### Fast Survey
-- `FAST_MODE=true` (default)  
-- `ENABLE_VALUE_OVERLAP=false`, `ENABLE_COMPOSITE_FK_INFERENCE=false`  
-- Quick mapping of entities/columns and high-confidence FKs.
+1. **Widget Bootstrap & Configuration Sanitisation**  
+   Widgets are created (if running interactively) and settings are validated. Missing output paths automatically disable `WRITE_FILES` to avoid unexpected DBFS usage.
 
-### Deep Inference
-- `FAST_MODE=false`  
-- `ENABLE_VALUE_OVERLAP=true`, `ENABLE_COMPOSITE_FK_INFERENCE=true`  
-- Lower `ROW_SAMPLE_FRACTION` if very large; expect longer runs for better FK accuracy.
+2. **Namespace Discovery**  
+   `SHOW TABLES` is executed with include/exclude filters and `MAX_TABLES` guardrails. Unity Catalog runs also collect `information_schema.tables` metadata when available.
+
+3. **Constraint & Metadata Harvesting**  
+   Declared PK/FK/check constraints are lifted via `information_schema.*`. Each table gets `DESCRIBE DETAIL` and `DESCRIBE EXTENDED` metadata, with nested type introspection for STRUCT/ARRAY/MAP columns.
+
+4. **Statistics & Heuristics**  
+   Bounded sampling produces null ratio estimates, optional approx distinct counts, sample rows (if enabled), and optional datetime format detection for string columns.
+
+5. **Key Discovery**  
+   Column-level scores consider distinctness, nullability, naming hints, and declared constraints. Optional composite search hashes candidate column sets to detect strong multi-column keys.
+
+6. **Relationship Inference**  
+   Declared FKs are emitted first. Additional candidates score name similarity, type compatibility, distinct ratios, null ratios, cardinality hints, and optional value overlap checks.
+
+7. **Reporting & Persistence**  
+   A canonical JSON model feeds Markdown, Mermaid ERD, GraphML, CSVs, and optional Delta tables. A manifest captures run parameters, counts, Spark environment, and warnings/errors for audit trails.
 
 ---
 
-## Using in a Databricks Job
+## Output Artefacts
 
-1. Create a **Job** → “Notebook” task → reference the notebook with this code.  
-2. Set **Parameters** to override widgets (e.g., `CATALOG`, `SCHEMA`, `OUTPUT_BASE`).  
-3. Optionally schedule or chain in a documentation/governance pipeline.  
-4. Outputs are written to `OUTPUT_BASE` or your **UC Volume** path.
+When `WRITE_FILES=true` and a valid path is supplied, the notebook creates a run-specific folder containing:
+
+- `data_model.json` – canonical entity/column/relationship model with metadata, evidence, and per-item confidence labels  
+- `data_model.md` – human-readable report with summaries, table profiles (including PK/FK confidence), relationships, and optional Mermaid diagram  
+- `data_model.graphml` – GraphML for graph visualisation tools, annotated with relationship confidence (optional toggle)  
+- `entities.csv` / `columns.csv` / `relationships.csv` – curated extracts; column output includes PK/FK scores, confidence, and sampled uniqueness, relationships include confidence levels  
+- `run_manifest.json` – execution manifest (parameters, counts, Spark environment, warnings, errors, output path)  
+- `delta_columns` / `delta_relationships` – optional Delta tables for downstream processing
 
 ---
 
-## Best Practices
+## Operational Modes
 
-- Narrow scope with `INCLUDE_TABLES_RE` / `EXCLUDE_TABLES_RE` to focus runs.  
-- Prefer **Unity Catalog** for declared PK/FK via `information_schema`.  
-- Daily runs: keep `FAST_MODE=true`; switch to **Deep Inference** as needed.  
-- **PII/Sensitivity**: keep `INCLUDE_EXAMPLES=false` (default).  
-- Version the **JSON**/Delta outputs to track schema drift.  
-- Tune diagram readability with `MERMAID_MAX_COLUMNS` & `MAX_MERMAID_TABLES`.
+| Mode | When to Use | Key Settings |
+| --- | --- | --- |
+| **Fast Survey** (default) | Daily/adhoc scans, catalog health checks | `FAST_MODE=true`, leave overlap/composite/datetime detection disabled |
+| **Deep Inference** | Design reviews, onboarding unfamiliar schemas, data lineage exercises | `FAST_MODE=false`, enable value overlap/composite FK inference, optionally enable datetime detection |
+| **Targeted Audit** | Focused domain review | Provide `INCLUDE_TABLES_RE`, tighten `MAX_TABLES`, optionally increase `ROW_SAMPLE_FRACTION` on small domains |
+
+Additional tips:
+- Use UC Volumes for outputs when possible to stay within Unity Catalog governance.  
+- Keep `INCLUDE_EXAMPLES=false` for PII-sensitive domains.  
+- Lower `ROW_SAMPLE_FRACTION` for very large tables to reduce shuffle pressure.  
+- Increase `MIN_REL_SCORE` to surface only the highest-confidence inferred relationships.
+- Leave `ENABLE_ADVANCED_KEY_TESTS=true` for production-grade confidence scoring; it is automatically disabled when `FAST_MODE=true`.
+
+---
+
+## Running in Databricks Jobs
+
+1. Create a Databricks Job → **Notebook task** → point to this notebook.  
+2. Set job parameters to override widgets (JSON map of key/value pairs).  
+3. Configure the cluster policy to grant access to the target catalog/schema and the output volume.  
+4. (Optional) Chain a follow-up task that consumes the generated JSON/Delta outputs for documentation or governance pipelines.  
+5. Monitor job runs; the notebook emits a concise summary plus the number of warnings/errors encountered.
+
+---
+
+## Operational Guardrails & Security
+
+- **Access control:** the notebook never elevates privileges; it respects the active cluster identity.  
+- **Runtime limits:** `MAX_RUNTIME_MINUTES` provides a soft stop—subsequent phases respect the deadline and truncate work safely.  
+- **Error handling:** failures (e.g. missing tables, `information_schema` restrictions) are converted into warnings where possible to keep the run progressing.  
+- **Output paths:** no default DBFS usage—users must opt in via `UC_VOLUME_PATH` or `OUTPUT_BASE`.  
+- **Deterministic run IDs:** every execution receives a time-stamped, UUID-suffixed run identifier used across filenames and manifest records.
 
 ---
 
 ## Troubleshooting
 
-- **No tables found**  
-  Check `CATALOG/SCHEMA` or `DATABASE`. Relax regex (e.g., `INCLUDE_TABLES_RE=.*`), clear excludes, verify permissions.
-
-- **Slow runs**  
-  Use `FAST_MODE=true`. Reduce `ROW_SAMPLE_FRACTION`/`ROW_SAMPLE_MAX`. Limit scope. Disable GraphML.
-
-- **Missing/inaccurate relationships**  
-  Lower `MIN_REL_SCORE` slightly (e.g., `0.5 → 0.45`). Use deep mode (`FAST_MODE=false`, `ENABLE_VALUE_OVERLAP=true`). Declared PKs help.
-
-- **GraphML oddities**  
-  XML is escaped; some viewers render differently. Check Mermaid ERD in the Markdown report.
-
-- **Datetime detection weirdness**  
-  Mixed formats reduce confidence. Adjust `DATETIME_SUPPORT_MIN` (e.g., `0.35`) to surface minority patterns.
+| Symptom | Likely Cause | Resolution |
+| --- | --- | --- |
+| No tables discovered | Incorrect catalog/schema or restrictive regex | Confirm widget values, clear `EXCLUDE_TABLES_RE`, or reduce `MAX_TABLES` |
+| `information_schema` warnings | Missing privileges on UC metadata | Request `USE CATALOG` / `USE SCHEMA` alongside `SELECT` on `information_schema.*`, or set `SKIP_INFORMATION_SCHEMA=true` |
+| Slow execution | Large tables with deep inference enabled | Keep `FAST_MODE=true`, lower `ROW_SAMPLE_FRACTION`, or tighten the include regex |
+| Missing inferred relationships | Strict score threshold or limited stats | Lower `MIN_REL_SCORE`, disable `FAST_MODE`, enable value overlap checks |
+| Low-confidence relationships | Limited referential evidence due to sampling caps | Increase `VALUE_OVERLAP_SAMPLE_ROWS`, disable `FAST_MODE`, or ensure `ENABLE_ADVANCED_KEY_TESTS=true` |
+| GraphML viewer issues | Tool-specific rendering quirks | Use the embedded Mermaid ERD or inspect the Markdown report |
 
 ---
 
-## Examples
+## Change Log
 
-### Minimal UC Run
+- **2.1.0**  
+  - Added advanced PK uniqueness sampling, FK referential coverage analysis, and confidence labelling (high/medium/low) across columns and relationships  
+  - Extended configuration with thresholds for acceptance/high-confidence, plus manifest and artifact updates surfacing the new metrics  
+  - Enhanced Markdown, GraphML, and CSV outputs to include scores, confidence indicators, and sampled evidence for audit trails
+- **2.0.0**  
+  - Rebuilt as a single self-contained notebook with class-based orchestration and explicit runtime guards  
+  - Unity Catalog–first execution path with safe fallbacks for legacy databases  
+  - Expanded documentation, manifest, and logging to meet enterprise audit expectations  
+  - Outputs default to UC Volumes, avoiding silent DBFS writes  
+  - Improved configuration sanitisation and reporting, ready for Databricks Jobs integration
 
-```python
-# Set parameters via widgets (optional if already set)
-dbutils.widgets.text("CATALOG", "prod", "UC Catalog")
-dbutils.widgets.text("SCHEMA", "finance", "UC Schema")
-dbutils.widgets.text("FAST_MODE", "true", "Fast mode")
-dbutils.widgets.text("OUTPUT_BASE", "/dbfs/tmp/datamodeler/manual_run")
+For previous behaviour or simulator harnesses, see the project history.
 
-# Optional narrowing
-dbutils.widgets.text("INCLUDE_TABLES_RE", "^(txn_|dim_|fact_).*", "Regex include")
-dbutils.widgets.text("EXCLUDE_TABLES_RE", "", "Regex exclude")
+---
+
+**Contact / Extensions:**  
+The notebook is production-ready but intentionally self-contained. Extend by forking the notebook, adjusting configuration defaults, or layering downstream transformations on the JSON/Delta outputs.
