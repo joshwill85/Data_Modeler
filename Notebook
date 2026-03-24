@@ -1,869 +1,1222 @@
-```python
-# Databricks / PySpark
-# Reverse ERD & Data Model Generator (Unity Catalog on AWS)
-# Author: Joshua Williamson
-# Version: 3.0.0
-# ------------------------------------------------------------------------------
-# Design goals (industry-standard reverse-ERD approach):
-# - No widgets, no interactive prints/logging — file/volume outputs only.
-# - Works in Unity Catalog (AWS). Uses information_schema where possible.
-# - Combines declared constraints + robust inference (name/type hints, stats, value overlap).
-# - Bounded, scalable sampling; no RDDs, no driver-JVM access, no job logs.
-# - Clean visual deliverables (HTML ERD + Markdown + GraphML) and CSV/JSON extracts.
-# - Writes to UC Volumes (preferred) or DBFS paths using /dbfs FUSE (safe on clusters).
-# ------------------------------------------------------------------------------
+# Databricks notebook source
+# ============================================================
+# UNITY CATALOG LINEAGE BACKBONE + ROOT-SPECIFIC PATH BUILDER
+# ------------------------------------------------------------
+# Inputs:
+#   - root_table widget: schema.table (for example: npdataset.npd_current_pending)
+#   - table/column source MVs in eciscor_prod.information_schema
+#
+# Outputs:
+#   1) Append-only raw history tables
+#   2) Version/change-log tables
+#   3) Current direct edge tables
+#   4) Root-specific table lineage paths
+#   5) Root-specific column lineage paths
+#
+# Design choices:
+#   - No SQL recursive CTEs, so there is no notebook-level hop cap.
+#   - Current state = latest target write event.
+#   - History = append-only raw rows + version tables.
+#   - Root values persist on every output row.
+# ============================================================
 
-from __future__ import annotations
+from pyspark.sql import functions as F, Window as W
+from delta.tables import DeltaTable
 
-import os
-import re
-import json
-import html
-import time
-import uuid
-import itertools
-import datetime as dt
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+DEFAULT_CATALOG = "eciscor_prod"
 
-from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
-from pyspark.sql.utils import AnalysisException
+# ------------------------------------------------------------
+# Widgets
+# ------------------------------------------------------------
+dbutils.widgets.text("root_table", "npdataset.npd_current_pending")
 
-# =========================
-# ===== CONFIG BLOCK  =====
-# =========================
-# Set your UC namespace and output root. Prefer a UC Volume.
-# Examples:
-#   UC_VOLUME_ROOT = "dbfs:/Volumes/your_catalog/your_schema/your_volume/erd"
-#   or fallback:
-#   UC_VOLUME_ROOT = "dbfs:/FileStore/erd"
-CATALOG = "main"          # e.g., "eciscor_prod"
-SCHEMA = "default"        # e.g., "cdo"
-UC_VOLUME_ROOT = "dbfs:/FileStore/erd"   # <-- change to a UC Volume path when available
-SESSION_TIMEZONE = "UTC"
+dbutils.widgets.text("table_source_mv",  "eciscor_prod.information_schema.table_lineage")
+dbutils.widgets.text("column_source_mv", "eciscor_prod.information_schema.column_lineage")
 
-# Heuristics & bounds (no user widgets; tuned for large-ish catalogs)
-ROW_SAMPLE_FRACTION = 0.05
-NULL_SAMPLE_ROWS = 50_000
-DISTINCT_SAMPLE_ROWS = 50_000
-MAX_DISTINCT_COLLECT = 50_000        # cap for distinct values collected to driver
-PK_ACCEPT_RATIO = 0.80               # distinct_ratio ~= ad/row_count
-REL_MIN_SCORE = 0.58                 # accept relationships above this score
-REL_HIGH_CONF = 0.75                 # high-confidence threshold
-MAX_TABLES = 50_000                  # hard safety bound
-MAX_COLUMNS_PER_ENTITY_HTML = 30     # -1 for unlimited
+dbutils.widgets.text("table_history_target",       "eciscor_prod.lineage_admin.table_lineage_history")
+dbutils.widgets.text("column_history_target",      "eciscor_prod.lineage_admin.column_lineage_history")
 
-# Name patterns (industry heuristics)
-ID_NAME_HINTS = [r".*\b(id|_id)\b", r".*\b(key|_key)\b", r".*\b(uuid|guid)\b"]
-FK_NAME_HINTS = [
-    r".*\b.*_id\b",
-    r".*\b(user|customer|account|client|order|product|parent|owner).*(id|_id)\b",
+dbutils.widgets.text("table_versions_target",      "eciscor_prod.lineage_admin.table_lineage_versions")
+dbutils.widgets.text("column_versions_target",     "eciscor_prod.lineage_admin.column_lineage_versions")
+
+dbutils.widgets.text("table_current_edges_target", "eciscor_prod.lineage_admin.table_lineage_current_edges")
+dbutils.widgets.text("column_current_edges_target","eciscor_prod.lineage_admin.column_lineage_current_edges")
+
+dbutils.widgets.text("table_paths_target",         "eciscor_prod.lineage_admin.npd_current_pending_table_paths")
+dbutils.widgets.text("column_paths_target",        "eciscor_prod.lineage_admin.npd_current_pending_column_paths")
+
+
+# ------------------------------------------------------------
+# Parameters
+# ------------------------------------------------------------
+ROOT_TABLE_INPUT           = dbutils.widgets.get("root_table").strip()
+TABLE_SOURCE_MV            = dbutils.widgets.get("table_source_mv").strip()
+COLUMN_SOURCE_MV           = dbutils.widgets.get("column_source_mv").strip()
+
+TABLE_HISTORY_TARGET       = dbutils.widgets.get("table_history_target").strip()
+COLUMN_HISTORY_TARGET      = dbutils.widgets.get("column_history_target").strip()
+
+TABLE_VERSIONS_TARGET      = dbutils.widgets.get("table_versions_target").strip()
+COLUMN_VERSIONS_TARGET     = dbutils.widgets.get("column_versions_target").strip()
+
+TABLE_CURRENT_EDGES_TARGET = dbutils.widgets.get("table_current_edges_target").strip()
+COLUMN_CURRENT_EDGES_TARGET= dbutils.widgets.get("column_current_edges_target").strip()
+
+TABLE_PATHS_TARGET         = dbutils.widgets.get("table_paths_target").strip()
+COLUMN_PATHS_TARGET        = dbutils.widgets.get("column_paths_target").strip()
+
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def qualify_name(name: str) -> str:
+    parts = [p.strip() for p in name.split(".") if p.strip()]
+    if len(parts) == 2:
+        return f"{DEFAULT_CATALOG}.{parts[0]}.{parts[1]}"
+    if len(parts) == 3:
+        if parts[0] != DEFAULT_CATALOG:
+            raise ValueError(f"Catalog must be {DEFAULT_CATALOG}. Got: {parts[0]}")
+        return ".".join(parts)
+    raise ValueError(f"Expected schema.table or catalog.schema.table. Got: {name}")
+
+def split_fqn(name: str):
+    q = qualify_name(name)
+    return q.split(".")
+
+def quote_name(name: str) -> str:
+    return ".".join([f"`{p}`" for p in split_fqn(name)])
+
+def quote_schema_from_table(name: str) -> str:
+    catalog, schema, _ = split_fqn(name)
+    return f"`{catalog}`.`{schema}`"
+
+def ensure_schema_for_table(name: str):
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {quote_schema_from_table(name)}")
+
+def table_exists(name: str) -> bool:
+    q = qualify_name(name)
+    return spark.catalog.tableExists(q)
+
+def df_has_rows(df) -> bool:
+    return len(df.take(1)) > 0
+
+def with_hash_key(df, key_cols, key_name="lineage_row_id"):
+    return (
+        df.withColumn(
+            key_name,
+            F.sha2(
+                F.concat_ws(
+                    "||",
+                    *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in key_cols]
+                ),
+                256
+            )
+        )
+        .withColumn("ingested_at", F.current_timestamp())
+    )
+
+def apply_table_features(target_table: str, cluster_cols=None):
+    spark.sql(
+        f"ALTER TABLE {quote_name(target_table)} "
+        "SET TBLPROPERTIES ('delta.enableChangeDataFeed'='true')"
+    )
+    if cluster_cols:
+        cols = ", ".join([f"`{c}`" for c in cluster_cols])
+        spark.sql(f"ALTER TABLE {quote_name(target_table)} CLUSTER BY ({cols})")
+
+def create_empty_delta_if_missing(df, target_table: str, cluster_cols=None):
+    ensure_schema_for_table(target_table)
+    q = qualify_name(target_table)
+    if not table_exists(q):
+        (
+            df.limit(0)
+              .write
+              .format("delta")
+              .mode("overwrite")
+              .option("overwriteSchema", "true")
+              .saveAsTable(q)
+        )
+        apply_table_features(q, cluster_cols)
+
+def merge_history(source_df, target_table: str, key_col: str, cluster_cols=None):
+    q = qualify_name(target_table)
+    create_empty_delta_if_missing(source_df, q, cluster_cols=cluster_cols)
+    delta_target = DeltaTable.forName(spark, q)
+    (
+        delta_target.alias("t")
+        .merge(source_df.alias("s"), f"t.{key_col} = s.{key_col}")
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+    apply_table_features(q, cluster_cols)
+
+def overwrite_delta(source_df, target_table: str, cluster_cols=None):
+    q = qualify_name(target_table)
+    ensure_schema_for_table(q)
+    (
+        source_df.write
+                 .format("delta")
+                 .mode("overwrite")
+                 .option("overwriteSchema", "true")
+                 .saveAsTable(q)
+    )
+    apply_table_features(q, cluster_cols)
+
+def root_table_to_full_name(root_table_input: str) -> str:
+    parts = [p.strip() for p in root_table_input.split(".") if p.strip()]
+    if len(parts) != 2:
+        raise ValueError(
+            f"root_table must be schema.table only. Got: {root_table_input}"
+        )
+    return f"{DEFAULT_CATALOG}.{parts[0]}.{parts[1]}"
+
+ROOT_FULL_NAME = root_table_to_full_name(ROOT_TABLE_INPUT)
+_, ROOT_SCHEMA, ROOT_NAME = split_fqn(ROOT_FULL_NAME)
+
+
+# ------------------------------------------------------------
+# Source MV schemas from your screenshots
+# ------------------------------------------------------------
+TABLE_SOURCE_COLS = [
+    "entity_type",
+    "entity_id",
+    "entity_run_id",
+    "source_table_full_name",
+    "source_table_catalog",
+    "source_table_schema",
+    "source_table_name",
+    "source_type",
+    "target_table_full_name",
+    "target_table_catalog",
+    "target_table_schema",
+    "target_table_name",
+    "target_type",
+    "created_by",
+    "event_time",
+    "event_date",
+    "event_id",
 ]
 
-# =========================
-# ====== UTILITIES   ======
-# =========================
+COLUMN_SOURCE_COLS = [
+    "entity_type",
+    "entity_id",
+    "entity_run_id",
+    "source_table_full_name",
+    "source_table_catalog",
+    "source_table_schema",
+    "source_table_name",
+    "source_type",
+    "source_column_name",
+    "target_table_full_name",
+    "target_table_catalog",
+    "target_table_schema",
+    "target_table_name",
+    "target_type",
+    "target_column_name",
+    "created_by",
+    "event_time",
+    "event_date",
+    "event_id",
+]
 
-VERSION = "3.0.0"
-AUTHOR = "Joshua Williamson"
 
-def now_utc() -> str:
-    return dt.datetime.utcnow().isoformat() + "Z"
+# ------------------------------------------------------------
+# 1) Read source MVs and persist raw history
+# ------------------------------------------------------------
+table_source_df = spark.table(qualify_name(TABLE_SOURCE_MV)).select(*TABLE_SOURCE_COLS)
+column_source_df = spark.table(qualify_name(COLUMN_SOURCE_MV)).select(*COLUMN_SOURCE_COLS)
 
-def run_id() -> str:
-    return dt.datetime.utcnow().strftime("run_%Y%m%d_%H%M%S_") + str(uuid.uuid4())[:8]
+table_history_stage = with_hash_key(
+    table_source_df,
+    key_cols=[
+        "entity_type",
+        "entity_id",
+        "entity_run_id",
+        "source_table_full_name",
+        "source_table_catalog",
+        "source_table_schema",
+        "source_table_name",
+        "source_type",
+        "target_table_full_name",
+        "target_table_catalog",
+        "target_table_schema",
+        "target_table_name",
+        "target_type",
+        "created_by",
+        "event_time",
+        "event_date",
+        "event_id",
+    ],
+    key_name="lineage_row_id",
+)
 
-def dbfs_to_local(dbfs_path: str) -> str:
-    # Convert "dbfs:/..." to "/dbfs/..." and "/Volumes/..." to "/dbfs/Volumes/..."
-    if dbfs_path.startswith("dbfs:/"):
-        return "/dbfs/" + dbfs_path[len("dbfs:/"):].lstrip("/")
-    if dbfs_path.startswith("/Volumes/"):
-        return "/dbfs" + dbfs_path
-    if dbfs_path.startswith("file:/"):
-        return dbfs_path[len("file:/"):]
-    return dbfs_path  # already local?
+column_history_stage = with_hash_key(
+    column_source_df,
+    key_cols=[
+        "entity_type",
+        "entity_id",
+        "entity_run_id",
+        "source_table_full_name",
+        "source_table_catalog",
+        "source_table_schema",
+        "source_table_name",
+        "source_type",
+        "source_column_name",
+        "target_table_full_name",
+        "target_table_catalog",
+        "target_table_schema",
+        "target_table_name",
+        "target_type",
+        "target_column_name",
+        "created_by",
+        "event_time",
+        "event_date",
+        "event_id",
+    ],
+    key_name="lineage_row_id",
+)
 
-def fq_identifier(token: str) -> str:
-    token = token.strip().strip("`")
-    return f"`{token}`"
+merge_history(
+    table_history_stage,
+    TABLE_HISTORY_TARGET,
+    key_col="lineage_row_id",
+    cluster_cols=["target_table_schema", "target_table_name", "event_date"],
+)
 
-def fq_table_name(parts: Iterable[str]) -> str:
-    tokens = [fq_identifier(p) for p in parts if p]
-    return ".".join(tokens)
+merge_history(
+    column_history_stage,
+    COLUMN_HISTORY_TARGET,
+    key_col="lineage_row_id",
+    cluster_cols=["target_table_schema", "target_table_name", "target_column_name"],
+)
 
-def dtype_family(dt: T.DataType) -> str:
-    s = dt.simpleString().lower()
-    if s.startswith("array"): return "array"
-    if s.startswith("map"): return "map"
-    if s.startswith("struct"): return "struct"
-    if "decimal" in s or "numeric" in s: return "decimal"
-    if s in {"byte","short","int","integer","long","bigint"}: return "integral"
-    if s in {"double","float"}: return "floating"
-    if "string" in s or "char" in s or "varchar" in s: return "stringy"
-    if "boolean" in s or "bool" in s: return "boolean"
-    if "timestamp" in s or s == "date": return "dates"
-    return s
+table_history_df = spark.table(qualify_name(TABLE_HISTORY_TARGET)).cache()
+column_history_df = spark.table(qualify_name(COLUMN_HISTORY_TARGET)).cache()
 
-def families_compatible(f1: str, f2: str) -> bool:
-    if f1 == f2: return True
-    if {f1, f2} <= {"integral", "decimal", "floating"}: return True
-    if {f1, f2} <= {"stringy"}: return True
-    if {f1, f2} <= {"dates"}: return True
-    return False
+# materialize cache
+_ = table_history_df.count()
+_ = column_history_df.count()
 
-def match_any(name: str, patterns: List[str]) -> bool:
-    lowered = name.lower()
-    for p in patterns:
-        try:
-            if re.match(p, lowered): return True
-        except re.error:
-            pass
-    return False
 
-def name_match_score(a: str, b: str) -> float:
-    a, b = a.lower(), b.lower()
-    if a == b: return 1.0
-    if a.endswith("_id") and b in {"id","pk","pk_id"}: return 0.9
-    if a.endswith(b) or b.endswith(a): return 0.75
-    at = set(re.split(r"[_\W]+", a))
-    bt = set(re.split(r"[_\W]+", b))
-    if not (at or bt): return 0.3
-    j = len(at & bt) / max(1, len(at | bt))
-    return max(0.3, j)
+# ------------------------------------------------------------
+# 2) Build table lineage version history + current direct edges
+# ------------------------------------------------------------
+# Latest target write event wins for CURRENT STATE.
+# Important:
+# - We choose the latest event per TARGET TABLE, not per edge.
+# - That avoids mixing older notebook/job sources with the newest writer.
+# - Table-level versions include target-only writes too, so a latest write with
+#   no source rows correctly clears current upstream lineage.
 
-def null_complement(null_ratio: Optional[float]) -> float:
-    if null_ratio is None: return 0.5
-    return 1.0 - float(null_ratio)
+table_target_events = (
+    table_history_df
+    .filter(F.col("target_table_full_name").isNotNull())
+    .select(
+        "target_table_full_name",
+        "target_table_catalog",
+        "target_table_schema",
+        "target_table_name",
+        "event_id",
+        "event_time",
+        "event_date",
+        "entity_type",
+        "entity_id",
+        "entity_run_id",
+        "created_by",
+    )
+    .dropDuplicates(["target_table_full_name", "event_id"])
+)
 
-def safe_conf_get(spark: SparkSession, key: str) -> Optional[str]:
-    try:
-        return spark.conf.get(key)
-    except Exception:
-        return None
+table_event_source_counts = (
+    table_history_df
+    .filter(
+        F.col("target_table_full_name").isNotNull() &
+        F.col("source_table_full_name").isNotNull()
+    )
+    .groupBy("target_table_full_name", "event_id")
+    .agg(F.count("*").alias("source_edge_count"))
+)
 
-def safe_conf_get_bool(spark: SparkSession, key: str) -> Optional[bool]:
-    v = safe_conf_get(spark, key)
-    if v is None: return None
-    s = str(v).strip().lower()
-    if s in {"true","1","t","y","yes","on"}: return True
-    if s in {"false","0","f","n","no","off"}: return False
-    return None
+table_versions_asc_w  = W.partitionBy("target_table_full_name").orderBy(F.col("event_time").asc(), F.col("event_id").asc())
+table_versions_desc_w = W.partitionBy("target_table_full_name").orderBy(F.col("event_time").desc(), F.col("event_id").desc())
 
-# =========================
-# ====== CORE LOGIC  ======
-# =========================
+table_versions_df = (
+    table_target_events
+    .join(table_event_source_counts, ["target_table_full_name", "event_id"], "left")
+    .fillna({"source_edge_count": 0})
+    .withColumn("valid_from_ts", F.col("event_time"))
+    .withColumn("valid_to_ts", F.lead("event_time").over(table_versions_asc_w))
+    .withColumn("version_rank_desc", F.row_number().over(table_versions_desc_w))
+    .withColumn("is_current", F.col("version_rank_desc") == 1)
+    .drop("version_rank_desc")
+)
 
-class ReverseERD:
-    def __init__(self, spark: SparkSession, catalog: str, schema: str, out_root_dbfs: str) -> None:
-        self.spark = spark
-        self.catalog = catalog
-        self.schema = schema
-        self.out_root_dbfs = out_root_dbfs.rstrip("/")
-        self.run_id = run_id()
-        self.start_ts = time.time()
+overwrite_delta(
+    table_versions_df,
+    TABLE_VERSIONS_TARGET,
+    cluster_cols=["target_table_schema", "target_table_name", "is_current"],
+)
 
-        # runtime caches
-        self.tables: List[str] = []
-        self.entities: Dict[str, Dict[str, Any]] = {}
-        self.declared: Dict[str, Any] = {"pk": {}, "fk": [], "checks": []}
-        self.relationships: List[Dict[str, Any]] = []
-        self.view_edges: List[Dict[str, Any]] = []
-        self.warnings: List[str] = []
-        self.errors: List[str] = []
+table_current_versions_df = (
+    table_versions_df
+    .filter(F.col("is_current"))
+    .select(
+        F.col("target_table_full_name").alias("version_target_table_full_name"),
+        F.col("event_id").alias("version_event_id"),
+        F.col("event_time").alias("version_event_time"),
+        F.col("valid_from_ts").alias("version_valid_from_ts"),
+        F.col("valid_to_ts").alias("version_valid_to_ts"),
+        F.col("is_current").alias("version_is_current"),
+        F.col("source_edge_count").alias("version_source_edge_count"),
+        F.col("created_by").alias("version_created_by"),
+        F.col("entity_type").alias("version_entity_type"),
+        F.col("entity_id").alias("version_entity_id"),
+        F.col("entity_run_id").alias("version_entity_run_id"),
+    )
+)
 
-        # environment snapshot
-        self.spark_env = {
-            "spark_version": self.spark.version,
-            "session_timezone": safe_conf_get(self.spark, "spark.sql.session.timeZone"),
-            "ansi": safe_conf_get_bool(self.spark, "spark.sql.ansi.enabled"),
-        }
+table_current_edges_df = (
+    table_history_df.alias("h")
+    .join(
+        table_current_versions_df.alias("v"),
+        (F.col("h.target_table_full_name") == F.col("v.version_target_table_full_name")) &
+        (F.col("h.event_id") == F.col("v.version_event_id")),
+        "inner"
+    )
+    .filter(F.col("h.source_table_full_name").isNotNull())
+    .select(
+        F.col("h.source_table_full_name"),
+        F.col("h.source_table_catalog"),
+        F.col("h.source_table_schema"),
+        F.col("h.source_table_name"),
+        F.col("h.source_type"),
 
-        # prepare paths
-        self.out_dir_dbfs = f"{self.out_root_dbfs}/{self.run_id}"
-        self.out_dir_local = dbfs_to_local(self.out_dir_dbfs)
-        os.makedirs(self.out_dir_local, exist_ok=True)
+        F.col("h.target_table_full_name"),
+        F.col("h.target_table_catalog"),
+        F.col("h.target_table_schema"),
+        F.col("h.target_table_name"),
+        F.col("h.target_type"),
 
-    # ---------- Discovery ----------
-    def discover_tables(self) -> None:
-        try:
-            df = self.spark.sql(
-                f"SHOW TABLES IN {fq_identifier(self.catalog)}.{fq_identifier(self.schema)}"
+        F.col("v.version_event_id"),
+        F.col("v.version_event_time"),
+        F.col("v.version_valid_from_ts"),
+        F.col("v.version_valid_to_ts"),
+        F.col("v.version_is_current"),
+        F.col("v.version_source_edge_count"),
+        F.col("v.version_created_by"),
+        F.col("v.version_entity_type"),
+        F.col("v.version_entity_id"),
+        F.col("v.version_entity_run_id"),
+    )
+    .dropDuplicates(["source_table_full_name", "target_table_full_name", "version_event_id"])
+    .cache()
+)
+
+_ = table_current_edges_df.count()
+
+overwrite_delta(
+    table_current_edges_df,
+    TABLE_CURRENT_EDGES_TARGET,
+    cluster_cols=["target_table_schema", "target_table_name", "source_table_schema", "source_table_name"],
+)
+
+
+# ------------------------------------------------------------
+# 3) Build column lineage version history + current direct edges
+# ------------------------------------------------------------
+# Important limitation:
+# column_lineage only contains events that have a source.
+# So CURRENT column lineage is best-effort: it picks the latest target-column
+# event that Databricks emitted, then warns if the table had a later write.
+
+table_current_write_times_df = (
+    table_current_versions_df
+    .select(
+        F.col("version_target_table_full_name").alias("target_table_full_name"),
+        F.col("version_event_time").alias("table_current_write_ts"),
+    )
+)
+
+column_target_events = (
+    column_history_df
+    .filter(
+        F.col("target_table_full_name").isNotNull() &
+        F.col("target_column_name").isNotNull()
+    )
+    .select(
+        "target_table_full_name",
+        "target_table_catalog",
+        "target_table_schema",
+        "target_table_name",
+        "target_type",
+        "target_column_name",
+        "event_id",
+        "event_time",
+        "event_date",
+        "entity_type",
+        "entity_id",
+        "entity_run_id",
+        "created_by",
+    )
+    .dropDuplicates(["target_table_full_name", "target_column_name", "event_id"])
+)
+
+column_event_source_counts = (
+    column_history_df
+    .filter(
+        F.col("target_table_full_name").isNotNull() &
+        F.col("target_column_name").isNotNull() &
+        F.col("source_table_full_name").isNotNull() &
+        F.col("source_column_name").isNotNull()
+    )
+    .groupBy("target_table_full_name", "target_column_name", "event_id")
+    .agg(F.count("*").alias("source_edge_count"))
+)
+
+column_versions_asc_w = (
+    W.partitionBy("target_table_full_name", "target_column_name")
+     .orderBy(F.col("event_time").asc(), F.col("event_id").asc())
+)
+column_versions_desc_w = (
+    W.partitionBy("target_table_full_name", "target_column_name")
+     .orderBy(F.col("event_time").desc(), F.col("event_id").desc())
+)
+
+column_versions_df = (
+    column_target_events
+    .join(column_event_source_counts, ["target_table_full_name", "target_column_name", "event_id"], "left")
+    .fillna({"source_edge_count": 0})
+    .withColumn("valid_from_ts", F.col("event_time"))
+    .withColumn("valid_to_ts", F.lead("event_time").over(column_versions_asc_w))
+    .withColumn("version_rank_desc", F.row_number().over(column_versions_desc_w))
+    .withColumn("is_current", F.col("version_rank_desc") == 1)
+    .drop("version_rank_desc")
+    .join(table_current_write_times_df, ["target_table_full_name"], "left")
+    .withColumn(
+        "possible_staleness_due_to_later_table_write",
+        F.when(
+            F.col("table_current_write_ts").isNotNull() &
+            (F.col("table_current_write_ts") > F.col("event_time")),
+            F.lit(True)
+        ).otherwise(F.lit(False))
+    )
+)
+
+overwrite_delta(
+    column_versions_df,
+    COLUMN_VERSIONS_TARGET,
+    cluster_cols=["target_table_schema", "target_table_name", "target_column_name", "is_current"],
+)
+
+column_current_versions_df = (
+    column_versions_df
+    .filter(F.col("is_current"))
+    .select(
+        F.col("target_table_full_name").alias("version_target_table_full_name"),
+        F.col("target_column_name").alias("version_target_column_name"),
+        F.col("event_id").alias("version_event_id"),
+        F.col("event_time").alias("version_event_time"),
+        F.col("valid_from_ts").alias("version_valid_from_ts"),
+        F.col("valid_to_ts").alias("version_valid_to_ts"),
+        F.col("is_current").alias("version_is_current"),
+        F.col("source_edge_count").alias("version_source_edge_count"),
+        F.col("possible_staleness_due_to_later_table_write"),
+        F.col("created_by").alias("version_created_by"),
+        F.col("entity_type").alias("version_entity_type"),
+        F.col("entity_id").alias("version_entity_id"),
+        F.col("entity_run_id").alias("version_entity_run_id"),
+    )
+)
+
+column_current_edges_df = (
+    column_history_df.alias("h")
+    .join(
+        column_current_versions_df.alias("v"),
+        (F.col("h.target_table_full_name") == F.col("v.version_target_table_full_name")) &
+        (F.col("h.target_column_name") == F.col("v.version_target_column_name")) &
+        (F.col("h.event_id") == F.col("v.version_event_id")),
+        "inner"
+    )
+    .filter(
+        F.col("h.source_table_full_name").isNotNull() &
+        F.col("h.source_column_name").isNotNull()
+    )
+    .select(
+        F.col("h.source_table_full_name"),
+        F.col("h.source_table_catalog"),
+        F.col("h.source_table_schema"),
+        F.col("h.source_table_name"),
+        F.col("h.source_type"),
+        F.col("h.source_column_name"),
+
+        F.col("h.target_table_full_name"),
+        F.col("h.target_table_catalog"),
+        F.col("h.target_table_schema"),
+        F.col("h.target_table_name"),
+        F.col("h.target_type"),
+        F.col("h.target_column_name"),
+
+        F.concat_ws("|", F.col("h.source_table_full_name"), F.col("h.source_column_name")).alias("source_node_key"),
+        F.concat_ws("|", F.col("h.target_table_full_name"), F.col("h.target_column_name")).alias("target_node_key"),
+
+        F.col("v.version_event_id"),
+        F.col("v.version_event_time"),
+        F.col("v.version_valid_from_ts"),
+        F.col("v.version_valid_to_ts"),
+        F.col("v.version_is_current"),
+        F.col("v.version_source_edge_count"),
+        F.col("v.possible_staleness_due_to_later_table_write"),
+        F.col("v.version_created_by"),
+        F.col("v.version_entity_type"),
+        F.col("v.version_entity_id"),
+        F.col("v.version_entity_run_id"),
+    )
+    .dropDuplicates(["source_node_key", "target_node_key", "version_event_id"])
+    .cache()
+)
+
+_ = column_current_edges_df.count()
+
+overwrite_delta(
+    column_current_edges_df,
+    COLUMN_CURRENT_EDGES_TARGET,
+    cluster_cols=["target_table_schema", "target_table_name", "target_column_name", "source_table_schema", "source_table_name", "source_column_name"],
+)
+
+
+# ------------------------------------------------------------
+# 4) Table graph traversal (shortest-path closure; all direct current edges kept separately)
+# ------------------------------------------------------------
+def build_empty_table_paths_df(current_edges_df):
+    return current_edges_df.limit(0).select(
+        F.lit(ROOT_FULL_NAME).cast("string").alias("root_table_full_name"),
+        F.lit(ROOT_SCHEMA).cast("string").alias("root_table_schema"),
+        F.lit(ROOT_NAME).cast("string").alias("root_table_name"),
+
+        F.lit(None).cast("string").alias("direction"),
+        F.lit(None).cast("int").alias("hop_count"),
+
+        F.lit(None).cast("string").alias("reached_table_full_name"),
+        F.lit(None).cast("string").alias("reached_table_schema"),
+        F.lit(None).cast("string").alias("reached_table_name"),
+        F.lit(None).cast("string").alias("reached_type"),
+
+        F.lit(None).cast("string").alias("adjacent_table_full_name"),
+        F.lit(None).cast("string").alias("adjacent_table_schema"),
+        F.lit(None).cast("string").alias("adjacent_table_name"),
+        F.lit(None).cast("string").alias("adjacent_type"),
+
+        F.lit(None).cast("string").alias("edge_source_table_full_name"),
+        F.lit(None).cast("string").alias("edge_source_table_schema"),
+        F.lit(None).cast("string").alias("edge_source_table_name"),
+        F.lit(None).cast("string").alias("edge_source_type"),
+
+        F.lit(None).cast("string").alias("edge_target_table_full_name"),
+        F.lit(None).cast("string").alias("edge_target_table_schema"),
+        F.lit(None).cast("string").alias("edge_target_table_name"),
+        F.lit(None).cast("string").alias("edge_target_type"),
+
+        F.lit(None).cast("string").alias("version_event_id"),
+        F.lit(None).cast("timestamp").alias("version_event_time"),
+        F.lit(None).cast("timestamp").alias("version_valid_from_ts"),
+        F.lit(None).cast("timestamp").alias("version_valid_to_ts"),
+        F.lit(None).cast("boolean").alias("version_is_current"),
+        F.lit(None).cast("int").alias("version_source_edge_count"),
+        F.lit(None).cast("string").alias("version_created_by"),
+        F.lit(None).cast("string").alias("version_entity_type"),
+        F.lit(None).cast("string").alias("version_entity_id"),
+        F.lit(None).cast("string").alias("version_entity_run_id"),
+
+        F.lit(None).cast("string").alias("path_from_root"),
+        F.lit(None).cast("boolean").alias("is_terminal"),
+        F.lit(None).cast("string").alias("terminal_reason"),
+        F.current_timestamp().alias("generated_at"),
+    )
+
+def traverse_table_direction(current_edges_df, direction: str):
+    root_frontier = spark.createDataFrame(
+        [(ROOT_FULL_NAME, ROOT_SCHEMA, ROOT_NAME, "TABLE", 0, ROOT_FULL_NAME)],
+        ["current_table_full_name", "current_table_schema", "current_table_name", "current_type", "hop_count", "path_from_root"]
+    )
+
+    visited = root_frontier.select(F.col("current_table_full_name").alias("visited_node")).dropDuplicates()
+    frontier = root_frontier
+    results = None
+    iteration = 0
+
+    if direction == "UPSTREAM":
+        expandable_nodes = current_edges_df.select(F.col("target_table_full_name").alias("expandable_node")).dropDuplicates().cache()
+    else:
+        expandable_nodes = current_edges_df.select(F.col("source_table_full_name").alias("expandable_node")).dropDuplicates().cache()
+
+    _ = expandable_nodes.count()
+
+    while df_has_rows(frontier):
+        iteration += 1
+
+        if direction == "UPSTREAM":
+            step = (
+                F.broadcast(frontier).alias("f")
+                .join(
+                    current_edges_df.alias("e"),
+                    F.col("f.current_table_full_name") == F.col("e.target_table_full_name"),
+                    "inner"
+                )
+                .select(
+                    F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
+                    F.lit(ROOT_SCHEMA).alias("root_table_schema"),
+                    F.lit(ROOT_NAME).alias("root_table_name"),
+
+                    F.lit("UPSTREAM").alias("direction"),
+                    (F.col("f.hop_count") + F.lit(1)).alias("hop_count"),
+
+                    F.col("e.source_table_full_name").alias("reached_table_full_name"),
+                    F.col("e.source_table_schema").alias("reached_table_schema"),
+                    F.col("e.source_table_name").alias("reached_table_name"),
+                    F.col("e.source_type").alias("reached_type"),
+
+                    F.col("f.current_table_full_name").alias("adjacent_table_full_name"),
+                    F.col("f.current_table_schema").alias("adjacent_table_schema"),
+                    F.col("f.current_table_name").alias("adjacent_table_name"),
+                    F.col("f.current_type").alias("adjacent_type"),
+
+                    F.col("e.source_table_full_name").alias("edge_source_table_full_name"),
+                    F.col("e.source_table_schema").alias("edge_source_table_schema"),
+                    F.col("e.source_table_name").alias("edge_source_table_name"),
+                    F.col("e.source_type").alias("edge_source_type"),
+
+                    F.col("e.target_table_full_name").alias("edge_target_table_full_name"),
+                    F.col("e.target_table_schema").alias("edge_target_table_schema"),
+                    F.col("e.target_table_name").alias("edge_target_table_name"),
+                    F.col("e.target_type").alias("edge_target_type"),
+
+                    F.col("e.version_event_id"),
+                    F.col("e.version_event_time"),
+                    F.col("e.version_valid_from_ts"),
+                    F.col("e.version_valid_to_ts"),
+                    F.col("e.version_is_current"),
+                    F.col("e.version_source_edge_count"),
+                    F.col("e.version_created_by"),
+                    F.col("e.version_entity_type"),
+                    F.col("e.version_entity_id"),
+                    F.col("e.version_entity_run_id"),
+
+                    F.concat(F.col("f.path_from_root"), F.lit(" <- "), F.col("e.source_table_full_name")).alias("path_from_root"),
+                )
             )
-            names = [r.tableName for r in df.select("tableName").limit(MAX_TABLES+1).collect()]
-            if len(names) > MAX_TABLES:
-                names = names[:MAX_TABLES]
-                self.warnings.append(f"Table count exceeded MAX_TABLES={MAX_TABLES}; truncated.")
-            self.tables = [f"{self.catalog}.{self.schema}.{n}" for n in names]
-            if not self.tables:
-                self.errors.append("No tables found in namespace.")
-        except Exception as exc:
-            self.errors.append(f"SHOW TABLES failed: {exc}")
-            self.tables = []
-
-    def fetch_information_schema(self) -> None:
-        if not self.tables: return
-        cat, sch = self.catalog, self.schema
-        # Tables overview
-        try:
-            is_tables = self.spark.sql(
-                f"""
-                SELECT table_name, table_type, data_source_format
-                FROM {fq_identifier(cat)}.information_schema.tables
-                WHERE table_schema = '{sch}'
-                """
-            )
-            table_map = {f"{cat}.{sch}.{r.table_name}": (r.table_type, r.data_source_format)
-                         for r in is_tables.collect()}
-        except Exception as exc:
-            self.warnings.append(f"information_schema.tables not accessible: {exc}")
-            table_map = {}
-
-        # Declared constraints (PK/FK/CHECK) if present
-        try:
-            is_tc = self.spark.sql(
-                f"""
-                SELECT constraint_name, table_name, constraint_type
-                FROM {fq_identifier(cat)}.information_schema.table_constraints
-                WHERE table_schema = '{sch}'
-                """
-            )
-            is_kcu = self.spark.sql(
-                f"""
-                SELECT constraint_name, table_name, column_name, ordinal_position
-                FROM {fq_identifier(cat)}.information_schema.key_column_usage
-                WHERE table_schema = '{sch}'
-                """
-            )
-            is_rc = self.spark.sql(
-                f"""
-                SELECT constraint_name, unique_constraint_name
-                FROM {fq_identifier(cat)}.information_schema.referential_constraints
-                WHERE constraint_schema = '{sch}'
-                """
-            )
-            pk_names = [r.constraint_name for r in is_tc.filter("constraint_type='PRIMARY KEY'").select("constraint_name").distinct().collect()]
-            for pk in pk_names:
-                cols = [r.column_name for r in is_kcu.filter(F.col("constraint_name")==pk).orderBy("ordinal_position").collect()]
-                tbl_row = is_kcu.filter(F.col("constraint_name")==pk).select("table_name").first()
-                if tbl_row and cols:
-                    t = f"{cat}.{sch}.{tbl_row.table_name}"
-                    self.declared["pk"][t] = cols
-
-            fk_rows = is_tc.filter("constraint_type='FOREIGN KEY'").select("constraint_name","table_name").collect()
-            for r in fk_rows:
-                fk_name, fk_tbl = r.constraint_name, f"{cat}.{sch}.{r.table_name}"
-                fk_cols = [x.column_name for x in is_kcu.filter(F.col("constraint_name")==fk_name).orderBy("ordinal_position").collect()]
-                ref = is_rc.filter(F.col("constraint_name")==fk_name).select("unique_constraint_name").first()
-                if ref:
-                    pk_name = ref.unique_constraint_name
-                    pk_tbl_row = is_kcu.filter(F.col("constraint_name")==pk_name).select("table_name").first()
-                    pk_cols = [x.column_name for x in is_kcu.filter(F.col("constraint_name")==pk_name).orderBy("ordinal_position").collect()]
-                    if pk_tbl_row and fk_cols and pk_cols:
-                        pk_tbl = f"{cat}.{sch}.{pk_tbl_row.table_name}"
-                        self.declared["fk"].append({
-                            "fk_table": fk_tbl, "fk_cols": fk_cols,
-                            "pk_table": pk_tbl, "pk_cols": pk_cols,
-                            "name": fk_name
-                        })
-        except Exception as exc:
-            self.warnings.append(f"information_schema constraint discovery limited: {exc}")
-
-        # View → base table edges (outside PK/FK; like lineage)
-        try:
-            view_usage = self.spark.sql(
-                f"""
-                SELECT view_name, table_name
-                FROM {fq_identifier(cat)}.information_schema.view_table_usage
-                WHERE view_schema = '{sch}'
-                """
-            )
-            for r in view_usage.collect():
-                self.view_edges.append({
-                    "view": f"{cat}.{sch}.{r.view_name}",
-                    "table": f"{cat}.{sch}.{r.table_name}"
-                })
-        except Exception as exc:
-            self.warnings.append(f"information_schema.view_table_usage not accessible: {exc}")
-
-        # Initialize entity shells
-        for t in self.tables:
-            tt, fmt = table_map.get(t, (None, None))
-            self.entities[t] = {
-                "table": t,
-                "row_count": None,
-                "table_type": tt,
-                "data_source_format": fmt,
-                "columns": [],
-                "is_view": (tt == "VIEW")
-            }
-
-    # ---------- Metadata / Stats ----------
-    def describe_table(self, table: str) -> Optional[DataFrame]:
-        try:
-            return self.spark.table(table)
-        except Exception as exc:
-            self.warnings.append(f"Cannot read table {table}: {exc}")
-            return None
-
-    def get_num_rows(self, table: str) -> Optional[int]:
-        try:
-            r = self.spark.sql(f"DESCRIBE DETAIL {fq_table_name(table.split('.'))}").select("numRows").first()
-            if r and r[0] is not None: return int(r[0])
-        except Exception:
-            pass
-        # Last resort (can be heavy for huge tables; skipped by default)
-        return None
-
-    def compute_table_stats(self) -> None:
-        for t, meta in self.entities.items():
-            df = self.describe_table(t)
-            meta["row_count"] = self.get_num_rows(t)
-            if df is None:
-                continue
-            cols: List[Dict[str, Any]] = []
-            for f in df.schema.fields:
-                fam = dtype_family(f.dataType)
-                cols.append({
-                    "name": f.name,
-                    "type": f.dataType.simpleString(),
-                    "family": fam,
-                    "nullable": f.nullable,
-                })
-
-            # null ratio (bounded sample)
-            nr: Dict[str, Optional[float]] = {}
-            try:
-                sdf = df.sample(False, ROW_SAMPLE_FRACTION, seed=42) if ROW_SAMPLE_FRACTION < 1.0 else df
-                sdf = sdf.limit(NULL_SAMPLE_ROWS)
-                exprs = [F.avg(F.when(F.col(c["name"]).isNull(), 1).otherwise(0)).alias(c["name"]) for c in cols]
-                row = sdf.select(*exprs).first()
-                if row: nr = {k: (float(v) if v is not None else None) for k, v in row.asDict().items()}
-            except Exception as exc:
-                self.warnings.append(f"Null ratio failed for {t}: {exc}")
-
-            # approx distinct via sampled rows (bounded)
-            ad: Dict[str, Optional[int]] = {}
-            try:
-                sdf = df.sample(False, ROW_SAMPLE_FRACTION, seed=7) if ROW_SAMPLE_FRACTION < 1.0 else df
-                sdf = sdf.limit(DISTINCT_SAMPLE_ROWS)
-                elig = [c["name"] for c in cols if c["family"] in {"integral","decimal","floating","stringy","dates","boolean"}]
-                for batch_start in range(0, len(elig), 40):
-                    batch = elig[batch_start:batch_start+40]
-                    exprs = [F.approx_count_distinct(F.col(c)).alias(c) for c in batch]
-                    row = sdf.select(*exprs).first()
-                    if row: ad.update({k: (int(v) if v is not None else None) for k, v in row.asDict().items()})
-            except Exception as exc:
-                self.warnings.append(f"Approx distinct failed for {t}: {exc}")
-
-            # enrich column metas
-            for c in cols:
-                c["null_ratio"] = nr.get(c["name"])
-                c["approx_distinct"] = ad.get(c["name"])
-                c["is_id_name"] = match_any(c["name"], ID_NAME_HINTS)
-                c["is_fk_name"] = match_any(c["name"], FK_NAME_HINTS)
-            meta["columns"] = cols
-
-    # ---------- Key candidates ----------
-    def pk_candidates(self, table: str, meta: Dict[str, Any]) -> List[str]:
-        # Declared PK wins
-        if table in self.declared["pk"] and self.declared["pk"][table]:
-            return list(self.declared["pk"][table])
-
-        cols = meta.get("columns", [])
-        row_count = meta.get("row_count")
-        if not cols or not row_count or row_count <= 0:
-            return []
-
-        # Score single-column PKs (distinctness + nulls + name hint)
-        scored: List[Tuple[str,float]] = []
-        for c in cols:
-            ad = c.get("approx_distinct")
-            if ad is None: continue
-            ratio = min(1.0, ad / max(1, row_count))
-            score = 0.65 * ratio + 0.25 * null_complement(c.get("null_ratio")) + 0.10 * (1.0 if c.get("is_id_name") else 0.0)
-            scored.append((c["name"], round(score,3)))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        if scored and scored[0][1] >= PK_ACCEPT_RATIO:
-            return [scored[0][0]]
-
-        # Simple composite (top 2) if close, bounded via sample + hash distinct
-        top_names = [n for (n,s) in scored[:5]]
-        if len(top_names) >= 2:
-            df = self.describe_table(table)
-            if df is not None:
-                try:
-                    sdf = df.select(*[F.col(n) for n in top_names]).sample(False, 0.2, seed=11).limit(200_000)
-                    best_combo, best_ratio = None, 0.0
-                    for combo in itertools.combinations(top_names, 2):
-                        ad2 = sdf.select(
-                            F.approx_count_distinct(
-                                F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c).cast("string"), F.lit("NULL")) for c in combo]), 256)
-                            ).alias("ad")
-                        ).first().ad
-                        if ad2:
-                            ratio2 = min(1.0, ad2 / max(1, row_count))
-                            if ratio2 > best_ratio:
-                                best_ratio, best_combo = ratio2, combo
-                    if best_combo and best_ratio >= PK_ACCEPT_RATIO:
-                        return list(best_combo)
-                except Exception as exc:
-                    self.warnings.append(f"Composite PK eval failed for {table}: {exc}")
-
-        # No strong candidate
-        return [scored[0][0]] if scored else []
-
-    def fk_candidates(self, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-        out = []
-        for c in meta.get("columns", []):
-            fam_ok = c.get("family") in {"integral","decimal","floating","stringy","dates"}
-            if not fam_ok: continue
-            base = 0.30
-            base += 0.40 if (c.get("is_fk_name") or c.get("is_id_name")) else 0.0
-            base += 0.30 * null_complement(c.get("null_ratio"))
-            out.append({"name": c["name"], "score": round(base,3)})
-        out.sort(key=lambda d: d["score"], reverse=True)
-        return out
-
-    # ---------- Value sampling (bounded) ----------
-    def collect_distinct_sample(self, table: str, col: str, max_rows: int, fraction: float) -> List[str]:
-        try:
-            df = self.describe_table(table)
-            if df is None: return []
-            sdf = df.select(F.col(col)).where(F.col(col).isNotNull()).sample(False, fraction, seed=23).limit(max_rows)
-            vals = [str(r[0]) for r in sdf.distinct().limit(MAX_DISTINCT_COLLECT).collect() if r[0] is not None]
-            return vals
-        except Exception as exc:
-            self.warnings.append(f"Value sample failed {table}.{col}: {exc}")
-            return []
-
-    # ---------- Relationship inference ----------
-    def infer_relationships(self) -> None:
-        # 1) Declared FKs
-        for fk in self.declared["fk"]:
-            fk_cols = fk["fk_cols"]; pk_cols = fk["pk_cols"]
-            self.relationships.append({
-                "fk_table": fk["fk_table"],
-                "fk_column": " + ".join(fk_cols) if len(fk_cols)>1 else fk_cols[0],
-                "pk_table": fk["pk_table"],
-                "pk_column": " + ".join(pk_cols) if len(pk_cols)>1 else pk_cols[0],
-                "score": 1.0,
-                "declared": True,
-                "cardinality": "many-to-one" if len(fk_cols)==1 else "many-to-one",
-                "confidence": "high",
-                "evidence": {"declared_constraint": fk["name"]},
-                "join_example_sql": self._join_sql(fk["fk_table"], fk["pk_table"], fk_cols, pk_cols)
-            })
-
-        # 2) Inferred FKs (single-column first)
-        pk_registry: Dict[str,List[str]] = {t: self.pk_candidates(t, m) for t,m in self.entities.items()}
-        for fk_table, fk_meta in self.entities.items():
-            fk_cols = self.fk_candidates(fk_meta)
-            for fk_col in fk_cols:
-                fk_name = fk_col["name"]
-                for pk_table, pk_cols in pk_registry.items():
-                    if not pk_cols: continue
-                    # Skip if declared edge exists
-                    if any(r.get("declared") and r["fk_table"]==fk_table and r["pk_table"]==pk_table for r in self.relationships):
-                        continue
-
-                    # Evaluate only single-column PKs in this phase
-                    if len(pk_cols) != 1:
-                        continue
-                    pk_name = pk_cols[0]
-
-                    # Type compatibility
-                    f_meta = next((c for c in fk_meta["columns"] if c["name"]==fk_name), None)
-                    p_meta = next((c for c in self.entities[pk_table]["columns"] if c["name"]==pk_name), None)
-                    if not f_meta or not p_meta: continue
-                    if not families_compatible(f_meta["family"], p_meta["family"]): continue
-
-                    # Feature scores
-                    sc_name = name_match_score(fk_name, pk_name)
-                    sc_null = null_complement(f_meta.get("null_ratio"))
-                    pk_ad = p_meta.get("approx_distinct")
-                    pk_rows = self.entities[pk_table].get("row_count")
-                    sc_dr = min(1.0, (pk_ad / max(1, pk_rows))) if (pk_ad is not None and pk_rows) else 0.5
-
-                    # Value overlap (bounded)
-                    fk_vals = set(self.collect_distinct_sample(fk_table, fk_name, DISTINCT_SAMPLE_ROWS, 0.25))
-                    pk_vals = set(self.collect_distinct_sample(pk_table, pk_name, DISTINCT_SAMPLE_ROWS, 0.25))
-                    sc_overlap = (len(fk_vals & pk_vals) / max(1, len(fk_vals))) if fk_vals else 0.0
-
-                    # Aggregate score
-                    score = (0.22*sc_name) + (0.18*sc_dr) + (0.18*sc_null) + (0.40*sc_overlap) + (0.02*1.0)
-                    rel_score = round(float(score), 3)
-                    if rel_score >= REL_MIN_SCORE:
-                        # Cardinality hint via approx distinct
-                        cardinality = "many-to-one"
-                        fk_ad = f_meta.get("approx_distinct")
-                        if fk_ad and pk_ad and pk_ad>0 and abs(fk_ad - pk_ad)/pk_ad < 0.05:
-                            cardinality = "one-to-one"
-
-                        self.relationships.append({
-                            "fk_table": fk_table,
-                            "fk_column": fk_name,
-                            "pk_table": pk_table,
-                            "pk_column": pk_name,
-                            "score": rel_score,
-                            "declared": False,
-                            "cardinality": cardinality,
-                            "confidence": "high" if rel_score >= REL_HIGH_CONF else "medium",
-                            "evidence": {
-                                "name_match": round(sc_name,3),
-                                "pk_distinct_ratio": round(sc_dr,3),
-                                "fk_null_complement": round(sc_null,3),
-                                "value_overlap": round(sc_overlap,3),
-                                "fk_ad": fk_ad, "pk_ad": pk_ad
-                            },
-                            "join_example_sql": self._join_sql(fk_table, pk_table, [fk_name], [pk_name])
-                        })
-
-        # 3) Composite inference (name-aligned pairs only; bounded)
-        for pk_table, pk_cols in pk_registry.items():
-            if len(pk_cols) < 2: continue
-            for fk_table, fk_meta in self.entities.items():
-                if fk_table == pk_table: continue
-                fk_names = [c["name"] for c in fk_meta["columns"]]
-                if all(any(fn.lower()==pc.lower() or fn.lower().endswith(f"_{pc.lower()}") for fn in fk_names) for pc in pk_cols):
-                    # overlap check
-                    try:
-                        fk_df = self.describe_table(fk_table)
-                        pk_df = self.describe_table(pk_table)
-                        if fk_df is None or pk_df is None: continue
-                        fk_sample = fk_df.select(*[F.col(c).cast("string") for c in pk_cols]).sample(False, 0.2, seed=101).limit(100_000)
-                        pk_sample = pk_df.select(*[F.col(c).cast("string") for c in pk_cols]).sample(False, 0.2, seed=102).limit(100_000)
-                        fk_hash = {r[0] for r in fk_sample.select(F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c), F.lit("NULL")) for c in pk_cols]),256)).distinct().limit(MAX_DISTINCT_COLLECT).collect()}
-                        pk_hash = {r[0] for r in pk_sample.select(F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c), F.lit("NULL")) for c in pk_cols]),256)).distinct().limit(MAX_DISTINCT_COLLECT).collect()}
-                        overlap = (len(fk_hash & pk_hash) / max(1, len(fk_hash))) if fk_hash else 0.0
-                    except Exception as exc:
-                        self.warnings.append(f"Composite overlap failed {fk_table}->{pk_table}: {exc}")
-                        overlap = 0.0
-
-                    if overlap >= 0.5:
-                        rel_score = round(0.7 + 0.3*min(1.0, overlap), 3)
-                        self.relationships.append({
-                            "fk_table": fk_table,
-                            "fk_column": " + ".join(pk_cols),
-                            "pk_table": pk_table,
-                            "pk_column": " + ".join(pk_cols),
-                            "score": rel_score,
-                            "declared": False,
-                            "cardinality": "many-to-one",
-                            "confidence": "high" if rel_score >= REL_HIGH_CONF else "medium",
-                            "evidence": {"composite_overlap": round(overlap,3)},
-                            "join_example_sql": self._join_sql(fk_table, pk_table, pk_cols, pk_cols)
-                        })
-
-        # 4) If absolutely nothing inferred/declared, keep top few suggestions (low confidence) to avoid empty output
-        if not self.relationships:
-            candidates: List[Tuple[float, Dict[str, Any]]] = []
-            # simple top-N by name & type compat only
-            for fk_table, fk_meta in self.entities.items():
-                for fk in self.fk_candidates(fk_meta)[:5]:
-                    f_meta = next((c for c in fk_meta["columns"] if c["name"]==fk["name"]), None)
-                    if not f_meta: continue
-                    for pk_table, pk_meta in self.entities.items():
-                        if fk_table == pk_table: continue
-                        for pc in self.pk_candidates(pk_table, pk_meta)[:1]:
-                            p_meta = next((c for c in pk_meta["columns"] if c["name"]==pc), None)
-                            if not p_meta: continue
-                            if not families_compatible(f_meta["family"], p_meta["family"]): continue
-                            sc_name = name_match_score(f_meta["name"], p_meta["name"])
-                            sc = 0.6*sc_name + 0.2*null_complement(f_meta.get("null_ratio")) + 0.2*0.5
-                            candidates.append((sc, {
-                                "fk_table": fk_table, "fk_column": f_meta["name"],
-                                "pk_table": pk_table, "pk_column": p_meta["name"],
-                                "score": round(sc,3), "declared": False,
-                                "cardinality": "many-to-one",
-                                "confidence": "low",
-                                "evidence": {"fallback": True, "name_match": round(sc_name,3)},
-                                "join_example_sql": self._join_sql(fk_table, pk_table, [f_meta["name"]],[p_meta["name"]])
-                            }))
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            for sc, rel in candidates[:10]:
-                self.relationships.append(rel)
-
-        # Add view edges (lineage-like) as separate set (they are not FK; label "view-usage")
-        for e in self.view_edges:
-            self.relationships.append({
-                "fk_table": e["view"],
-                "fk_column": "*",
-                "pk_table": e["table"],
-                "pk_column": "*",
-                "score": 0.99,
-                "declared": False,
-                "cardinality": "derived-from",
-                "confidence": "high",
-                "evidence": {"source": "information_schema.view_table_usage"},
-                "join_example_sql": f"-- View {e['view']} uses {e['table']}"
-            })
-
-    def _join_sql(self, fk_table: str, pk_table: str, fk_cols: List[str], pk_cols: List[str]) -> str:
-        fqt = fq_table_name(fk_table.split("."))
-        pqt = fq_table_name(pk_table.split("."))
-        cond = " AND ".join([f"f.`{f}` = p.`{p}`" for f,p in itertools.zip_longest(fk_cols, pk_cols, fillvalue=pk_cols[-1])])
-        return f"SELECT * FROM {fqt} f JOIN {pqt} p ON {cond}"
-
-    # ---------- Rendering ----------
-    def render_markdown(self, model: Dict[str, Any]) -> str:
-        md: List[str] = []
-        md.append(f"# Reverse ERD & Data Model (v{VERSION})")
-        md.append("")
-        ns = model["namespace"]
-        label = f"{ns['catalog']}.{ns['schema']}"
-        md.append(f"- **Run ID:** `{model['run_id']}`")
-        md.append(f"- **Namespace:** `{label}`")
-        md.append(f"- **Tables:** {len(model['entities'])}")
-        md.append(f"- **Relationships:** {len(model['relationships'])}")
-        md.append("")
-        md.append("## Table Inventory")
-        for e in model["entities"]:
-            md.append(f"### {e['name']}")
-            md.append(f"- Rows: `{e.get('row_count')}`")
-            md.append(f"- Type: `{e.get('table_type') or ('VIEW' if e.get('is_view') else 'TABLE')}`")
-            md.append(f"- Source: `{e.get('data_source_format') or 'unknown'}`")
-            md.append("")
-            md.append("| Column | Type | Nullable | Approx Distinct | Null Ratio |")
-            md.append("| --- | --- | --- | --- | --- |")
-            for c in e["columns"]:
-                md.append(f"| `{c['name']}` | `{c['type']}` | `{c['nullable']}` | `{c.get('approx_distinct')}` | `{c.get('null_ratio')}` |")
-            md.append("")
-        md.append("## Relationships")
-        if model["relationships"]:
-            for r in model["relationships"]:
-                md.append(f"- **{r['fk_table']}**.`{r['fk_column']}` → **{r['pk_table']}**.`{r['pk_column']}` "
-                          f"(score={r['score']}, conf={r['confidence']}, type={r['cardinality']})")
         else:
-            md.append("_None found._")
-        md.append("")
-        md.append("## Notes")
-        md.append("- Inferred edges are heuristics; verify before enforcing constraints.")
-        return "\n".join(md)
+            step = (
+                F.broadcast(frontier).alias("f")
+                .join(
+                    current_edges_df.alias("e"),
+                    F.col("f.current_table_full_name") == F.col("e.source_table_full_name"),
+                    "inner"
+                )
+                .select(
+                    F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
+                    F.lit(ROOT_SCHEMA).alias("root_table_schema"),
+                    F.lit(ROOT_NAME).alias("root_table_name"),
 
-    def render_html(self, model: Dict[str, Any]) -> str:
-        # minimal, clean, searchable ERD with vis-network
-        def esc(x: Any) -> str: return html.escape("" if x is None else str(x), quote=True)
-        nodes = []
-        for e in model["entities"]:
-            cols = e.get("columns", [])
-            lines = []
-            for idx, c in enumerate(cols):
-                if MAX_COLUMNS_PER_ENTITY_HTML != -1 and idx >= MAX_COLUMNS_PER_ENTITY_HTML:
-                    lines.append(f"… {len(cols) - MAX_COLUMNS_PER_ENTITY_HTML} more")
-                    break
-                badges = []
-                if match_any(c["name"], ID_NAME_HINTS): badges.append("ID")
-                if match_any(c["name"], FK_NAME_HINTS): badges.append("FK?")
-                btxt = f" <span class='badge'>{', '.join(badges)}</span>" if badges else ""
-                lines.append(f"{esc(c['name'])} <span class='type'>({esc(c['type'])})</span>{btxt}")
-            label = f"<b>{esc(e['name'])}</b>"
-            if lines: label += "<br/>" + "<br/>".join(lines)
-            nodes.append({"id": e["name"], "label": label, "title": esc(f"Rows: {e.get('row_count')}")})
+                    F.lit("DOWNSTREAM").alias("direction"),
+                    (F.col("f.hop_count") + F.lit(1)).alias("hop_count"),
 
-        edges = []
-        for r in model["relationships"]:
-            col = {"high":"#2E7D32","medium":"#F9A825","low":"#C62828"}.get(r["confidence"], "#546E7A")
-            dashes = (r["confidence"] == "low")
-            edges.append({
-                "from": r["fk_table"], "to": r["pk_table"],
-                "label": f"{r['fk_column']} → {r['pk_column']}",
-                "title": esc(f"score={r['score']} type={r['cardinality']}"),
-                "color": col, "dashes": dashes
-            })
+                    F.col("e.target_table_full_name").alias("reached_table_full_name"),
+                    F.col("e.target_table_schema").alias("reached_table_schema"),
+                    F.col("e.target_table_name").alias("reached_table_name"),
+                    F.col("e.target_type").alias("reached_type"),
 
-        html_doc = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>ERD — {esc(model['namespace']['catalog'])}.{esc(model['namespace']['schema'])}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet"/>
-<link rel="stylesheet" href="https://unpkg.com/vis-network/styles/vis-network.min.css"/>
-<style>
-body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 18px; color: #1f2937; background:#fafbfc; }}
-#toolbar {{ display:flex; gap:8px; margin-bottom:12px; align-items:center; }}
-input[type="search"] {{ padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; width:320px; }}
-#network {{ height: 720px; background:#fff; border:1px solid #d1d5db; border-radius:8px; }}
-.badge {{ background:#eef2ff; color:#3730a3; font-size:10px; padding:0 6px; border-radius:6px; margin-left:4px; }}
-.type {{ color:#6b7280; }}
-</style>
-</head>
-<body>
-<div id="toolbar">
-  <input id="q" type="search" placeholder="Filter entities by name or column…"/>
-</div>
-<div id="network"></div>
-<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-<script>
-const nodesData = new vis.DataSet({json.dumps(nodes).replace("</","<\\/")});
-const edgesData = new vis.DataSet({json.dumps(edges).replace("</","<\\/")});
-const container = document.getElementById('network');
-const network = new vis.Network(container, {{nodes: nodesData, edges: edgesData}}, {{
-  layout: {{ hierarchical: {{ enabled: true, direction:'LR', levelSeparation: 220, nodeSpacing: 180 }} }},
-  physics: false,
-  edges: {{ arrows: {{ to: {{ enabled: true, scaleFactor: 0.8 }} }}, smooth: {{ type:'cubicBezier', forceDirection:'horizontal', roundness: 0.45 }}, font: {{ face:'Inter', size: 12, align:'top' }} }},
-  nodes: {{ shape:'box', font: {{ multi:'html', face:'Inter', size: 12 }}, margin: 12, widthConstraint: {{ maximum: 320 }},
-           color: {{ background:'#fff', border:'#a3b1c2', highlight: {{ background:'#f5f7fa', border:'#1f7aec' }} }} }},
-  interaction: {{ hover: true, tooltipDelay: 100, zoomView: true, dragView: true }}
-}});
-document.getElementById('q').addEventListener('input', (e) => {{
-  const v = e.target.value.toLowerCase().trim();
-  nodesData.forEach(n => {{
-    const vis = v==='' || n.id.toLowerCase().includes(v) || (n.label && n.label.toLowerCase().includes(v));
-    nodesData.update({{ id:n.id, hidden: !vis }});
-  }});
-  network.fit({{ animation:false }});
-}});
-</script>
-</body>
-</html>"""
-        return html_doc
+                    F.col("f.current_table_full_name").alias("adjacent_table_full_name"),
+                    F.col("f.current_table_schema").alias("adjacent_table_schema"),
+                    F.col("f.current_table_name").alias("adjacent_table_name"),
+                    F.col("f.current_type").alias("adjacent_type"),
 
-    # ---------- Build & Persist ----------
-    def build_model(self) -> Dict[str, Any]:
-        model = {
-            "version": VERSION,
-            "author": AUTHOR,
-            "run_id": self.run_id,
-            "generated_at_utc": now_utc(),
-            "namespace": {"catalog": self.catalog, "schema": self.schema},
-            "spark_env": self.spark_env,
-            "entities": [],
-            "relationships": self.relationships,
-            "warnings": self.warnings,
-            "errors": self.errors,
-        }
-        for t in sorted(self.entities.keys()):
-            m = self.entities[t]
-            entity = {
-                "name": t,
-                "row_count": m.get("row_count"),
-                "table_type": m.get("table_type"),
-                "data_source_format": m.get("data_source_format"),
-                "is_view": m.get("is_view"),
-                "columns": m.get("columns", []),
-            }
-            model["entities"].append(entity)
-        return model
+                    F.col("e.source_table_full_name").alias("edge_source_table_full_name"),
+                    F.col("e.source_table_schema").alias("edge_source_table_schema"),
+                    F.col("e.source_table_name").alias("edge_source_table_name"),
+                    F.col("e.source_type").alias("edge_source_type"),
 
-    def write_text(self, rel_path: str, content: str) -> None:
-        path_local = os.path.join(self.out_dir_local, rel_path.lstrip("/"))
-        os.makedirs(os.path.dirname(path_local), exist_ok=True)
-        with open(path_local, "w", encoding="utf-8") as fh:
-            fh.write(content)
+                    F.col("e.target_table_full_name").alias("edge_target_table_full_name"),
+                    F.col("e.target_table_schema").alias("edge_target_table_schema"),
+                    F.col("e.target_table_name").alias("edge_target_table_name"),
+                    F.col("e.target_type").alias("edge_target_type"),
 
-    def write_csv_rows(self, rel_path: str, header: List[str], rows: List[Iterable[Any]]) -> None:
-        # simple CSV writer to avoid csv module overhead in driver (keeps it compact)
-        def csv_escape(v: Any) -> str:
-            s = "" if v is None else str(v)
-            if any(ch in s for ch in [",", '"', "\n"]):
-                s = '"' + s.replace('"','""') + '"'
-            return s
-        lines = [",".join([csv_escape(h) for h in header])]
-        for row in rows:
-            lines.append(",".join([csv_escape(x) for x in row]))
-        self.write_text(rel_path, "\n".join(lines))
+                    F.col("e.version_event_id"),
+                    F.col("e.version_event_time"),
+                    F.col("e.version_valid_from_ts"),
+                    F.col("e.version_valid_to_ts"),
+                    F.col("e.version_is_current"),
+                    F.col("e.version_source_edge_count"),
+                    F.col("e.version_created_by"),
+                    F.col("e.version_entity_type"),
+                    F.col("e.version_entity_id"),
+                    F.col("e.version_entity_run_id"),
 
-    def persist(self, model: Dict[str, Any]) -> None:
-        # JSON
-        self.write_text("data_model.json", json.dumps(model, indent=2))
-        # Markdown
-        self.write_text("data_model.md", self.render_markdown(model))
-        # HTML
-        self.write_text("data_model.html", self.render_html(model))
-        # GraphML
-        self.write_text("data_model.graphml", self.build_graphml(model))
-        # CSVs
-        ent_rows = [
-            (e["name"], e.get("table_type") or ("VIEW" if e.get("is_view") else "TABLE"), e.get("data_source_format") or "", e.get("row_count"))
-            for e in model["entities"]
-        ]
-        self.write_csv_rows("entities.csv", ["table","table_type","data_source_format","row_count"], ent_rows)
+                    F.concat(F.col("f.path_from_root"), F.lit(" -> "), F.col("e.target_table_full_name")).alias("path_from_root"),
+                )
+            )
 
-        col_rows: List[List[Any]] = []
-        for e in model["entities"]:
-            for c in e["columns"]:
-                col_rows.append([
-                    e["name"], c["name"], c["type"], c["family"], c["nullable"],
-                    c.get("approx_distinct"), c.get("null_ratio"),
-                    1 if match_any(c["name"], ID_NAME_HINTS) else 0,
-                    1 if match_any(c["name"], FK_NAME_HINTS) else 0
-                ])
-        self.write_csv_rows("columns.csv",
-            ["table","column","type","family","nullable","approx_distinct","null_ratio","id_name_hint","fk_name_hint"],
-            col_rows)
+        if not df_has_rows(step):
+            break
 
-        rel_rows = [
-            (r["fk_table"], r["fk_column"], r["pk_table"], r["pk_column"], r["score"], r.get("declared", False), r.get("cardinality","many-to-one"), r.get("confidence"))
-            for r in model["relationships"]
-        ]
-        self.write_csv_rows("relationships.csv",
-            ["fk_table","fk_column","pk_table","pk_column","score","declared","cardinality","confidence"],
-            rel_rows)
+        step_rank_w = (
+            W.partitionBy("reached_table_full_name")
+             .orderBy(
+                 F.col("hop_count").asc(),
+                 F.col("adjacent_table_full_name").asc(),
+                 F.col("version_event_time").desc(),
+                 F.col("edge_source_table_full_name").asc(),
+                 F.col("edge_target_table_full_name").asc(),
+             )
+        )
 
-        # Manifest
-        elapsed = time.time() - self.start_ts
-        manifest = {
-            "version": VERSION, "author": AUTHOR, "run_id": self.run_id,
-            "namespace": {"catalog": self.catalog, "schema": self.schema},
-            "output_dir_dbfs": self.out_dir_dbfs, "output_dir_local": self.out_dir_local,
-            "counts": {
-                "tables": len(model["entities"]),
-                "relationships": len(model["relationships"]),
-                "warnings": len(self.warnings), "errors": len(self.errors)
-            },
-            "spark_env": self.spark_env,
-            "elapsed_seconds": round(elapsed, 2),
-            "timestamp_utc": now_utc(),
-            "notes": [
-                "No console printing/logging performed; all artifacts written to output directory.",
-                "Relationships include declared constraints, inferred edges, and view usage."
-            ],
-            "warnings": self.warnings[:200],
-            "errors": self.errors
-        }
-        self.write_text("run_manifest.json", json.dumps(manifest, indent=2))
+        step = (
+            step.withColumn("candidate_rank", F.row_number().over(step_rank_w))
+                .filter(F.col("candidate_rank") == 1)
+                .drop("candidate_rank")
+        )
 
-    def build_graphml(self, model: Dict[str, Any]) -> str:
-        def x(s: Any) -> str:
-            return html.escape("" if s is None else str(s), quote=True)
-        lines = [
-            '<?xml version="1.0" encoding="UTF-8"?>',
-            '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
-            '  <key id="label" for="edge" attr.name="label" attr.type="string"/>',
-            '  <graph edgedefault="directed">'
-        ]
-        for e in sorted(model["entities"], key=lambda z: z["name"]):
-            lines.append(f'    <node id="{x(e["name"])}"/>')
-        for r in model["relationships"]:
-            label = f'{r["fk_column"]}→{r["pk_column"]} [{r.get("confidence","")}] ({r["score"]})'
-            lines.append(f'    <edge source="{x(r["fk_table"])}" target="{x(r["pk_table"])}">')
-            lines.append(f'      <data key="label">{x(label)}</data>')
-            lines.append('    </edge>')
-        lines.append('  </graph>')
-        lines.append('</graphml>')
-        return "\n".join(lines)
+        new_step = (
+            step.alias("s")
+            .join(
+                visited.alias("v"),
+                F.col("s.reached_table_full_name") == F.col("v.visited_node"),
+                "leftanti"
+            )
+        )
 
-# =========================
-# ========= RUN ===========
-# =========================
+        if not df_has_rows(new_step):
+            break
 
-def main() -> Dict[str, Any]:
-    spark = SparkSession.builder.getOrCreate()
-    try:
-        spark.conf.set("spark.sql.session.timeZone", SESSION_TIMEZONE)
-    except Exception:
-        pass
+        results = new_step if results is None else results.unionByName(new_step)
 
-    erd = ReverseERD(spark, CATALOG, SCHEMA, UC_VOLUME_ROOT)
-    erd.discover_tables()
-    erd.fetch_information_schema()
-    erd.compute_table_stats()
-    erd.infer_relationships()
-    model = erd.build_model()
-    erd.persist(model)
-    return model
+        frontier = (
+            new_step.select(
+                F.col("reached_table_full_name").alias("current_table_full_name"),
+                F.col("reached_table_schema").alias("current_table_schema"),
+                F.col("reached_table_name").alias("current_table_name"),
+                F.col("reached_type").alias("current_type"),
+                F.col("hop_count"),
+                F.col("path_from_root"),
+            )
+            .dropDuplicates(["current_table_full_name"])
+        )
 
-# Execute immediately (no prints/logging).
-MODEL = main()
-```
+        visited = (
+            visited.unionByName(
+                frontier.select(F.col("current_table_full_name").alias("visited_node"))
+            )
+            .dropDuplicates(["visited_node"])
+        )
+
+        if iteration % 5 == 0:
+            frontier = frontier.localCheckpoint(eager=True)
+            visited = visited.localCheckpoint(eager=True)
+            if results is not None:
+                results = results.localCheckpoint(eager=True)
+
+    if results is None:
+        return build_empty_table_paths_df(current_edges_df)
+
+    terminal_reason = "NO_CURRENT_UPSTREAM_EDGE" if direction == "UPSTREAM" else "NO_CURRENT_DOWNSTREAM_EDGE"
+
+    results = (
+        results.alias("r")
+        .join(
+            expandable_nodes.alias("x"),
+            F.col("r.reached_table_full_name") == F.col("x.expandable_node"),
+            "left"
+        )
+        .withColumn("is_terminal", F.col("x.expandable_node").isNull())
+        .withColumn(
+            "terminal_reason",
+            F.when(F.col("x.expandable_node").isNull(), F.lit(terminal_reason)).otherwise(F.lit(None).cast("string"))
+        )
+        .drop("expandable_node")
+        .withColumn("generated_at", F.current_timestamp())
+    )
+
+    return results
+
+table_upstream_paths_df = traverse_table_direction(table_current_edges_df, "UPSTREAM")
+table_downstream_paths_df = traverse_table_direction(table_current_edges_df, "DOWNSTREAM")
+
+table_paths_df = table_upstream_paths_df.unionByName(table_downstream_paths_df)
+
+overwrite_delta(
+    table_paths_df,
+    TABLE_PATHS_TARGET,
+    cluster_cols=["direction", "hop_count", "reached_table_schema", "reached_table_name"],
+)
+
+
+# ------------------------------------------------------------
+# 5) Column graph traversal (shortest-path closure per root column)
+# ------------------------------------------------------------
+def build_empty_column_paths_df(current_edges_df):
+    return current_edges_df.limit(0).select(
+        F.lit(ROOT_FULL_NAME).cast("string").alias("root_table_full_name"),
+        F.lit(ROOT_SCHEMA).cast("string").alias("root_table_schema"),
+        F.lit(ROOT_NAME).cast("string").alias("root_table_name"),
+        F.lit(None).cast("string").alias("root_column_name"),
+        F.lit(None).cast("string").alias("root_node_key"),
+
+        F.lit(None).cast("string").alias("direction"),
+        F.lit(None).cast("int").alias("hop_count"),
+
+        F.lit(None).cast("string").alias("reached_table_full_name"),
+        F.lit(None).cast("string").alias("reached_table_schema"),
+        F.lit(None).cast("string").alias("reached_table_name"),
+        F.lit(None).cast("string").alias("reached_column_name"),
+        F.lit(None).cast("string").alias("reached_type"),
+        F.lit(None).cast("string").alias("reached_node_key"),
+
+        F.lit(None).cast("string").alias("adjacent_table_full_name"),
+        F.lit(None).cast("string").alias("adjacent_table_schema"),
+        F.lit(None).cast("string").alias("adjacent_table_name"),
+        F.lit(None).cast("string").alias("adjacent_column_name"),
+        F.lit(None).cast("string").alias("adjacent_type"),
+        F.lit(None).cast("string").alias("adjacent_node_key"),
+
+        F.lit(None).cast("string").alias("edge_source_table_full_name"),
+        F.lit(None).cast("string").alias("edge_source_table_schema"),
+        F.lit(None).cast("string").alias("edge_source_table_name"),
+        F.lit(None).cast("string").alias("edge_source_column_name"),
+        F.lit(None).cast("string").alias("edge_source_type"),
+
+        F.lit(None).cast("string").alias("edge_target_table_full_name"),
+        F.lit(None).cast("string").alias("edge_target_table_schema"),
+        F.lit(None).cast("string").alias("edge_target_table_name"),
+        F.lit(None).cast("string").alias("edge_target_column_name"),
+        F.lit(None).cast("string").alias("edge_target_type"),
+
+        F.lit(None).cast("string").alias("version_event_id"),
+        F.lit(None).cast("timestamp").alias("version_event_time"),
+        F.lit(None).cast("timestamp").alias("version_valid_from_ts"),
+        F.lit(None).cast("timestamp").alias("version_valid_to_ts"),
+        F.lit(None).cast("boolean").alias("version_is_current"),
+        F.lit(None).cast("int").alias("version_source_edge_count"),
+        F.lit(None).cast("boolean").alias("possible_staleness_due_to_later_table_write"),
+        F.lit(None).cast("string").alias("version_created_by"),
+        F.lit(None).cast("string").alias("version_entity_type"),
+        F.lit(None).cast("string").alias("version_entity_id"),
+        F.lit(None).cast("string").alias("version_entity_run_id"),
+
+        F.lit(None).cast("string").alias("path_from_root"),
+        F.lit(None).cast("boolean").alias("is_terminal"),
+        F.lit(None).cast("string").alias("terminal_reason"),
+        F.current_timestamp().alias("generated_at"),
+    )
+
+anchor_columns_df = (
+    column_current_edges_df
+    .filter(F.col("source_table_full_name") == ROOT_FULL_NAME)
+    .select(
+        F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
+        F.lit(ROOT_SCHEMA).alias("root_table_schema"),
+        F.lit(ROOT_NAME).alias("root_table_name"),
+        F.col("source_column_name").alias("root_column_name"),
+        F.concat_ws("|", F.lit(ROOT_FULL_NAME), F.col("source_column_name")).alias("root_node_key"),
+    )
+    .unionByName(
+        column_current_edges_df
+        .filter(F.col("target_table_full_name") == ROOT_FULL_NAME)
+        .select(
+            F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
+            F.lit(ROOT_SCHEMA).alias("root_table_schema"),
+            F.lit(ROOT_NAME).alias("root_table_name"),
+            F.col("target_column_name").alias("root_column_name"),
+            F.concat_ws("|", F.lit(ROOT_FULL_NAME), F.col("target_column_name")).alias("root_node_key"),
+        )
+    )
+    .dropDuplicates(["root_node_key"])
+    .cache()
+)
+
+_ = anchor_columns_df.count()
+
+def traverse_column_direction(current_edges_df, anchor_df, direction: str):
+    if not df_has_rows(anchor_df):
+        return build_empty_column_paths_df(current_edges_df)
+
+    frontier = (
+        anchor_df.select(
+            "root_table_full_name",
+            "root_table_schema",
+            "root_table_name",
+            "root_column_name",
+            "root_node_key",
+            F.lit(ROOT_FULL_NAME).alias("current_table_full_name"),
+            F.lit(ROOT_SCHEMA).alias("current_table_schema"),
+            F.lit(ROOT_NAME).alias("current_table_name"),
+            F.col("root_column_name").alias("current_column_name"),
+            F.col("root_node_key").alias("current_node_key"),
+            F.lit("TABLE").alias("current_type"),
+            F.lit(0).alias("hop_count"),
+            F.concat(F.lit(ROOT_FULL_NAME), F.lit("."), F.col("root_column_name")).alias("path_from_root"),
+        )
+    )
+
+    visited = (
+        frontier.select("root_node_key", F.col("current_node_key").alias("visited_node_key"))
+        .dropDuplicates(["root_node_key", "visited_node_key"])
+    )
+
+    results = None
+    iteration = 0
+
+    if direction == "UPSTREAM":
+        expandable_nodes = current_edges_df.select(F.col("target_node_key").alias("expandable_node_key")).dropDuplicates().cache()
+    else:
+        expandable_nodes = current_edges_df.select(F.col("source_node_key").alias("expandable_node_key")).dropDuplicates().cache()
+
+    _ = expandable_nodes.count()
+
+    while df_has_rows(frontier):
+        iteration += 1
+
+        if direction == "UPSTREAM":
+            step = (
+                F.broadcast(frontier).alias("f")
+                .join(
+                    current_edges_df.alias("e"),
+                    F.col("f.current_node_key") == F.col("e.target_node_key"),
+                    "inner"
+                )
+                .select(
+                    "f.root_table_full_name",
+                    "f.root_table_schema",
+                    "f.root_table_name",
+                    "f.root_column_name",
+                    "f.root_node_key",
+
+                    F.lit("UPSTREAM").alias("direction"),
+                    (F.col("f.hop_count") + F.lit(1)).alias("hop_count"),
+
+                    F.col("e.source_table_full_name").alias("reached_table_full_name"),
+                    F.col("e.source_table_schema").alias("reached_table_schema"),
+                    F.col("e.source_table_name").alias("reached_table_name"),
+                    F.col("e.source_column_name").alias("reached_column_name"),
+                    F.col("e.source_type").alias("reached_type"),
+                    F.col("e.source_node_key").alias("reached_node_key"),
+
+                    F.col("f.current_table_full_name").alias("adjacent_table_full_name"),
+                    F.col("f.current_table_schema").alias("adjacent_table_schema"),
+                    F.col("f.current_table_name").alias("adjacent_table_name"),
+                    F.col("f.current_column_name").alias("adjacent_column_name"),
+                    F.col("f.current_type").alias("adjacent_type"),
+                    F.col("f.current_node_key").alias("adjacent_node_key"),
+
+                    F.col("e.source_table_full_name").alias("edge_source_table_full_name"),
+                    F.col("e.source_table_schema").alias("edge_source_table_schema"),
+                    F.col("e.source_table_name").alias("edge_source_table_name"),
+                    F.col("e.source_column_name").alias("edge_source_column_name"),
+                    F.col("e.source_type").alias("edge_source_type"),
+
+                    F.col("e.target_table_full_name").alias("edge_target_table_full_name"),
+                    F.col("e.target_table_schema").alias("edge_target_table_schema"),
+                    F.col("e.target_table_name").alias("edge_target_table_name"),
+                    F.col("e.target_column_name").alias("edge_target_column_name"),
+                    F.col("e.target_type").alias("edge_target_type"),
+
+                    F.col("e.version_event_id"),
+                    F.col("e.version_event_time"),
+                    F.col("e.version_valid_from_ts"),
+                    F.col("e.version_valid_to_ts"),
+                    F.col("e.version_is_current"),
+                    F.col("e.version_source_edge_count"),
+                    F.col("e.possible_staleness_due_to_later_table_write"),
+                    F.col("e.version_created_by"),
+                    F.col("e.version_entity_type"),
+                    F.col("e.version_entity_id"),
+                    F.col("e.version_entity_run_id"),
+
+                    F.concat(
+                        F.col("f.path_from_root"),
+                        F.lit(" <- "),
+                        F.col("e.source_table_full_name"),
+                        F.lit("."),
+                        F.col("e.source_column_name")
+                    ).alias("path_from_root"),
+                )
+            )
+        else:
+            step = (
+                F.broadcast(frontier).alias("f")
+                .join(
+                    current_edges_df.alias("e"),
+                    F.col("f.current_node_key") == F.col("e.source_node_key"),
+                    "inner"
+                )
+                .select(
+                    "f.root_table_full_name",
+                    "f.root_table_schema",
+                    "f.root_table_name",
+                    "f.root_column_name",
+                    "f.root_node_key",
+
+                    F.lit("DOWNSTREAM").alias("direction"),
+                    (F.col("f.hop_count") + F.lit(1)).alias("hop_count"),
+
+                    F.col("e.target_table_full_name").alias("reached_table_full_name"),
+                    F.col("e.target_table_schema").alias("reached_table_schema"),
+                    F.col("e.target_table_name").alias("reached_table_name"),
+                    F.col("e.target_column_name").alias("reached_column_name"),
+                    F.col("e.target_type").alias("reached_type"),
+                    F.col("e.target_node_key").alias("reached_node_key"),
+
+                    F.col("f.current_table_full_name").alias("adjacent_table_full_name"),
+                    F.col("f.current_table_schema").alias("adjacent_table_schema"),
+                    F.col("f.current_table_name").alias("adjacent_table_name"),
+                    F.col("f.current_column_name").alias("adjacent_column_name"),
+                    F.col("f.current_type").alias("adjacent_type"),
+                    F.col("f.current_node_key").alias("adjacent_node_key"),
+
+                    F.col("e.source_table_full_name").alias("edge_source_table_full_name"),
+                    F.col("e.source_table_schema").alias("edge_source_table_schema"),
+                    F.col("e.source_table_name").alias("edge_source_table_name"),
+                    F.col("e.source_column_name").alias("edge_source_column_name"),
+                    F.col("e.source_type").alias("edge_source_type"),
+
+                    F.col("e.target_table_full_name").alias("edge_target_table_full_name"),
+                    F.col("e.target_table_schema").alias("edge_target_table_schema"),
+                    F.col("e.target_table_name").alias("edge_target_table_name"),
+                    F.col("e.target_column_name").alias("edge_target_column_name"),
+                    F.col("e.target_type").alias("edge_target_type"),
+
+                    F.col("e.version_event_id"),
+                    F.col("e.version_event_time"),
+                    F.col("e.version_valid_from_ts"),
+                    F.col("e.version_valid_to_ts"),
+                    F.col("e.version_is_current"),
+                    F.col("e.version_source_edge_count"),
+                    F.col("e.possible_staleness_due_to_later_table_write"),
+                    F.col("e.version_created_by"),
+                    F.col("e.version_entity_type"),
+                    F.col("e.version_entity_id"),
+                    F.col("e.version_entity_run_id"),
+
+                    F.concat(
+                        F.col("f.path_from_root"),
+                        F.lit(" -> "),
+                        F.col("e.target_table_full_name"),
+                        F.lit("."),
+                        F.col("e.target_column_name")
+                    ).alias("path_from_root"),
+                )
+            )
+
+        if not df_has_rows(step):
+            break
+
+        step_rank_w = (
+            W.partitionBy("root_node_key", "reached_node_key")
+             .orderBy(
+                 F.col("hop_count").asc(),
+                 F.col("adjacent_table_full_name").asc(),
+                 F.col("adjacent_column_name").asc(),
+                 F.col("version_event_time").desc(),
+                 F.col("edge_source_table_full_name").asc(),
+                 F.col("edge_source_column_name").asc(),
+             )
+        )
+
+        step = (
+            step.withColumn("candidate_rank", F.row_number().over(step_rank_w))
+                .filter(F.col("candidate_rank") == 1)
+                .drop("candidate_rank")
+        )
+
+        new_step = (
+            step.alias("s")
+            .join(
+                visited.alias("v"),
+                (F.col("s.root_node_key") == F.col("v.root_node_key")) &
+                (F.col("s.reached_node_key") == F.col("v.visited_node_key")),
+                "leftanti"
+            )
+        )
+
+        if not df_has_rows(new_step):
+            break
+
+        results = new_step if results is None else results.unionByName(new_step)
+
+        frontier = (
+            new_step.select(
+                "root_table_full_name",
+                "root_table_schema",
+                "root_table_name",
+                "root_column_name",
+                "root_node_key",
+                F.col("reached_table_full_name").alias("current_table_full_name"),
+                F.col("reached_table_schema").alias("current_table_schema"),
+                F.col("reached_table_name").alias("current_table_name"),
+                F.col("reached_column_name").alias("current_column_name"),
+                F.col("reached_node_key").alias("current_node_key"),
+                F.col("reached_type").alias("current_type"),
+                "hop_count",
+                "path_from_root",
+            )
+            .dropDuplicates(["root_node_key", "current_node_key"])
+        )
+
+        visited = (
+            visited.unionByName(
+                frontier.select("root_node_key", F.col("current_node_key").alias("visited_node_key"))
+            )
+            .dropDuplicates(["root_node_key", "visited_node_key"])
+        )
+
+        if iteration % 5 == 0:
+            frontier = frontier.localCheckpoint(eager=True)
+            visited = visited.localCheckpoint(eager=True)
+            if results is not None:
+                results = results.localCheckpoint(eager=True)
+
+    if results is None:
+        return build_empty_column_paths_df(current_edges_df)
+
+    terminal_reason = "NO_CURRENT_UPSTREAM_EDGE" if direction == "UPSTREAM" else "NO_CURRENT_DOWNSTREAM_EDGE"
+
+    results = (
+        results.alias("r")
+        .join(
+            expandable_nodes.alias("x"),
+            F.col("r.reached_node_key") == F.col("x.expandable_node_key"),
+            "left"
+        )
+        .withColumn("is_terminal", F.col("x.expandable_node_key").isNull())
+        .withColumn(
+            "terminal_reason",
+            F.when(F.col("x.expandable_node_key").isNull(), F.lit(terminal_reason)).otherwise(F.lit(None).cast("string"))
+        )
+        .drop("expandable_node_key")
+        .withColumn("generated_at", F.current_timestamp())
+    )
+
+    return results
+
+column_upstream_paths_df = traverse_column_direction(column_current_edges_df, anchor_columns_df, "UPSTREAM")
+column_downstream_paths_df = traverse_column_direction(column_current_edges_df, anchor_columns_df, "DOWNSTREAM")
+
+column_paths_df = column_upstream_paths_df.unionByName(column_downstream_paths_df)
+
+overwrite_delta(
+    column_paths_df,
+    COLUMN_PATHS_TARGET,
+    cluster_cols=["root_column_name", "direction", "hop_count", "reached_table_schema", "reached_table_name", "reached_column_name"],
+)
+
+
+# ------------------------------------------------------------
+# 6) Output summary
+# ------------------------------------------------------------
+print("Root table:", ROOT_FULL_NAME)
+print("Table history target:      ", qualify_name(TABLE_HISTORY_TARGET))
+print("Column history target:     ", qualify_name(COLUMN_HISTORY_TARGET))
+print("Table versions target:     ", qualify_name(TABLE_VERSIONS_TARGET))
+print("Column versions target:    ", qualify_name(COLUMN_VERSIONS_TARGET))
+print("Table current edges target:", qualify_name(TABLE_CURRENT_EDGES_TARGET))
+print("Column current edges target:", qualify_name(COLUMN_CURRENT_EDGES_TARGET))
+print("Table paths target:        ", qualify_name(TABLE_PATHS_TARGET))
+print("Column paths target:       ", qualify_name(COLUMN_PATHS_TARGET))
