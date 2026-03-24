@@ -2,28 +2,38 @@
 # ============================================================
 # UNITY CATALOG LINEAGE BACKBONE + ROOT-SPECIFIC PATH BUILDER
 # ------------------------------------------------------------
-# Inputs:
-#   - root_table widget: schema.table (for example: npdataset.npd_current_pending)
-#   - table/column source MVs in eciscor_prod.information_schema
+# Safer version:
+# - no manual clustering
+# - no dataSkippingStatsColumns changes
+# - no CLUSTER BY in the notebook
+# - no CDF/property changes in the notebook
 #
-# Outputs:
-#   1) Append-only raw history tables
-#   2) Version/change-log tables
-#   3) Current direct edge tables
-#   4) Root-specific table lineage paths
-#   5) Root-specific column lineage paths
+# What it creates:
+# 1) Append-only-ish persisted history tables (via merge on a deterministic hash key)
+# 2) Version tables that show how lineage changed over time
+# 3) Current direct edge tables using "latest target event wins"
+# 4) Root-specific table lineage paths
+# 5) Root-specific column lineage paths
 #
-# Design choices:
-#   - No SQL recursive CTEs, so there is no notebook-level hop cap.
-#   - Current state = latest target write event.
-#   - History = append-only raw rows + version tables.
-#   - Root values persist on every output row.
+# Important behavior:
+# - root_table widget must be schema.table
+# - catalog is fixed to eciscor_prod
+# - output path tables can be shared across many roots
+#   because this notebook replaces only the selected root's slice
+# - root_table_full_name is persisted on every table-path row
+# - root_table_full_name + root_column_name are persisted on every column-path row
+# - no lowercase normalization is used
+# - no hop limit is imposed by the notebook logic
 # ============================================================
 
 from pyspark.sql import functions as F, Window as W
 from delta.tables import DeltaTable
 
 DEFAULT_CATALOG = "eciscor_prod"
+
+# Optional but helpful for future schema evolution in MERGE
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+
 
 # ------------------------------------------------------------
 # Widgets
@@ -33,37 +43,38 @@ dbutils.widgets.text("root_table", "npdataset.npd_current_pending")
 dbutils.widgets.text("table_source_mv",  "eciscor_prod.information_schema.table_lineage")
 dbutils.widgets.text("column_source_mv", "eciscor_prod.information_schema.column_lineage")
 
-dbutils.widgets.text("table_history_target",       "eciscor_prod.lineage_admin.table_lineage_history")
-dbutils.widgets.text("column_history_target",      "eciscor_prod.lineage_admin.column_lineage_history")
+dbutils.widgets.text("table_history_target",        "eciscor_prod.lineage_admin.table_lineage_history")
+dbutils.widgets.text("column_history_target",       "eciscor_prod.lineage_admin.column_lineage_history")
 
-dbutils.widgets.text("table_versions_target",      "eciscor_prod.lineage_admin.table_lineage_versions")
-dbutils.widgets.text("column_versions_target",     "eciscor_prod.lineage_admin.column_lineage_versions")
+dbutils.widgets.text("table_versions_target",       "eciscor_prod.lineage_admin.table_lineage_versions")
+dbutils.widgets.text("column_versions_target",      "eciscor_prod.lineage_admin.column_lineage_versions")
 
-dbutils.widgets.text("table_current_edges_target", "eciscor_prod.lineage_admin.table_lineage_current_edges")
-dbutils.widgets.text("column_current_edges_target","eciscor_prod.lineage_admin.column_lineage_current_edges")
+dbutils.widgets.text("table_current_edges_target",  "eciscor_prod.lineage_admin.table_lineage_current_edges")
+dbutils.widgets.text("column_current_edges_target", "eciscor_prod.lineage_admin.column_lineage_current_edges")
 
-dbutils.widgets.text("table_paths_target",         "eciscor_prod.lineage_admin.npd_current_pending_table_paths")
-dbutils.widgets.text("column_paths_target",        "eciscor_prod.lineage_admin.npd_current_pending_column_paths")
+dbutils.widgets.text("table_paths_target",          "eciscor_prod.lineage_admin.table_paths_current")
+dbutils.widgets.text("column_paths_target",         "eciscor_prod.lineage_admin.column_paths_current")
 
 
 # ------------------------------------------------------------
 # Parameters
 # ------------------------------------------------------------
-ROOT_TABLE_INPUT           = dbutils.widgets.get("root_table").strip()
-TABLE_SOURCE_MV            = dbutils.widgets.get("table_source_mv").strip()
-COLUMN_SOURCE_MV           = dbutils.widgets.get("column_source_mv").strip()
+ROOT_TABLE_INPUT            = dbutils.widgets.get("root_table").strip()
 
-TABLE_HISTORY_TARGET       = dbutils.widgets.get("table_history_target").strip()
-COLUMN_HISTORY_TARGET      = dbutils.widgets.get("column_history_target").strip()
+TABLE_SOURCE_MV             = dbutils.widgets.get("table_source_mv").strip()
+COLUMN_SOURCE_MV            = dbutils.widgets.get("column_source_mv").strip()
 
-TABLE_VERSIONS_TARGET      = dbutils.widgets.get("table_versions_target").strip()
-COLUMN_VERSIONS_TARGET     = dbutils.widgets.get("column_versions_target").strip()
+TABLE_HISTORY_TARGET        = dbutils.widgets.get("table_history_target").strip()
+COLUMN_HISTORY_TARGET       = dbutils.widgets.get("column_history_target").strip()
 
-TABLE_CURRENT_EDGES_TARGET = dbutils.widgets.get("table_current_edges_target").strip()
-COLUMN_CURRENT_EDGES_TARGET= dbutils.widgets.get("column_current_edges_target").strip()
+TABLE_VERSIONS_TARGET       = dbutils.widgets.get("table_versions_target").strip()
+COLUMN_VERSIONS_TARGET      = dbutils.widgets.get("column_versions_target").strip()
 
-TABLE_PATHS_TARGET         = dbutils.widgets.get("table_paths_target").strip()
-COLUMN_PATHS_TARGET        = dbutils.widgets.get("column_paths_target").strip()
+TABLE_CURRENT_EDGES_TARGET  = dbutils.widgets.get("table_current_edges_target").strip()
+COLUMN_CURRENT_EDGES_TARGET = dbutils.widgets.get("column_current_edges_target").strip()
+
+TABLE_PATHS_TARGET          = dbutils.widgets.get("table_paths_target").strip()
+COLUMN_PATHS_TARGET         = dbutils.widgets.get("column_paths_target").strip()
 
 
 # ------------------------------------------------------------
@@ -80,8 +91,7 @@ def qualify_name(name: str) -> str:
     raise ValueError(f"Expected schema.table or catalog.schema.table. Got: {name}")
 
 def split_fqn(name: str):
-    q = qualify_name(name)
-    return q.split(".")
+    return qualify_name(name).split(".")
 
 def quote_name(name: str) -> str:
     return ".".join([f"`{p}`" for p in split_fqn(name)])
@@ -94,8 +104,7 @@ def ensure_schema_for_table(name: str):
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {quote_schema_from_table(name)}")
 
 def table_exists(name: str) -> bool:
-    q = qualify_name(name)
-    return spark.catalog.tableExists(q)
+    return spark.catalog.tableExists(qualify_name(name))
 
 def df_has_rows(df) -> bool:
     return len(df.take(1)) > 0
@@ -115,18 +124,10 @@ def with_hash_key(df, key_cols, key_name="lineage_row_id"):
         .withColumn("ingested_at", F.current_timestamp())
     )
 
-def apply_table_features(target_table: str, cluster_cols=None):
-    spark.sql(
-        f"ALTER TABLE {quote_name(target_table)} "
-        "SET TBLPROPERTIES ('delta.enableChangeDataFeed'='true')"
-    )
-    if cluster_cols:
-        cols = ", ".join([f"`{c}`" for c in cluster_cols])
-        spark.sql(f"ALTER TABLE {quote_name(target_table)} CLUSTER BY ({cols})")
-
-def create_empty_delta_if_missing(df, target_table: str, cluster_cols=None):
-    ensure_schema_for_table(target_table)
+def create_empty_delta_if_missing(df, target_table: str):
     q = qualify_name(target_table)
+    ensure_schema_for_table(q)
+
     if not table_exists(q):
         (
             df.limit(0)
@@ -136,11 +137,11 @@ def create_empty_delta_if_missing(df, target_table: str, cluster_cols=None):
               .option("overwriteSchema", "true")
               .saveAsTable(q)
         )
-        apply_table_features(q, cluster_cols)
 
-def merge_history(source_df, target_table: str, key_col: str, cluster_cols=None):
+def merge_history(source_df, target_table: str, key_col: str):
     q = qualify_name(target_table)
-    create_empty_delta_if_missing(source_df, q, cluster_cols=cluster_cols)
+    create_empty_delta_if_missing(source_df, q)
+
     delta_target = DeltaTable.forName(spark, q)
     (
         delta_target.alias("t")
@@ -148,11 +149,11 @@ def merge_history(source_df, target_table: str, key_col: str, cluster_cols=None)
         .whenNotMatchedInsertAll()
         .execute()
     )
-    apply_table_features(q, cluster_cols)
 
-def overwrite_delta(source_df, target_table: str, cluster_cols=None):
+def overwrite_delta(source_df, target_table: str):
     q = qualify_name(target_table)
     ensure_schema_for_table(q)
+
     (
         source_df.write
                  .format("delta")
@@ -160,14 +161,25 @@ def overwrite_delta(source_df, target_table: str, cluster_cols=None):
                  .option("overwriteSchema", "true")
                  .saveAsTable(q)
     )
-    apply_table_features(q, cluster_cols)
+
+def replace_root_slice(source_df, target_table: str, root_field: str, root_value: str):
+    q = qualify_name(target_table)
+    create_empty_delta_if_missing(source_df, q)
+
+    DeltaTable.forName(spark, q).delete(F.col(root_field) == F.lit(root_value))
+
+    (
+        source_df.write
+                 .format("delta")
+                 .mode("append")
+                 .option("mergeSchema", "true")
+                 .saveAsTable(q)
+    )
 
 def root_table_to_full_name(root_table_input: str) -> str:
     parts = [p.strip() for p in root_table_input.split(".") if p.strip()]
     if len(parts) != 2:
-        raise ValueError(
-            f"root_table must be schema.table only. Got: {root_table_input}"
-        )
+        raise ValueError(f"root_table must be schema.table only. Got: {root_table_input}")
     return f"{DEFAULT_CATALOG}.{parts[0]}.{parts[1]}"
 
 ROOT_FULL_NAME = root_table_to_full_name(ROOT_TABLE_INPUT)
@@ -221,7 +233,7 @@ COLUMN_SOURCE_COLS = [
 
 
 # ------------------------------------------------------------
-# 1) Read source MVs and persist raw history
+# 1) Read source MVs and persist history
 # ------------------------------------------------------------
 table_source_df = spark.table(qualify_name(TABLE_SOURCE_MV)).select(*TABLE_SOURCE_COLS)
 column_source_df = spark.table(qualify_name(COLUMN_SOURCE_MV)).select(*COLUMN_SOURCE_COLS)
@@ -276,38 +288,21 @@ column_history_stage = with_hash_key(
     key_name="lineage_row_id",
 )
 
-merge_history(
-    table_history_stage,
-    TABLE_HISTORY_TARGET,
-    key_col="lineage_row_id",
-    cluster_cols=["target_table_schema", "target_table_name", "event_date"],
-)
-
-merge_history(
-    column_history_stage,
-    COLUMN_HISTORY_TARGET,
-    key_col="lineage_row_id",
-    cluster_cols=["target_table_schema", "target_table_name", "target_column_name"],
-)
+merge_history(table_history_stage, TABLE_HISTORY_TARGET, key_col="lineage_row_id")
+merge_history(column_history_stage, COLUMN_HISTORY_TARGET, key_col="lineage_row_id")
 
 table_history_df = spark.table(qualify_name(TABLE_HISTORY_TARGET)).cache()
 column_history_df = spark.table(qualify_name(COLUMN_HISTORY_TARGET)).cache()
 
-# materialize cache
 _ = table_history_df.count()
 _ = column_history_df.count()
 
 
 # ------------------------------------------------------------
-# 2) Build table lineage version history + current direct edges
+# 2) Build table lineage versions + current direct edges
+# Current-state rule:
+#   latest event per TARGET TABLE wins
 # ------------------------------------------------------------
-# Latest target write event wins for CURRENT STATE.
-# Important:
-# - We choose the latest event per TARGET TABLE, not per edge.
-# - That avoids mixing older notebook/job sources with the newest writer.
-# - Table-level versions include target-only writes too, so a latest write with
-#   no source rows correctly clears current upstream lineage.
-
 table_target_events = (
     table_history_df
     .filter(F.col("target_table_full_name").isNotNull())
@@ -337,25 +332,29 @@ table_event_source_counts = (
     .agg(F.count("*").alias("source_edge_count"))
 )
 
-table_versions_asc_w  = W.partitionBy("target_table_full_name").orderBy(F.col("event_time").asc(), F.col("event_id").asc())
-table_versions_desc_w = W.partitionBy("target_table_full_name").orderBy(F.col("event_time").desc(), F.col("event_id").desc())
+table_versions_asc_w = (
+    W.partitionBy("target_table_full_name")
+     .orderBy(F.col("event_time").asc(), F.col("event_id").asc())
+)
+table_versions_desc_w = (
+    W.partitionBy("target_table_full_name")
+     .orderBy(F.col("event_time").desc(), F.col("event_id").desc())
+)
 
 table_versions_df = (
     table_target_events
     .join(table_event_source_counts, ["target_table_full_name", "event_id"], "left")
     .fillna({"source_edge_count": 0})
+    .withColumn("version_number", F.row_number().over(table_versions_asc_w))
     .withColumn("valid_from_ts", F.col("event_time"))
     .withColumn("valid_to_ts", F.lead("event_time").over(table_versions_asc_w))
     .withColumn("version_rank_desc", F.row_number().over(table_versions_desc_w))
     .withColumn("is_current", F.col("version_rank_desc") == 1)
+    .withColumn("has_source_lineage", F.col("source_edge_count") > 0)
     .drop("version_rank_desc")
 )
 
-overwrite_delta(
-    table_versions_df,
-    TABLE_VERSIONS_TARGET,
-    cluster_cols=["target_table_schema", "target_table_name", "is_current"],
-)
+overwrite_delta(table_versions_df, TABLE_VERSIONS_TARGET)
 
 table_current_versions_df = (
     table_versions_df
@@ -366,8 +365,10 @@ table_current_versions_df = (
         F.col("event_time").alias("version_event_time"),
         F.col("valid_from_ts").alias("version_valid_from_ts"),
         F.col("valid_to_ts").alias("version_valid_to_ts"),
+        F.col("version_number").alias("version_number"),
         F.col("is_current").alias("version_is_current"),
         F.col("source_edge_count").alias("version_source_edge_count"),
+        F.col("has_source_lineage").alias("version_has_source_lineage"),
         F.col("created_by").alias("version_created_by"),
         F.col("entity_type").alias("version_entity_type"),
         F.col("entity_id").alias("version_entity_id"),
@@ -401,8 +402,10 @@ table_current_edges_df = (
         F.col("v.version_event_time"),
         F.col("v.version_valid_from_ts"),
         F.col("v.version_valid_to_ts"),
+        F.col("v.version_number"),
         F.col("v.version_is_current"),
         F.col("v.version_source_edge_count"),
+        F.col("v.version_has_source_lineage"),
         F.col("v.version_created_by"),
         F.col("v.version_entity_type"),
         F.col("v.version_entity_id"),
@@ -413,22 +416,18 @@ table_current_edges_df = (
 )
 
 _ = table_current_edges_df.count()
-
-overwrite_delta(
-    table_current_edges_df,
-    TABLE_CURRENT_EDGES_TARGET,
-    cluster_cols=["target_table_schema", "target_table_name", "source_table_schema", "source_table_name"],
-)
+overwrite_delta(table_current_edges_df, TABLE_CURRENT_EDGES_TARGET)
 
 
 # ------------------------------------------------------------
-# 3) Build column lineage version history + current direct edges
-# ------------------------------------------------------------
+# 3) Build column lineage versions + current direct edges
+# Current-state rule:
+#   latest event per TARGET COLUMN wins
+#
 # Important limitation:
-# column_lineage only contains events that have a source.
-# So CURRENT column lineage is best-effort: it picks the latest target-column
-# event that Databricks emitted, then warns if the table had a later write.
-
+#   column_lineage does not capture no-source writes.
+#   So a later table write can make current column lineage "best effort".
+# ------------------------------------------------------------
 table_current_write_times_df = (
     table_current_versions_df
     .select(
@@ -486,10 +485,12 @@ column_versions_df = (
     column_target_events
     .join(column_event_source_counts, ["target_table_full_name", "target_column_name", "event_id"], "left")
     .fillna({"source_edge_count": 0})
+    .withColumn("version_number", F.row_number().over(column_versions_asc_w))
     .withColumn("valid_from_ts", F.col("event_time"))
     .withColumn("valid_to_ts", F.lead("event_time").over(column_versions_asc_w))
     .withColumn("version_rank_desc", F.row_number().over(column_versions_desc_w))
     .withColumn("is_current", F.col("version_rank_desc") == 1)
+    .withColumn("has_source_lineage", F.col("source_edge_count") > 0)
     .drop("version_rank_desc")
     .join(table_current_write_times_df, ["target_table_full_name"], "left")
     .withColumn(
@@ -502,11 +503,7 @@ column_versions_df = (
     )
 )
 
-overwrite_delta(
-    column_versions_df,
-    COLUMN_VERSIONS_TARGET,
-    cluster_cols=["target_table_schema", "target_table_name", "target_column_name", "is_current"],
-)
+overwrite_delta(column_versions_df, COLUMN_VERSIONS_TARGET)
 
 column_current_versions_df = (
     column_versions_df
@@ -518,8 +515,10 @@ column_current_versions_df = (
         F.col("event_time").alias("version_event_time"),
         F.col("valid_from_ts").alias("version_valid_from_ts"),
         F.col("valid_to_ts").alias("version_valid_to_ts"),
+        F.col("version_number").alias("version_number"),
         F.col("is_current").alias("version_is_current"),
         F.col("source_edge_count").alias("version_source_edge_count"),
+        F.col("has_source_lineage").alias("version_has_source_lineage"),
         F.col("possible_staleness_due_to_later_table_write"),
         F.col("created_by").alias("version_created_by"),
         F.col("entity_type").alias("version_entity_type"),
@@ -563,8 +562,10 @@ column_current_edges_df = (
         F.col("v.version_event_time"),
         F.col("v.version_valid_from_ts"),
         F.col("v.version_valid_to_ts"),
+        F.col("v.version_number"),
         F.col("v.version_is_current"),
         F.col("v.version_source_edge_count"),
+        F.col("v.version_has_source_lineage"),
         F.col("v.possible_staleness_due_to_later_table_write"),
         F.col("v.version_created_by"),
         F.col("v.version_entity_type"),
@@ -576,30 +577,28 @@ column_current_edges_df = (
 )
 
 _ = column_current_edges_df.count()
-
-overwrite_delta(
-    column_current_edges_df,
-    COLUMN_CURRENT_EDGES_TARGET,
-    cluster_cols=["target_table_schema", "target_table_name", "target_column_name", "source_table_schema", "source_table_name", "source_column_name"],
-)
+overwrite_delta(column_current_edges_df, COLUMN_CURRENT_EDGES_TARGET)
 
 
 # ------------------------------------------------------------
-# 4) Table graph traversal (shortest-path closure; all direct current edges kept separately)
+# 4) Root-only rows
 # ------------------------------------------------------------
-def build_empty_table_paths_df(current_edges_df):
-    return current_edges_df.limit(0).select(
-        F.lit(ROOT_FULL_NAME).cast("string").alias("root_table_full_name"),
-        F.lit(ROOT_SCHEMA).cast("string").alias("root_table_schema"),
-        F.lit(ROOT_NAME).cast("string").alias("root_table_name"),
+def build_root_table_row():
+    return spark.createDataFrame(
+        [(ROOT_FULL_NAME, ROOT_SCHEMA, ROOT_NAME)],
+        ["root_table_full_name", "root_table_schema", "root_table_name"]
+    ).select(
+        "root_table_full_name",
+        "root_table_schema",
+        "root_table_name",
 
-        F.lit(None).cast("string").alias("direction"),
-        F.lit(None).cast("int").alias("hop_count"),
+        F.lit("ROOT").alias("direction"),
+        F.lit(0).cast("int").alias("hop_count"),
 
-        F.lit(None).cast("string").alias("reached_table_full_name"),
-        F.lit(None).cast("string").alias("reached_table_schema"),
-        F.lit(None).cast("string").alias("reached_table_name"),
-        F.lit(None).cast("string").alias("reached_type"),
+        F.lit(ROOT_FULL_NAME).alias("reached_table_full_name"),
+        F.lit(ROOT_SCHEMA).alias("reached_table_schema"),
+        F.lit(ROOT_NAME).alias("reached_table_name"),
+        F.lit("TABLE").alias("reached_type"),
 
         F.lit(None).cast("string").alias("adjacent_table_full_name"),
         F.lit(None).cast("string").alias("adjacent_table_schema"),
@@ -620,27 +619,96 @@ def build_empty_table_paths_df(current_edges_df):
         F.lit(None).cast("timestamp").alias("version_event_time"),
         F.lit(None).cast("timestamp").alias("version_valid_from_ts"),
         F.lit(None).cast("timestamp").alias("version_valid_to_ts"),
+        F.lit(None).cast("int").alias("version_number"),
         F.lit(None).cast("boolean").alias("version_is_current"),
         F.lit(None).cast("int").alias("version_source_edge_count"),
+        F.lit(None).cast("boolean").alias("version_has_source_lineage"),
         F.lit(None).cast("string").alias("version_created_by"),
         F.lit(None).cast("string").alias("version_entity_type"),
         F.lit(None).cast("string").alias("version_entity_id"),
         F.lit(None).cast("string").alias("version_entity_run_id"),
 
-        F.lit(None).cast("string").alias("path_from_root"),
+        F.lit(ROOT_FULL_NAME).alias("path_from_root"),
         F.lit(None).cast("boolean").alias("is_terminal"),
         F.lit(None).cast("string").alias("terminal_reason"),
         F.current_timestamp().alias("generated_at"),
     )
 
+def build_root_column_rows():
+    root_cols = spark.table(ROOT_FULL_NAME).columns
+    root_cols_df = spark.createDataFrame([(c,) for c in root_cols], "root_column_name string")
+
+    return root_cols_df.select(
+        F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
+        F.lit(ROOT_SCHEMA).alias("root_table_schema"),
+        F.lit(ROOT_NAME).alias("root_table_name"),
+        F.col("root_column_name"),
+        F.concat_ws("|", F.lit(ROOT_FULL_NAME), F.col("root_column_name")).alias("root_node_key"),
+
+        F.lit("ROOT").alias("direction"),
+        F.lit(0).cast("int").alias("hop_count"),
+
+        F.lit(ROOT_FULL_NAME).alias("reached_table_full_name"),
+        F.lit(ROOT_SCHEMA).alias("reached_table_schema"),
+        F.lit(ROOT_NAME).alias("reached_table_name"),
+        F.col("root_column_name").alias("reached_column_name"),
+        F.lit("TABLE").alias("reached_type"),
+        F.concat_ws("|", F.lit(ROOT_FULL_NAME), F.col("root_column_name")).alias("reached_node_key"),
+
+        F.lit(None).cast("string").alias("adjacent_table_full_name"),
+        F.lit(None).cast("string").alias("adjacent_table_schema"),
+        F.lit(None).cast("string").alias("adjacent_table_name"),
+        F.lit(None).cast("string").alias("adjacent_column_name"),
+        F.lit(None).cast("string").alias("adjacent_type"),
+        F.lit(None).cast("string").alias("adjacent_node_key"),
+
+        F.lit(None).cast("string").alias("edge_source_table_full_name"),
+        F.lit(None).cast("string").alias("edge_source_table_schema"),
+        F.lit(None).cast("string").alias("edge_source_table_name"),
+        F.lit(None).cast("string").alias("edge_source_column_name"),
+        F.lit(None).cast("string").alias("edge_source_type"),
+
+        F.lit(None).cast("string").alias("edge_target_table_full_name"),
+        F.lit(None).cast("string").alias("edge_target_table_schema"),
+        F.lit(None).cast("string").alias("edge_target_table_name"),
+        F.lit(None).cast("string").alias("edge_target_column_name"),
+        F.lit(None).cast("string").alias("edge_target_type"),
+
+        F.lit(None).cast("string").alias("version_event_id"),
+        F.lit(None).cast("timestamp").alias("version_event_time"),
+        F.lit(None).cast("timestamp").alias("version_valid_from_ts"),
+        F.lit(None).cast("timestamp").alias("version_valid_to_ts"),
+        F.lit(None).cast("int").alias("version_number"),
+        F.lit(None).cast("boolean").alias("version_is_current"),
+        F.lit(None).cast("int").alias("version_source_edge_count"),
+        F.lit(None).cast("boolean").alias("version_has_source_lineage"),
+        F.lit(None).cast("boolean").alias("possible_staleness_due_to_later_table_write"),
+        F.lit(None).cast("string").alias("version_created_by"),
+        F.lit(None).cast("string").alias("version_entity_type"),
+        F.lit(None).cast("string").alias("version_entity_id"),
+        F.lit(None).cast("string").alias("version_entity_run_id"),
+
+        F.concat(F.lit(ROOT_FULL_NAME), F.lit("."), F.col("root_column_name")).alias("path_from_root"),
+        F.lit(None).cast("boolean").alias("is_terminal"),
+        F.lit(None).cast("string").alias("terminal_reason"),
+        F.current_timestamp().alias("generated_at"),
+    )
+
+
+# ------------------------------------------------------------
+# 5) Table traversal
+# Stores shortest path to each reachable table node.
+# Full current graph is still preserved separately in table_current_edges_df.
+# ------------------------------------------------------------
+EMPTY_TABLE_PATHS_SCHEMA_DF = build_root_table_row().limit(0)
+
 def traverse_table_direction(current_edges_df, direction: str):
-    root_frontier = spark.createDataFrame(
+    frontier = spark.createDataFrame(
         [(ROOT_FULL_NAME, ROOT_SCHEMA, ROOT_NAME, "TABLE", 0, ROOT_FULL_NAME)],
         ["current_table_full_name", "current_table_schema", "current_table_name", "current_type", "hop_count", "path_from_root"]
     )
 
-    visited = root_frontier.select(F.col("current_table_full_name").alias("visited_node")).dropDuplicates()
-    frontier = root_frontier
+    visited = frontier.select(F.col("current_table_full_name").alias("visited_node")).dropDuplicates()
     results = None
     iteration = 0
 
@@ -694,8 +762,10 @@ def traverse_table_direction(current_edges_df, direction: str):
                     F.col("e.version_event_time"),
                     F.col("e.version_valid_from_ts"),
                     F.col("e.version_valid_to_ts"),
+                    F.col("e.version_number"),
                     F.col("e.version_is_current"),
                     F.col("e.version_source_edge_count"),
+                    F.col("e.version_has_source_lineage"),
                     F.col("e.version_created_by"),
                     F.col("e.version_entity_type"),
                     F.col("e.version_entity_id"),
@@ -744,8 +814,10 @@ def traverse_table_direction(current_edges_df, direction: str):
                     F.col("e.version_event_time"),
                     F.col("e.version_valid_from_ts"),
                     F.col("e.version_valid_to_ts"),
+                    F.col("e.version_number"),
                     F.col("e.version_is_current"),
                     F.col("e.version_source_edge_count"),
+                    F.col("e.version_has_source_lineage"),
                     F.col("e.version_created_by"),
                     F.col("e.version_entity_type"),
                     F.col("e.version_entity_id"),
@@ -795,8 +867,8 @@ def traverse_table_direction(current_edges_df, direction: str):
                 F.col("reached_table_schema").alias("current_table_schema"),
                 F.col("reached_table_name").alias("current_table_name"),
                 F.col("reached_type").alias("current_type"),
-                F.col("hop_count"),
-                F.col("path_from_root"),
+                "hop_count",
+                "path_from_root",
             )
             .dropDuplicates(["current_table_full_name"])
         )
@@ -815,7 +887,7 @@ def traverse_table_direction(current_edges_df, direction: str):
                 results = results.localCheckpoint(eager=True)
 
     if results is None:
-        return build_empty_table_paths_df(current_edges_df)
+        return EMPTY_TABLE_PATHS_SCHEMA_DF
 
     terminal_reason = "NO_CURRENT_UPSTREAM_EDGE" if direction == "UPSTREAM" else "NO_CURRENT_DOWNSTREAM_EDGE"
 
@@ -837,98 +909,41 @@ def traverse_table_direction(current_edges_df, direction: str):
 
     return results
 
+table_root_row_df = build_root_table_row()
 table_upstream_paths_df = traverse_table_direction(table_current_edges_df, "UPSTREAM")
 table_downstream_paths_df = traverse_table_direction(table_current_edges_df, "DOWNSTREAM")
 
-table_paths_df = table_upstream_paths_df.unionByName(table_downstream_paths_df)
+table_paths_df = (
+    table_root_row_df
+    .unionByName(table_upstream_paths_df)
+    .unionByName(table_downstream_paths_df)
+)
 
-overwrite_delta(
+replace_root_slice(
     table_paths_df,
     TABLE_PATHS_TARGET,
-    cluster_cols=["direction", "hop_count", "reached_table_schema", "reached_table_name"],
+    root_field="root_table_full_name",
+    root_value=ROOT_FULL_NAME
 )
 
 
 # ------------------------------------------------------------
-# 5) Column graph traversal (shortest-path closure per root column)
+# 6) Column traversal
+# Stores shortest path to each reachable column node per root column.
+# Full current graph is still preserved separately in column_current_edges_df.
 # ------------------------------------------------------------
-def build_empty_column_paths_df(current_edges_df):
-    return current_edges_df.limit(0).select(
-        F.lit(ROOT_FULL_NAME).cast("string").alias("root_table_full_name"),
-        F.lit(ROOT_SCHEMA).cast("string").alias("root_table_schema"),
-        F.lit(ROOT_NAME).cast("string").alias("root_table_name"),
-        F.lit(None).cast("string").alias("root_column_name"),
-        F.lit(None).cast("string").alias("root_node_key"),
-
-        F.lit(None).cast("string").alias("direction"),
-        F.lit(None).cast("int").alias("hop_count"),
-
-        F.lit(None).cast("string").alias("reached_table_full_name"),
-        F.lit(None).cast("string").alias("reached_table_schema"),
-        F.lit(None).cast("string").alias("reached_table_name"),
-        F.lit(None).cast("string").alias("reached_column_name"),
-        F.lit(None).cast("string").alias("reached_type"),
-        F.lit(None).cast("string").alias("reached_node_key"),
-
-        F.lit(None).cast("string").alias("adjacent_table_full_name"),
-        F.lit(None).cast("string").alias("adjacent_table_schema"),
-        F.lit(None).cast("string").alias("adjacent_table_name"),
-        F.lit(None).cast("string").alias("adjacent_column_name"),
-        F.lit(None).cast("string").alias("adjacent_type"),
-        F.lit(None).cast("string").alias("adjacent_node_key"),
-
-        F.lit(None).cast("string").alias("edge_source_table_full_name"),
-        F.lit(None).cast("string").alias("edge_source_table_schema"),
-        F.lit(None).cast("string").alias("edge_source_table_name"),
-        F.lit(None).cast("string").alias("edge_source_column_name"),
-        F.lit(None).cast("string").alias("edge_source_type"),
-
-        F.lit(None).cast("string").alias("edge_target_table_full_name"),
-        F.lit(None).cast("string").alias("edge_target_table_schema"),
-        F.lit(None).cast("string").alias("edge_target_table_name"),
-        F.lit(None).cast("string").alias("edge_target_column_name"),
-        F.lit(None).cast("string").alias("edge_target_type"),
-
-        F.lit(None).cast("string").alias("version_event_id"),
-        F.lit(None).cast("timestamp").alias("version_event_time"),
-        F.lit(None).cast("timestamp").alias("version_valid_from_ts"),
-        F.lit(None).cast("timestamp").alias("version_valid_to_ts"),
-        F.lit(None).cast("boolean").alias("version_is_current"),
-        F.lit(None).cast("int").alias("version_source_edge_count"),
-        F.lit(None).cast("boolean").alias("possible_staleness_due_to_later_table_write"),
-        F.lit(None).cast("string").alias("version_created_by"),
-        F.lit(None).cast("string").alias("version_entity_type"),
-        F.lit(None).cast("string").alias("version_entity_id"),
-        F.lit(None).cast("string").alias("version_entity_run_id"),
-
-        F.lit(None).cast("string").alias("path_from_root"),
-        F.lit(None).cast("boolean").alias("is_terminal"),
-        F.lit(None).cast("string").alias("terminal_reason"),
-        F.current_timestamp().alias("generated_at"),
-    )
+root_column_rows_df = build_root_column_rows()
+EMPTY_COLUMN_PATHS_SCHEMA_DF = root_column_rows_df.limit(0)
 
 anchor_columns_df = (
-    column_current_edges_df
-    .filter(F.col("source_table_full_name") == ROOT_FULL_NAME)
+    root_column_rows_df
     .select(
-        F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
-        F.lit(ROOT_SCHEMA).alias("root_table_schema"),
-        F.lit(ROOT_NAME).alias("root_table_name"),
-        F.col("source_column_name").alias("root_column_name"),
-        F.concat_ws("|", F.lit(ROOT_FULL_NAME), F.col("source_column_name")).alias("root_node_key"),
+        "root_table_full_name",
+        "root_table_schema",
+        "root_table_name",
+        "root_column_name",
+        "root_node_key"
     )
-    .unionByName(
-        column_current_edges_df
-        .filter(F.col("target_table_full_name") == ROOT_FULL_NAME)
-        .select(
-            F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
-            F.lit(ROOT_SCHEMA).alias("root_table_schema"),
-            F.lit(ROOT_NAME).alias("root_table_name"),
-            F.col("target_column_name").alias("root_column_name"),
-            F.concat_ws("|", F.lit(ROOT_FULL_NAME), F.col("target_column_name")).alias("root_node_key"),
-        )
-    )
-    .dropDuplicates(["root_node_key"])
     .cache()
 )
 
@@ -936,7 +951,7 @@ _ = anchor_columns_df.count()
 
 def traverse_column_direction(current_edges_df, anchor_df, direction: str):
     if not df_has_rows(anchor_df):
-        return build_empty_column_paths_df(current_edges_df)
+        return EMPTY_COLUMN_PATHS_SCHEMA_DF
 
     frontier = (
         anchor_df.select(
@@ -1022,8 +1037,10 @@ def traverse_column_direction(current_edges_df, anchor_df, direction: str):
                     F.col("e.version_event_time"),
                     F.col("e.version_valid_from_ts"),
                     F.col("e.version_valid_to_ts"),
+                    F.col("e.version_number"),
                     F.col("e.version_is_current"),
                     F.col("e.version_source_edge_count"),
+                    F.col("e.version_has_source_lineage"),
                     F.col("e.possible_staleness_due_to_later_table_write"),
                     F.col("e.version_created_by"),
                     F.col("e.version_entity_type"),
@@ -1087,8 +1104,10 @@ def traverse_column_direction(current_edges_df, anchor_df, direction: str):
                     F.col("e.version_event_time"),
                     F.col("e.version_valid_from_ts"),
                     F.col("e.version_valid_to_ts"),
+                    F.col("e.version_number"),
                     F.col("e.version_is_current"),
                     F.col("e.version_source_edge_count"),
+                    F.col("e.version_has_source_lineage"),
                     F.col("e.possible_staleness_due_to_later_table_write"),
                     F.col("e.version_created_by"),
                     F.col("e.version_entity_type"),
@@ -1174,7 +1193,7 @@ def traverse_column_direction(current_edges_df, anchor_df, direction: str):
                 results = results.localCheckpoint(eager=True)
 
     if results is None:
-        return build_empty_column_paths_df(current_edges_df)
+        return EMPTY_COLUMN_PATHS_SCHEMA_DF
 
     terminal_reason = "NO_CURRENT_UPSTREAM_EDGE" if direction == "UPSTREAM" else "NO_CURRENT_DOWNSTREAM_EDGE"
 
@@ -1199,24 +1218,46 @@ def traverse_column_direction(current_edges_df, anchor_df, direction: str):
 column_upstream_paths_df = traverse_column_direction(column_current_edges_df, anchor_columns_df, "UPSTREAM")
 column_downstream_paths_df = traverse_column_direction(column_current_edges_df, anchor_columns_df, "DOWNSTREAM")
 
-column_paths_df = column_upstream_paths_df.unionByName(column_downstream_paths_df)
+column_paths_df = (
+    root_column_rows_df
+    .unionByName(column_upstream_paths_df)
+    .unionByName(column_downstream_paths_df)
+)
 
-overwrite_delta(
+replace_root_slice(
     column_paths_df,
     COLUMN_PATHS_TARGET,
-    cluster_cols=["root_column_name", "direction", "hop_count", "reached_table_schema", "reached_table_name", "reached_column_name"],
+    root_field="root_table_full_name",
+    root_value=ROOT_FULL_NAME
 )
 
 
 # ------------------------------------------------------------
-# 6) Output summary
+# 7) Quick summary
 # ------------------------------------------------------------
 print("Root table:", ROOT_FULL_NAME)
-print("Table history target:      ", qualify_name(TABLE_HISTORY_TARGET))
-print("Column history target:     ", qualify_name(COLUMN_HISTORY_TARGET))
-print("Table versions target:     ", qualify_name(TABLE_VERSIONS_TARGET))
-print("Column versions target:    ", qualify_name(COLUMN_VERSIONS_TARGET))
-print("Table current edges target:", qualify_name(TABLE_CURRENT_EDGES_TARGET))
+print("Table history target:       ", qualify_name(TABLE_HISTORY_TARGET))
+print("Column history target:      ", qualify_name(COLUMN_HISTORY_TARGET))
+print("Table versions target:      ", qualify_name(TABLE_VERSIONS_TARGET))
+print("Column versions target:     ", qualify_name(COLUMN_VERSIONS_TARGET))
+print("Table current edges target: ", qualify_name(TABLE_CURRENT_EDGES_TARGET))
 print("Column current edges target:", qualify_name(COLUMN_CURRENT_EDGES_TARGET))
-print("Table paths target:        ", qualify_name(TABLE_PATHS_TARGET))
-print("Column paths target:       ", qualify_name(COLUMN_PATHS_TARGET))
+print("Table paths target:         ", qualify_name(TABLE_PATHS_TARGET))
+print("Column paths target:        ", qualify_name(COLUMN_PATHS_TARGET))
+
+print("table_history rows:", table_history_df.count())
+print("column_history rows:", column_history_df.count())
+print("table_current_edges rows:", table_current_edges_df.count())
+print("column_current_edges rows:", column_current_edges_df.count())
+
+display(
+    spark.table(qualify_name(TABLE_PATHS_TARGET))
+         .filter(F.col("root_table_full_name") == ROOT_FULL_NAME)
+         .orderBy("direction", "hop_count", "path_from_root")
+)
+
+display(
+    spark.table(qualify_name(COLUMN_PATHS_TARGET))
+         .filter(F.col("root_table_full_name") == ROOT_FULL_NAME)
+         .orderBy("root_column_name", "direction", "hop_count", "path_from_root")
+)
