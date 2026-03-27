@@ -1,1263 +1,1266 @@
 # Databricks notebook source
-# ============================================================
-# UNITY CATALOG LINEAGE BACKBONE + ROOT-SPECIFIC PATH BUILDER
-# ------------------------------------------------------------
-# Safer version:
-# - no manual clustering
-# - no dataSkippingStatsColumns changes
-# - no CLUSTER BY in the notebook
-# - no CDF/property changes in the notebook
-#
-# What it creates:
-# 1) Append-only-ish persisted history tables (via merge on a deterministic hash key)
-# 2) Version tables that show how lineage changed over time
-# 3) Current direct edge tables using "latest target event wins"
-# 4) Root-specific table lineage paths
-# 5) Root-specific column lineage paths
-#
-# Important behavior:
-# - root_table widget must be schema.table
-# - catalog is fixed to eciscor_prod
-# - output path tables can be shared across many roots
-#   because this notebook replaces only the selected root's slice
-# - root_table_full_name is persisted on every table-path row
-# - root_table_full_name + root_column_name are persisted on every column-path row
-# - no lowercase normalization is used
-# - no hop limit is imposed by the notebook logic
-# ============================================================
+# MAGIC %md
+# MAGIC # DBU observability test notebook (Unity Catalog / AWS / DBR 15.4 LTS-safe)
+# MAGIC
+# MAGIC This notebook is intentionally defensive:
+# MAGIC - It probes which system tables you can actually read.
+# MAGIC - It separates **precise**, **approximate**, and **not-supported** DBU attribution cases.
+# MAGIC - It uses `system.billing.list_prices` when available for **list-price USD translation**.
+# MAGIC - It prints a final summary showing what works, what does not, and why.
 
-from pyspark.sql import functions as F, Window as W
-from delta.tables import DeltaTable
+# COMMAND ----------
 
-DEFAULT_CATALOG = "eciscor_prod"
+# Databricks widgets
+try:
+    dbutils.widgets.text("days_back", "30")
+    dbutils.widgets.text("top_n", "50")
+    dbutils.widgets.dropdown("include_optional_sql_tests", "true", ["true", "false"])
+    dbutils.widgets.text("manual_price_overrides_json", "{}")
+except Exception:
+    pass
 
-# Optional but helpful for future schema evolution in MERGE
-spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+# COMMAND ----------
 
+import json
+import traceback
+from datetime import datetime
 
-# ------------------------------------------------------------
-# Widgets
-# ------------------------------------------------------------
-dbutils.widgets.text("root_table", "npdataset.npd_current_pending")
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
-dbutils.widgets.text("table_source_mv",  "eciscor_prod.information_schema.table_lineage")
-dbutils.widgets.text("column_source_mv", "eciscor_prod.information_schema.column_lineage")
+# -----------------------------
+# Parameter helpers
+# -----------------------------
+def _get_widget(name, default):
+    try:
+        value = dbutils.widgets.get(name)
+        return value if value is not None and str(value).strip() != "" else default
+    except Exception:
+        return default
 
-dbutils.widgets.text("table_history_target",        "eciscor_prod.lineage_admin.table_lineage_history")
-dbutils.widgets.text("column_history_target",       "eciscor_prod.lineage_admin.column_lineage_history")
+def _to_int(value, default):
+    try:
+        return int(value)
+    except Exception:
+        return default
 
-dbutils.widgets.text("table_versions_target",       "eciscor_prod.lineage_admin.table_lineage_versions")
-dbutils.widgets.text("column_versions_target",      "eciscor_prod.lineage_admin.column_lineage_versions")
+DAYS_BACK = _to_int(_get_widget("days_back", "30"), 30)
+TOP_N = _to_int(_get_widget("top_n", "50"), 50)
+INCLUDE_OPTIONAL_SQL_TESTS = str(_get_widget("include_optional_sql_tests", "true")).lower() == "true"
 
-dbutils.widgets.text("table_current_edges_target",  "eciscor_prod.lineage_admin.table_lineage_current_edges")
-dbutils.widgets.text("column_current_edges_target", "eciscor_prod.lineage_admin.column_lineage_current_edges")
+_manual_overrides_raw = _get_widget("manual_price_overrides_json", "{}")
+try:
+    MANUAL_PRICE_OVERRIDES = json.loads(_manual_overrides_raw)
+    if not isinstance(MANUAL_PRICE_OVERRIDES, dict):
+        MANUAL_PRICE_OVERRIDES = {}
+except Exception:
+    MANUAL_PRICE_OVERRIDES = {}
 
-dbutils.widgets.text("table_paths_target",          "eciscor_prod.lineage_admin.table_paths_current")
-dbutils.widgets.text("column_paths_target",         "eciscor_prod.lineage_admin.column_paths_current")
+print("Parameters:")
+print(f"  DAYS_BACK={DAYS_BACK}")
+print(f"  TOP_N={TOP_N}")
+print(f"  INCLUDE_OPTIONAL_SQL_TESTS={INCLUDE_OPTIONAL_SQL_TESTS}")
+print(f"  MANUAL_PRICE_OVERRIDES keys={list(MANUAL_PRICE_OVERRIDES.keys())[:10]}")
 
+# COMMAND ----------
 
-# ------------------------------------------------------------
-# Parameters
-# ------------------------------------------------------------
-ROOT_TABLE_INPUT            = dbutils.widgets.get("root_table").strip()
+# -----------------------------
+# Generic helpers
+# -----------------------------
+test_results = []
+table_probe_results = []
 
-TABLE_SOURCE_MV             = dbutils.widgets.get("table_source_mv").strip()
-COLUMN_SOURCE_MV            = dbutils.widgets.get("column_source_mv").strip()
+def classify_exception(exc: Exception) -> str:
+    msg = str(exc)
+    up = msg.upper()
+    if "TABLE_OR_VIEW_NOT_FOUND" in up or "NOT FOUND" in up or "CANNOT RESOLVE" in up:
+        return "MISSING_OR_NOT_ENABLED"
+    if "PERMISSION" in up or "INSUFFICIENT_PRIVILEGES" in up or "ACCESS DENIED" in up or "NOT AUTHORIZED" in up:
+        return "NO_ACCESS"
+    if "PARSE" in up or "SYNTAX" in up:
+        return "SQL_ERROR"
+    return "OTHER_ERROR"
 
-TABLE_HISTORY_TARGET        = dbutils.widgets.get("table_history_target").strip()
-COLUMN_HISTORY_TARGET       = dbutils.widgets.get("column_history_target").strip()
+def show_df(df, n=20):
+    try:
+        display(df.limit(n))
+    except Exception:
+        df.show(n, truncate=False)
 
-TABLE_VERSIONS_TARGET       = dbutils.widgets.get("table_versions_target").strip()
-COLUMN_VERSIONS_TARGET      = dbutils.widgets.get("column_versions_target").strip()
+def create_empty_view(view_name: str, schema_ddl: str):
+    empty_df = spark.createDataFrame([], schema=schema_ddl)
+    empty_df.createOrReplaceTempView(view_name)
 
-TABLE_CURRENT_EDGES_TARGET  = dbutils.widgets.get("table_current_edges_target").strip()
-COLUMN_CURRENT_EDGES_TARGET = dbutils.widgets.get("column_current_edges_target").strip()
+def run_sql(name: str, sql_text: str, top_n: int = None, persist_view: str = None, collect_count: bool = True):
+    if top_n is None:
+        top_n = TOP_N
+    try:
+        df = spark.sql(sql_text)
+        if persist_view:
+            df.createOrReplaceTempView(persist_view)
+        row_count = df.count() if collect_count else None
+        status = "PASS" if (row_count is None or row_count > 0) else "NO_ROWS"
+        print(f"\n===== {name} =====")
+        print(f"status={status}" + (f" rows={row_count}" if row_count is not None else ""))
+        if row_count is None or row_count > 0:
+            show_df(df, top_n)
+        return {
+            "ok": True,
+            "status": status,
+            "rows": row_count,
+            "df": df,
+            "error_type": None,
+            "error": None,
+            "sql": sql_text
+        }
+    except Exception as exc:
+        err_type = classify_exception(exc)
+        print(f"\n===== {name} =====")
+        print(f"status=ERROR error_type={err_type}")
+        print(str(exc))
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "rows": None,
+            "df": None,
+            "error_type": err_type,
+            "error": str(exc),
+            "sql": sql_text
+        }
 
-TABLE_PATHS_TARGET          = dbutils.widgets.get("table_paths_target").strip()
-COLUMN_PATHS_TARGET         = dbutils.widgets.get("column_paths_target").strip()
+def add_test_result(test_name, category, precision, prerequisites, result, notes):
+    test_results.append({
+        "test_name": test_name,
+        "category": category,
+        "precision": precision,
+        "prerequisites": ", ".join(prerequisites),
+        "status": result["status"],
+        "rows": result["rows"],
+        "error_type": result["error_type"],
+        "notes": notes
+    })
 
+def probe_table(table_name: str, required_for: str, requirement_level: str, why_it_matters: str, recent_time_col: str = None):
+    probe = {
+        "table_name": table_name,
+        "requirement_level": requirement_level,
+        "required_for": required_for,
+        "why_it_matters": why_it_matters,
+        "access_status": None,
+        "error_type": None,
+        "error": None,
+        "has_data_in_window": None
+    }
+    try:
+        spark.sql(f"SELECT * FROM {table_name} LIMIT 0").collect()
+        probe["access_status"] = "ACCESSIBLE"
+        if recent_time_col:
+            try:
+                recent_sql = f"""
+                SELECT 1
+                FROM {table_name}
+                WHERE {recent_time_col} >= current_timestamp() - INTERVAL {DAYS_BACK} DAYS
+                LIMIT 1
+                """
+                recent_rows = spark.sql(recent_sql).count()
+                probe["has_data_in_window"] = recent_rows > 0
+            except Exception:
+                try:
+                    recent_sql = f"""
+                    SELECT 1
+                    FROM {table_name}
+                    WHERE {recent_time_col} >= date_sub(current_date(), {DAYS_BACK})
+                    LIMIT 1
+                    """
+                    recent_rows = spark.sql(recent_sql).count()
+                    probe["has_data_in_window"] = recent_rows > 0
+                except Exception:
+                    probe["has_data_in_window"] = None
+    except Exception as exc:
+        probe["access_status"] = "UNAVAILABLE"
+        probe["error_type"] = classify_exception(exc)
+        probe["error"] = str(exc)
+    table_probe_results.append(probe)
+    return probe
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def qualify_name(name: str) -> str:
-    parts = [p.strip() for p in name.split(".") if p.strip()]
-    if len(parts) == 2:
-        return f"{DEFAULT_CATALOG}.{parts[0]}.{parts[1]}"
-    if len(parts) == 3:
-        if parts[0] != DEFAULT_CATALOG:
-            raise ValueError(f"Catalog must be {DEFAULT_CATALOG}. Got: {parts[0]}")
-        return ".".join(parts)
-    raise ValueError(f"Expected schema.table or catalog.schema.table. Got: {name}")
+def is_accessible(table_name: str) -> bool:
+    for row in table_probe_results:
+        if row["table_name"] == table_name:
+            return row["access_status"] == "ACCESSIBLE"
+    return False
 
-def split_fqn(name: str):
-    return qualify_name(name).split(".")
+def get_ctx_tag(name: str, default=None):
+    try:
+        return dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().apply(name)
+    except Exception:
+        return default
 
-def quote_name(name: str) -> str:
-    return ".".join([f"`{p}`" for p in split_fqn(name)])
+# COMMAND ----------
 
-def quote_schema_from_table(name: str) -> str:
-    catalog, schema, _ = split_fqn(name)
-    return f"`{catalog}`.`{schema}`"
+# -----------------------------
+# Environment snapshot
+# -----------------------------
+runtime_info = {
+    "current_user": spark.sql("SELECT current_user() AS current_user").first()["current_user"],
+    "current_catalog": spark.sql("SELECT current_catalog() AS current_catalog").first()["current_catalog"],
+    "current_schema": spark.sql("SELECT current_schema() AS current_schema").first()["current_schema"],
+    "spark_version": spark.version,
+    "workspace_id_tag": get_ctx_tag("orgId"),
+    "cluster_id_tag": get_ctx_tag("clusterId"),
+    "job_id_tag": get_ctx_tag("jobId"),
+    "run_id_tag": get_ctx_tag("idInJob"),
+    "notebook_path_tag": get_ctx_tag("notebook_path"),
+    "notebook_id_tag": get_ctx_tag("notebookId"),
+}
 
-def ensure_schema_for_table(name: str):
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {quote_schema_from_table(name)}")
+print("Environment snapshot:")
+for k, v in runtime_info.items():
+    print(f"  {k}={v}")
 
-def table_exists(name: str) -> bool:
-    return spark.catalog.tableExists(qualify_name(name))
+# COMMAND ----------
 
-def df_has_rows(df) -> bool:
-    return len(df.take(1)) > 0
+# MAGIC %md
+# MAGIC ## 1) Probe the system tables you need vs optional ones
 
-def with_hash_key(df, key_cols, key_name="lineage_row_id"):
-    return (
-        df.withColumn(
-            key_name,
-            F.sha2(
-                F.concat_ws(
-                    "||",
-                    *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in key_cols]
-                ),
-                256
-            )
-        )
-        .withColumn("ingested_at", F.current_timestamp())
-    )
+# COMMAND ----------
 
-def create_empty_delta_if_missing(df, target_table: str):
-    q = qualify_name(target_table)
-    ensure_schema_for_table(q)
-
-    if not table_exists(q):
-        (
-            df.limit(0)
-              .write
-              .format("delta")
-              .mode("overwrite")
-              .option("overwriteSchema", "true")
-              .saveAsTable(q)
-        )
-
-def merge_history(source_df, target_table: str, key_col: str):
-    q = qualify_name(target_table)
-    create_empty_delta_if_missing(source_df, q)
-
-    delta_target = DeltaTable.forName(spark, q)
+required_tables = [
     (
-        delta_target.alias("t")
-        .merge(source_df.alias("s"), f"t.{key_col} = s.{key_col}")
-        .whenNotMatchedInsertAll()
-        .execute()
-    )
-
-def overwrite_delta(source_df, target_table: str):
-    q = qualify_name(target_table)
-    ensure_schema_for_table(q)
-
+        "system.billing.usage",
+        "All DBU attribution tests",
+        "REQUIRED",
+        "Core billing log. Without this, DBU testing is not possible.",
+        "usage_start_time"
+    ),
     (
-        source_df.write
-                 .format("delta")
-                 .mode("overwrite")
-                 .option("overwriteSchema", "true")
-                 .saveAsTable(q)
-    )
-
-def replace_root_slice(source_df, target_table: str, root_field: str, root_value: str):
-    q = qualify_name(target_table)
-    create_empty_delta_if_missing(source_df, q)
-
-    DeltaTable.forName(spark, q).delete(F.col(root_field) == F.lit(root_value))
-
+        "system.billing.list_prices",
+        "Automatic DBU -> USD translation",
+        "RECOMMENDED",
+        "Historical SKU list prices for DBU-to-dollar translation.",
+        "price_start_time"
+    ),
     (
-        source_df.write
-                 .format("delta")
-                 .mode("append")
-                 .option("mergeSchema", "true")
-                 .saveAsTable(q)
-    )
-
-def root_table_to_full_name(root_table_input: str) -> str:
-    parts = [p.strip() for p in root_table_input.split(".") if p.strip()]
-    if len(parts) != 2:
-        raise ValueError(f"root_table must be schema.table only. Got: {root_table_input}")
-    return f"{DEFAULT_CATALOG}.{parts[0]}.{parts[1]}"
-
-ROOT_FULL_NAME = root_table_to_full_name(ROOT_TABLE_INPUT)
-_, ROOT_SCHEMA, ROOT_NAME = split_fqn(ROOT_FULL_NAME)
-
-
-# ------------------------------------------------------------
-# Source MV schemas from your screenshots
-# ------------------------------------------------------------
-TABLE_SOURCE_COLS = [
-    "entity_type",
-    "entity_id",
-    "entity_run_id",
-    "source_table_full_name",
-    "source_table_catalog",
-    "source_table_schema",
-    "source_table_name",
-    "source_type",
-    "target_table_full_name",
-    "target_table_catalog",
-    "target_table_schema",
-    "target_table_name",
-    "target_type",
-    "created_by",
-    "event_time",
-    "event_date",
-    "event_id",
+        "system.lakeflow.job_run_timeline",
+        "Run-level job enrichment and run-type detection",
+        "RECOMMENDED",
+        "Lets you distinguish JOB_RUN vs SUBMIT_RUN vs WORKFLOW_RUN.",
+        "period_start_time"
+    ),
+    (
+        "system.lakeflow.job_task_run_timeline",
+        "Task-level compute mapping and all-purpose-job detection",
+        "RECOMMENDED",
+        "Contains compute_ids used by job tasks, including interactive clusters and SQL warehouses.",
+        "period_start_time"
+    ),
+    (
+        "system.lakeflow.jobs",
+        "Friendly job names and latest job metadata",
+        "OPTIONAL",
+        "Used for job-name enrichment only.",
+        "change_time"
+    ),
+    (
+        "system.lakeflow.job_tasks",
+        "Task metadata",
+        "OPTIONAL",
+        "Nice to have for extra task metadata.",
+        "change_time"
+    ),
+    (
+        "system.compute.clusters",
+        "Cluster metadata and cluster_source",
+        "RECOMMENDED",
+        "Needed to distinguish JOB clusters from UI/API all-purpose clusters.",
+        "change_time"
+    ),
+    (
+        "system.query.history",
+        "Optional SQL-flow diagnostics",
+        "OPTIONAL",
+        "Useful for warehouse/serverless SQL statement context, but not required for DBU tests.",
+        "start_time"
+    ),
+    (
+        "system.compute.warehouses",
+        "Optional warehouse metadata enrichment",
+        "OPTIONAL",
+        "Used only for warehouse naming/type enrichment.",
+        "change_time"
+    ),
 ]
 
-COLUMN_SOURCE_COLS = [
-    "entity_type",
-    "entity_id",
-    "entity_run_id",
-    "source_table_full_name",
-    "source_table_catalog",
-    "source_table_schema",
-    "source_table_name",
-    "source_type",
-    "source_column_name",
-    "target_table_full_name",
-    "target_table_catalog",
-    "target_table_schema",
-    "target_table_name",
-    "target_type",
-    "target_column_name",
-    "created_by",
-    "event_time",
-    "event_date",
-    "event_id",
+for tbl in required_tables:
+    probe_table(*tbl)
+
+probe_df = spark.createDataFrame(table_probe_results)
+print("System table access matrix:")
+show_df(probe_df.orderBy("requirement_level", "table_name"), 100)
+
+ACCESS = {row["table_name"]: row["access_status"] == "ACCESSIBLE" for row in table_probe_results}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2) Create safe temp views used by the tests
+
+# COMMAND ----------
+
+# Manual overrides view
+override_rows = []
+for sku_name, price in MANUAL_PRICE_OVERRIDES.items():
+    try:
+        override_rows.append((str(sku_name), float(price)))
+    except Exception:
+        pass
+
+override_schema = "sku_name string, manual_dbu_price_usd double"
+if override_rows:
+    spark.createDataFrame(override_rows, override_schema).createOrReplaceTempView("manual_price_overrides")
+else:
+    create_empty_view("manual_price_overrides", override_schema)
+
+# Latest jobs view
+if ACCESS.get("system.lakeflow.jobs", False):
+    latest_jobs_sql = """
+    SELECT *
+    FROM (
+      SELECT
+        *,
+        ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) AS rn
+      FROM system.lakeflow.jobs
+    ) t
+    WHERE rn = 1
+    """
+    run_sql("Build latest_jobs view", latest_jobs_sql, top_n=20, persist_view="latest_jobs", collect_count=False)
+else:
+    create_empty_view(
+        "latest_jobs",
+        "account_id string, workspace_id string, job_id string, name string, change_time timestamp, delete_time timestamp, rn int"
+    )
+    print("latest_jobs view created empty because system.lakeflow.jobs is unavailable.")
+
+# Latest clusters view
+if ACCESS.get("system.compute.clusters", False):
+    latest_clusters_sql = """
+    SELECT *
+    FROM (
+      SELECT
+        *,
+        ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC) AS rn
+      FROM system.compute.clusters
+    ) t
+    WHERE rn = 1
+    """
+    run_sql("Build latest_clusters view", latest_clusters_sql, top_n=20, persist_view="latest_clusters", collect_count=False)
+else:
+    create_empty_view(
+        "latest_clusters",
+        "account_id string, workspace_id string, cluster_id string, cluster_name string, owned_by string, dbr_version string, cluster_source string, delete_time timestamp, rn int"
+    )
+    print("latest_clusters view created empty because system.compute.clusters is unavailable.")
+
+# Latest warehouses view
+if ACCESS.get("system.compute.warehouses", False):
+    latest_warehouses_sql = """
+    SELECT *
+    FROM (
+      SELECT
+        *,
+        ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) AS rn
+      FROM system.compute.warehouses
+    ) t
+    WHERE rn = 1
+    """
+    run_sql("Build latest_warehouses view", latest_warehouses_sql, top_n=20, persist_view="latest_warehouses", collect_count=False)
+else:
+    create_empty_view(
+        "latest_warehouses",
+        "warehouse_id string, workspace_id string, warehouse_name string, warehouse_type string, warehouse_size string, change_time timestamp, delete_time timestamp, rn int"
+    )
+    print("latest_warehouses view created empty because system.compute.warehouses is unavailable.")
+
+# Slim list prices view
+if ACCESS.get("system.billing.list_prices", False):
+    list_prices_sql = """
+    SELECT
+      cloud,
+      sku_name,
+      usage_unit,
+      currency_code,
+      price_start_time,
+      price_end_time,
+      CAST(pricing.default AS DOUBLE) AS list_price_usd
+    FROM system.billing.list_prices
+    WHERE currency_code = 'USD'
+      AND usage_unit = 'DBU'
+    """
+    run_sql("Build list_prices_slim view", list_prices_sql, top_n=20, persist_view="list_prices_slim", collect_count=False)
+else:
+    create_empty_view(
+        "list_prices_slim",
+        "cloud string, sku_name string, usage_unit string, currency_code string, price_start_time timestamp, price_end_time timestamp, list_price_usd double"
+    )
+    print("list_prices_slim view created empty because system.billing.list_prices is unavailable.")
+
+# Core priced usage view
+if ACCESS.get("system.billing.usage", False):
+    priced_usage_sql = f"""
+    SELECT
+      u.*,
+      COALESCE(lp.list_price_usd, mpo.manual_dbu_price_usd) AS effective_dbu_price_usd,
+      CASE
+        WHEN COALESCE(lp.list_price_usd, mpo.manual_dbu_price_usd) IS NOT NULL
+        THEN u.usage_quantity * COALESCE(lp.list_price_usd, mpo.manual_dbu_price_usd)
+        ELSE NULL
+      END AS list_cost_usd,
+      CASE
+        WHEN lp.list_price_usd IS NOT NULL THEN 'SYSTEM_LIST_PRICE'
+        WHEN mpo.manual_dbu_price_usd IS NOT NULL THEN 'MANUAL_OVERRIDE'
+        ELSE 'NO_PRICE_FOUND'
+      END AS price_source
+    FROM system.billing.usage u
+    LEFT JOIN list_prices_slim lp
+      ON u.cloud = lp.cloud
+     AND u.sku_name = lp.sku_name
+     AND lp.price_start_time <= u.usage_start_time
+     AND (lp.price_end_time >= u.usage_start_time OR lp.price_end_time IS NULL)
+    LEFT JOIN manual_price_overrides mpo
+      ON u.sku_name = mpo.sku_name
+    WHERE u.usage_date >= date_sub(current_date(), {DAYS_BACK})
+      AND u.usage_unit = 'DBU'
+    """
+    run_sql("Build priced_usage view", priced_usage_sql, top_n=20, persist_view="priced_usage", collect_count=False)
+else:
+    print("system.billing.usage is unavailable. Downstream DBU tests will be skipped.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3) Billing baseline / coverage checks
+
+# COMMAND ----------
+
+if ACCESS.get("system.billing.usage", False):
+    baseline_sql = """
+    SELECT
+      billing_origin_product,
+      COALESCE(CAST(product_features.is_serverless AS STRING), 'null') AS is_serverless,
+      sku_name,
+      COUNT(*) AS usage_rows,
+      COUNT(DISTINCT workspace_id) AS workspace_count,
+      SUM(usage_quantity) AS total_dbu,
+      SUM(list_cost_usd) AS total_list_cost_usd,
+      SUM(CASE WHEN effective_dbu_price_usd IS NOT NULL THEN usage_quantity ELSE 0 END) AS dbu_with_price,
+      SUM(CASE WHEN effective_dbu_price_usd IS NULL THEN usage_quantity ELSE 0 END) AS dbu_without_price
+    FROM priced_usage
+    GROUP BY
+      billing_origin_product,
+      COALESCE(CAST(product_features.is_serverless AS STRING), 'null'),
+      sku_name
+    ORDER BY total_dbu DESC
+    """
+    res = run_sql("Baseline DBU coverage by product / serverless / SKU", baseline_sql, top_n=100)
+    add_test_result(
+        "Baseline DBU coverage by product / serverless / SKU",
+        "BASELINE",
+        "N/A",
+        ["system.billing.usage"],
+        res,
+        "Top-level coverage view. Use this first to confirm what kinds of billed workloads are present."
+    )
+
+    metadata_coverage_sql = """
+    SELECT
+      COUNT(*) AS total_rows,
+      SUM(CASE WHEN usage_metadata.cluster_id IS NOT NULL THEN 1 ELSE 0 END) AS rows_with_cluster_id,
+      SUM(CASE WHEN usage_metadata.job_id IS NOT NULL THEN 1 ELSE 0 END) AS rows_with_job_id,
+      SUM(CASE WHEN usage_metadata.job_run_id IS NOT NULL THEN 1 ELSE 0 END) AS rows_with_job_run_id,
+      SUM(CASE WHEN usage_metadata.notebook_id IS NOT NULL THEN 1 ELSE 0 END) AS rows_with_notebook_id,
+      SUM(CASE WHEN usage_metadata.warehouse_id IS NOT NULL THEN 1 ELSE 0 END) AS rows_with_warehouse_id,
+      SUM(CASE WHEN usage_metadata.instance_pool_id IS NOT NULL THEN 1 ELSE 0 END) AS rows_with_instance_pool_id
+    FROM priced_usage
+    """
+    res = run_sql("Billing metadata coverage", metadata_coverage_sql, top_n=20)
+    add_test_result(
+        "Billing metadata coverage",
+        "BASELINE",
+        "N/A",
+        ["system.billing.usage"],
+        res,
+        "Checks whether key attribution fields are populated in your recent billing data."
+    )
+
+    price_coverage_sql = """
+    SELECT
+      price_source,
+      COUNT(*) AS usage_rows,
+      SUM(usage_quantity) AS total_dbu,
+      SUM(list_cost_usd) AS total_list_cost_usd
+    FROM priced_usage
+    GROUP BY price_source
+    ORDER BY total_dbu DESC
+    """
+    res = run_sql("USD translation coverage", price_coverage_sql, top_n=20)
+    add_test_result(
+        "USD translation coverage",
+        "BASELINE",
+        "N/A",
+        ["system.billing.usage"],
+        res,
+        "If NO_PRICE_FOUND appears, automatic DBU-to-USD translation is incomplete unless you add manual overrides."
+    )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4) Precise attribution tests
+
+# COMMAND ----------
+
+def run_test_with_diagnostics(test_name, category, precision, prerequisites, main_sql, notes, diagnostics=None):
+    missing = [t for t in prerequisites if not ACCESS.get(t, False)]
+    if missing:
+        result = {
+            "status": "SKIPPED",
+            "rows": None,
+            "error_type": "MISSING_PREREQUISITE",
+            "error": f"Missing or inaccessible prerequisite tables: {missing}"
+        }
+        print(f"\n===== {test_name} =====")
+        print(result["error"])
+        add_test_result(test_name, category, precision, prerequisites, result, notes)
+        return result
+
+    result = run_sql(test_name, main_sql, top_n=TOP_N)
+    add_test_result(test_name, category, precision, prerequisites, result, notes)
+
+    if (result["status"] in ("NO_ROWS", "ERROR")) and diagnostics:
+        for diag_name, diag_sql in diagnostics:
+            run_sql(f"{test_name} :: diagnostic :: {diag_name}", diag_sql, top_n=TOP_N)
+
+    return result
+
+# 4A. Serverless notebook runs (precise)
+serverless_notebooks_sql = """
+SELECT
+  workspace_id,
+  usage_metadata.notebook_id AS notebook_id,
+  usage_metadata.notebook_path AS notebook_path,
+  FIRST(identity_metadata.run_as, TRUE) AS run_as,
+  MIN(usage_start_time) AS first_usage_start_time,
+  MAX(usage_end_time) AS last_usage_end_time,
+  COUNT(*) AS usage_rows,
+  SUM(usage_quantity) AS total_dbu,
+  SUM(list_cost_usd) AS total_list_cost_usd
+FROM priced_usage
+WHERE billing_origin_product = 'INTERACTIVE'
+  AND COALESCE(product_features.is_serverless, FALSE) = TRUE
+  AND usage_metadata.notebook_id IS NOT NULL
+GROUP BY
+  workspace_id,
+  usage_metadata.notebook_id,
+  usage_metadata.notebook_path
+ORDER BY total_list_cost_usd DESC NULLS LAST, total_dbu DESC
+"""
+
+serverless_notebooks_diags = [
+    (
+        "interactive_serverless_rows_overall",
+        """
+        SELECT
+          COUNT(*) AS usage_rows,
+          SUM(usage_quantity) AS total_dbu
+        FROM priced_usage
+        WHERE billing_origin_product = 'INTERACTIVE'
+          AND COALESCE(product_features.is_serverless, FALSE) = TRUE
+        """
+    ),
+    (
+        "interactive_serverless_rows_with_notebook_id",
+        """
+        SELECT
+          COUNT(*) AS usage_rows,
+          SUM(usage_quantity) AS total_dbu
+        FROM priced_usage
+        WHERE billing_origin_product = 'INTERACTIVE'
+          AND COALESCE(product_features.is_serverless, FALSE) = TRUE
+          AND usage_metadata.notebook_id IS NOT NULL
+        """
+    ),
+]
+run_test_with_diagnostics(
+    "Precise DBU for serverless notebook runs",
+    "ATTRIBUTION",
+    "PRECISE",
+    ["system.billing.usage"],
+    serverless_notebooks_sql,
+    "Expected to work only for serverless notebooks. Classic all-purpose notebooks do not have notebook_id in billing.",
+    serverless_notebooks_diags
+)
+
+# 4B. Serverless jobs (precise)
+serverless_jobs_sql = """
+SELECT
+  u.workspace_id,
+  u.usage_metadata.job_id AS job_id,
+  COALESCE(u.usage_metadata.job_name, j.name) AS job_name,
+  u.usage_metadata.job_run_id AS job_run_id,
+  FIRST(u.identity_metadata.run_as, TRUE) AS run_as,
+  MIN(u.usage_start_time) AS first_usage_start_time,
+  MAX(u.usage_end_time) AS last_usage_end_time,
+  COUNT(*) AS usage_rows,
+  SUM(u.usage_quantity) AS total_dbu,
+  SUM(u.list_cost_usd) AS total_list_cost_usd
+FROM priced_usage u
+LEFT JOIN latest_jobs j
+  ON u.workspace_id = j.workspace_id
+ AND u.usage_metadata.job_id = j.job_id
+WHERE u.billing_origin_product = 'JOBS'
+  AND COALESCE(u.product_features.is_serverless, FALSE) = TRUE
+  AND u.usage_metadata.job_id IS NOT NULL
+  AND u.usage_metadata.job_run_id IS NOT NULL
+GROUP BY
+  u.workspace_id,
+  u.usage_metadata.job_id,
+  COALESCE(u.usage_metadata.job_name, j.name),
+  u.usage_metadata.job_run_id
+ORDER BY total_list_cost_usd DESC NULLS LAST, total_dbu DESC
+"""
+
+serverless_jobs_diags = [
+    (
+        "jobs_serverless_rows_overall",
+        """
+        SELECT
+          COUNT(*) AS usage_rows,
+          SUM(usage_quantity) AS total_dbu
+        FROM priced_usage
+        WHERE billing_origin_product = 'JOBS'
+          AND COALESCE(product_features.is_serverless, FALSE) = TRUE
+        """
+    ),
+    (
+        "jobs_serverless_rows_with_job_run_id",
+        """
+        SELECT
+          COUNT(*) AS usage_rows,
+          SUM(usage_quantity) AS total_dbu
+        FROM priced_usage
+        WHERE billing_origin_product = 'JOBS'
+          AND COALESCE(product_features.is_serverless, FALSE) = TRUE
+          AND usage_metadata.job_run_id IS NOT NULL
+        """
+    ),
+]
+run_test_with_diagnostics(
+    "Precise DBU for serverless job runs",
+    "ATTRIBUTION",
+    "PRECISE",
+    ["system.billing.usage"],
+    serverless_jobs_sql,
+    "Expected to work for serverless jobs because billing carries job_id and job_run_id.",
+    serverless_jobs_diags
+)
+
+# 4C. Jobs compute / ephemeral job clusters (precise)
+jobs_compute_sql = """
+SELECT
+  u.workspace_id,
+  u.usage_metadata.job_id AS job_id,
+  COALESCE(u.usage_metadata.job_name, j.name) AS job_name,
+  u.usage_metadata.job_run_id AS job_run_id,
+  u.usage_metadata.cluster_id AS cluster_id,
+  c.cluster_name,
+  c.cluster_source,
+  c.owned_by,
+  c.dbr_version,
+  FIRST(u.identity_metadata.run_as, TRUE) AS run_as,
+  MIN(u.usage_start_time) AS first_usage_start_time,
+  MAX(u.usage_end_time) AS last_usage_end_time,
+  COUNT(*) AS usage_rows,
+  SUM(u.usage_quantity) AS total_dbu,
+  SUM(u.list_cost_usd) AS total_list_cost_usd
+FROM priced_usage u
+LEFT JOIN latest_jobs j
+  ON u.workspace_id = j.workspace_id
+ AND u.usage_metadata.job_id = j.job_id
+LEFT JOIN latest_clusters c
+  ON u.workspace_id = c.workspace_id
+ AND u.usage_metadata.cluster_id = c.cluster_id
+WHERE u.billing_origin_product = 'JOBS'
+  AND COALESCE(u.product_features.is_serverless, FALSE) = FALSE
+  AND u.usage_metadata.job_id IS NOT NULL
+  AND u.usage_metadata.job_run_id IS NOT NULL
+GROUP BY
+  u.workspace_id,
+  u.usage_metadata.job_id,
+  COALESCE(u.usage_metadata.job_name, j.name),
+  u.usage_metadata.job_run_id,
+  u.usage_metadata.cluster_id,
+  c.cluster_name,
+  c.cluster_source,
+  c.owned_by,
+  c.dbr_version
+ORDER BY total_list_cost_usd DESC NULLS LAST, total_dbu DESC
+"""
+
+jobs_compute_diags = [
+    (
+        "jobs_classic_rows_with_job_id",
+        """
+        SELECT
+          COUNT(*) AS usage_rows,
+          SUM(usage_quantity) AS total_dbu
+        FROM priced_usage
+        WHERE billing_origin_product = 'JOBS'
+          AND COALESCE(product_features.is_serverless, FALSE) = FALSE
+          AND usage_metadata.job_id IS NOT NULL
+        """
+    ),
+    (
+        "jobs_classic_rows_with_cluster_id",
+        """
+        SELECT
+          COUNT(*) AS usage_rows,
+          SUM(usage_quantity) AS total_dbu
+        FROM priced_usage
+        WHERE billing_origin_product = 'JOBS'
+          AND COALESCE(product_features.is_serverless, FALSE) = FALSE
+          AND usage_metadata.cluster_id IS NOT NULL
+        """
+    ),
+]
+run_test_with_diagnostics(
+    "Precise DBU for jobs compute / ephemeral job clusters",
+    "ATTRIBUTION",
+    "PRECISE",
+    ["system.billing.usage"],
+    jobs_compute_sql,
+    "This is the classical jobs-compute case. If cluster_source='JOB', you are seeing job clusters / ephemeral job clusters.",
+    jobs_compute_diags
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5) Cluster-level and approximate attribution tests
+
+# COMMAND ----------
+
+# 5A. All-purpose compute cluster-level attribution (precise at cluster level only)
+all_purpose_cluster_sql = """
+SELECT
+  u.workspace_id,
+  u.usage_metadata.cluster_id AS cluster_id,
+  c.cluster_name,
+  c.owned_by,
+  c.cluster_source,
+  c.dbr_version,
+  FIRST(u.identity_metadata.run_as, TRUE) AS sample_run_as,
+  MIN(u.usage_start_time) AS first_usage_start_time,
+  MAX(u.usage_end_time) AS last_usage_end_time,
+  COUNT(*) AS usage_rows,
+  SUM(u.usage_quantity) AS total_dbu,
+  SUM(u.list_cost_usd) AS total_list_cost_usd
+FROM priced_usage u
+LEFT JOIN latest_clusters c
+  ON u.workspace_id = c.workspace_id
+ AND u.usage_metadata.cluster_id = c.cluster_id
+WHERE u.billing_origin_product = 'ALL_PURPOSE'
+  AND u.usage_metadata.cluster_id IS NOT NULL
+GROUP BY
+  u.workspace_id,
+  u.usage_metadata.cluster_id,
+  c.cluster_name,
+  c.owned_by,
+  c.cluster_source,
+  c.dbr_version
+ORDER BY total_list_cost_usd DESC NULLS LAST, total_dbu DESC
+"""
+
+all_purpose_cluster_diags = [
+    (
+        "all_purpose_overall",
+        """
+        SELECT
+          COUNT(*) AS usage_rows,
+          SUM(usage_quantity) AS total_dbu
+        FROM priced_usage
+        WHERE billing_origin_product = 'ALL_PURPOSE'
+        """
+    )
+]
+run_test_with_diagnostics(
+    "All-purpose compute DBU at cluster level",
+    "ATTRIBUTION",
+    "PRECISE_CLUSTER_LEVEL_ONLY",
+    ["system.billing.usage"],
+    all_purpose_cluster_sql,
+    "This is as precise as billing gets for classic all-purpose compute: cluster-level, not notebook-level or job-run-level.",
+    all_purpose_cluster_diags
+)
+
+# 5B. Identify jobs that ran on all-purpose compute
+jobs_on_all_purpose_sql = f"""
+SELECT
+  t.workspace_id,
+  t.job_id,
+  COALESCE(j.name, CONCAT('job_', t.job_id)) AS job_name,
+  e.cluster_id,
+  c.cluster_name,
+  c.owned_by,
+  c.cluster_source,
+  MIN(t.period_start_time) AS first_seen_period_start_time,
+  MAX(t.period_end_time) AS last_seen_period_end_time,
+  COUNT(DISTINCT t.run_id) AS task_run_count,
+  SUM(GREATEST(0, UNIX_TIMESTAMP(t.period_end_time) - UNIX_TIMESTAMP(t.period_start_time))) AS observed_task_runtime_seconds
+FROM system.lakeflow.job_task_run_timeline t
+LATERAL VIEW explode(t.compute_ids) e AS cluster_id
+INNER JOIN latest_clusters c
+  ON t.workspace_id = c.workspace_id
+ AND e.cluster_id = c.cluster_id
+LEFT JOIN latest_jobs j
+  ON t.workspace_id = j.workspace_id
+ AND t.job_id = j.job_id
+WHERE t.period_start_time >= current_timestamp() - INTERVAL {DAYS_BACK} DAYS
+  AND c.cluster_source IN ('UI', 'API')
+GROUP BY
+  t.workspace_id,
+  t.job_id,
+  COALESCE(j.name, CONCAT('job_', t.job_id)),
+  e.cluster_id,
+  c.cluster_name,
+  c.owned_by,
+  c.cluster_source
+ORDER BY observed_task_runtime_seconds DESC
+"""
+
+jobs_on_all_purpose_diags = [
+    (
+        "all_recent_task_runs_by_cluster_source",
+        f"""
+        SELECT
+          c.cluster_source,
+          COUNT(*) AS task_rows
+        FROM system.lakeflow.job_task_run_timeline t
+        LATERAL VIEW explode(t.compute_ids) e AS cluster_id
+        LEFT JOIN latest_clusters c
+          ON t.workspace_id = c.workspace_id
+         AND e.cluster_id = c.cluster_id
+        WHERE t.period_start_time >= current_timestamp() - INTERVAL {DAYS_BACK} DAYS
+        GROUP BY c.cluster_source
+        ORDER BY task_rows DESC
+        """
+    )
+]
+run_test_with_diagnostics(
+    "Identify jobs that ran on all-purpose compute",
+    "ATTRIBUTION",
+    "IDENTIFICATION_ONLY",
+    ["system.lakeflow.job_task_run_timeline", "system.compute.clusters"],
+    jobs_on_all_purpose_sql,
+    "This identifies jobs that touched UI/API clusters. It does not make the cost precise by itself.",
+    jobs_on_all_purpose_diags
+)
+
+# 5C. Approximate DBU allocation for jobs on all-purpose compute
+approx_all_purpose_job_cost_sql = f"""
+WITH all_purpose_cluster_day AS (
+  SELECT
+    workspace_id,
+    usage_metadata.cluster_id AS cluster_id,
+    usage_date,
+    SUM(usage_quantity) AS cluster_dbu,
+    SUM(list_cost_usd) AS cluster_list_cost_usd
+  FROM priced_usage
+  WHERE billing_origin_product = 'ALL_PURPOSE'
+    AND usage_metadata.cluster_id IS NOT NULL
+  GROUP BY
+    workspace_id,
+    usage_metadata.cluster_id,
+    usage_date
+),
+job_task_runtime AS (
+  SELECT
+    t.workspace_id,
+    e.cluster_id,
+    CAST(t.period_start_time AS DATE) AS usage_date,
+    t.job_id,
+    COALESCE(j.name, CONCAT('job_', t.job_id)) AS job_name,
+    SUM(GREATEST(0, UNIX_TIMESTAMP(t.period_end_time) - UNIX_TIMESTAMP(t.period_start_time))) AS task_runtime_seconds
+  FROM system.lakeflow.job_task_run_timeline t
+  LATERAL VIEW explode(t.compute_ids) e AS cluster_id
+  INNER JOIN latest_clusters c
+    ON t.workspace_id = c.workspace_id
+   AND e.cluster_id = c.cluster_id
+  LEFT JOIN latest_jobs j
+    ON t.workspace_id = j.workspace_id
+   AND t.job_id = j.job_id
+  WHERE t.period_start_time >= current_timestamp() - INTERVAL {DAYS_BACK} DAYS
+    AND c.cluster_source IN ('UI', 'API')
+  GROUP BY
+    t.workspace_id,
+    e.cluster_id,
+    CAST(t.period_start_time AS DATE),
+    t.job_id,
+    COALESCE(j.name, CONCAT('job_', t.job_id))
+),
+job_task_runtime_total AS (
+  SELECT
+    workspace_id,
+    cluster_id,
+    usage_date,
+    SUM(task_runtime_seconds) AS total_job_task_runtime_seconds
+  FROM job_task_runtime
+  GROUP BY
+    workspace_id,
+    cluster_id,
+    usage_date
+)
+SELECT
+  j.workspace_id,
+  j.cluster_id,
+  c.cluster_name,
+  c.owned_by,
+  j.usage_date,
+  j.job_id,
+  j.job_name,
+  j.task_runtime_seconds,
+  t.total_job_task_runtime_seconds,
+  b.cluster_dbu,
+  b.cluster_list_cost_usd,
+  CASE
+    WHEN t.total_job_task_runtime_seconds > 0 AND b.cluster_dbu IS NOT NULL
+    THEN b.cluster_dbu * (j.task_runtime_seconds / t.total_job_task_runtime_seconds)
+    ELSE NULL
+  END AS approx_job_dbu_from_job_task_runtime_share,
+  CASE
+    WHEN t.total_job_task_runtime_seconds > 0 AND b.cluster_list_cost_usd IS NOT NULL
+    THEN b.cluster_list_cost_usd * (j.task_runtime_seconds / t.total_job_task_runtime_seconds)
+    ELSE NULL
+  END AS approx_job_list_cost_usd_from_job_task_runtime_share,
+  'APPROX_ONLY_SHARED_CLUSTER' AS estimate_type,
+  'Directional estimate only. Shared notebooks, SQL, and other workloads on the same cluster are not isolated here.' AS caveat
+FROM job_task_runtime j
+INNER JOIN job_task_runtime_total t
+  ON j.workspace_id = t.workspace_id
+ AND j.cluster_id = t.cluster_id
+ AND j.usage_date = t.usage_date
+LEFT JOIN all_purpose_cluster_day b
+  ON j.workspace_id = b.workspace_id
+ AND j.cluster_id = b.cluster_id
+ AND j.usage_date = b.usage_date
+LEFT JOIN latest_clusters c
+  ON j.workspace_id = c.workspace_id
+ AND j.cluster_id = c.cluster_id
+ORDER BY approx_job_list_cost_usd_from_job_task_runtime_share DESC NULLS LAST, j.task_runtime_seconds DESC
+"""
+
+run_test_with_diagnostics(
+    "Approximate DBU allocation for jobs on all-purpose compute",
+    "ATTRIBUTION",
+    "APPROXIMATE_ONLY",
+    ["system.billing.usage", "system.lakeflow.job_task_run_timeline", "system.compute.clusters"],
+    approx_all_purpose_job_cost_sql,
+    "Use only as a directional estimate. Shared-cluster workloads make exact per-job costing impossible.",
+    None
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6) Special-case run types (submit runs and notebook workflow runs)
+
+# COMMAND ----------
+
+# 6A. Submit runs
+submit_run_cost_sql = f"""
+WITH submit_runs AS (
+  SELECT
+    workspace_id,
+    job_id,
+    run_id,
+    run_name,
+    MIN(period_start_time) AS run_start_time,
+    MAX(period_end_time) AS run_end_time,
+    FIRST(result_state, TRUE) AS result_state
+  FROM system.lakeflow.job_run_timeline
+  WHERE run_type = 'SUBMIT_RUN'
+    AND period_start_time >= current_timestamp() - INTERVAL {DAYS_BACK} DAYS
+  GROUP BY
+    workspace_id,
+    job_id,
+    run_id,
+    run_name
+)
+SELECT
+  s.workspace_id,
+  s.job_id,
+  COALESCE(j.name, s.run_name, CONCAT('submit_run_', s.run_id)) AS job_or_run_name,
+  s.run_id,
+  s.run_start_time,
+  s.run_end_time,
+  s.result_state,
+  COUNT(u.record_id) AS matched_billing_rows,
+  SUM(u.usage_quantity) AS total_dbu,
+  SUM(u.list_cost_usd) AS total_list_cost_usd
+FROM submit_runs s
+LEFT JOIN priced_usage u
+  ON s.workspace_id = u.workspace_id
+ AND s.job_id = u.usage_metadata.job_id
+ AND s.run_id = u.usage_metadata.job_run_id
+LEFT JOIN latest_jobs j
+  ON s.workspace_id = j.workspace_id
+ AND s.job_id = j.job_id
+GROUP BY
+  s.workspace_id,
+  s.job_id,
+  COALESCE(j.name, s.run_name, CONCAT('submit_run_', s.run_id)),
+  s.run_id,
+  s.run_start_time,
+  s.run_end_time,
+  s.result_state
+ORDER BY total_list_cost_usd DESC NULLS LAST, total_dbu DESC
+"""
+
+run_test_with_diagnostics(
+    "SUBMIT_RUN coverage and cost join",
+    "RUN_TYPE",
+    "PRECISE_WHEN_BILLING_MATCHES",
+    ["system.lakeflow.job_run_timeline", "system.billing.usage"],
+    submit_run_cost_sql,
+    "Shows whether one-time submitted runs are visible and whether they match billed job/job_run IDs.",
+    None
+)
+
+# 6B. Workflow runs
+workflow_run_cost_sql = f"""
+WITH workflow_runs AS (
+  SELECT
+    workspace_id,
+    job_id,
+    run_id,
+    run_name,
+    MIN(period_start_time) AS run_start_time,
+    MAX(period_end_time) AS run_end_time,
+    FIRST(result_state, TRUE) AS result_state
+  FROM system.lakeflow.job_run_timeline
+  WHERE run_type = 'WORKFLOW_RUN'
+    AND period_start_time >= current_timestamp() - INTERVAL {DAYS_BACK} DAYS
+  GROUP BY
+    workspace_id,
+    job_id,
+    run_id,
+    run_name
+)
+SELECT
+  w.workspace_id,
+  w.job_id,
+  COALESCE(w.run_name, CONCAT('workflow_run_', w.run_id)) AS workflow_run_name,
+  w.run_id,
+  w.run_start_time,
+  w.run_end_time,
+  w.result_state,
+  COUNT(u.record_id) AS matched_billing_rows,
+  SUM(u.usage_quantity) AS matched_billing_dbu,
+  SUM(u.list_cost_usd) AS matched_billing_list_cost_usd
+FROM workflow_runs w
+LEFT JOIN priced_usage u
+  ON w.workspace_id = u.workspace_id
+ AND w.job_id = u.usage_metadata.job_id
+ AND w.run_id = u.usage_metadata.job_run_id
+GROUP BY
+  w.workspace_id,
+  w.job_id,
+  COALESCE(w.run_name, CONCAT('workflow_run_', w.run_id)),
+  w.run_id,
+  w.run_start_time,
+  w.run_end_time,
+  w.result_state
+ORDER BY w.run_start_time DESC
+"""
+
+run_test_with_diagnostics(
+    "WORKFLOW_RUN coverage and billing join",
+    "RUN_TYPE",
+    "EXPECTED_NOT_SEPARATELY_BILLED",
+    ["system.lakeflow.job_run_timeline", "system.billing.usage"],
+    workflow_run_cost_sql,
+    "By documentation, notebook workflow runs are tracked in job_run_timeline but not directly costed as separate billing rows; usage rolls up to the parent notebook/job context.",
+    None
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7) Optional SQL / warehouse diagnostics
+
+# COMMAND ----------
+
+if INCLUDE_OPTIONAL_SQL_TESTS:
+    sql_statement_context_sql = f"""
+    SELECT
+      COALESCE(compute.type, 'UNKNOWN') AS compute_type,
+      CASE
+        WHEN query_source.notebook_id IS NOT NULL THEN 'NOTEBOOK_SQL'
+        WHEN query_source.job_info.job_id IS NOT NULL THEN 'JOB_SQL'
+        ELSE 'OTHER_SQL'
+      END AS sql_flow_type,
+      COALESCE(CAST(query_source.notebook_id AS STRING), CAST(query_source.job_info.job_id AS STRING), 'n/a') AS source_object_id,
+      COUNT(*) AS statement_count,
+      MIN(start_time) AS first_seen,
+      MAX(end_time) AS last_seen
+    FROM system.query.history
+    WHERE start_time >= current_timestamp() - INTERVAL {DAYS_BACK} DAYS
+    GROUP BY
+      COALESCE(compute.type, 'UNKNOWN'),
+      CASE
+        WHEN query_source.notebook_id IS NOT NULL THEN 'NOTEBOOK_SQL'
+        WHEN query_source.job_info.job_id IS NOT NULL THEN 'JOB_SQL'
+        ELSE 'OTHER_SQL'
+      END,
+      COALESCE(CAST(query_source.notebook_id AS STRING), CAST(query_source.job_info.job_id AS STRING), 'n/a')
+    ORDER BY statement_count DESC
+    """
+    run_test_with_diagnostics(
+        "Optional SQL flow context from query history",
+        "OPTIONAL_SQL",
+        "INFORMATIONAL_ONLY",
+        ["system.query.history"],
+        sql_statement_context_sql,
+        "Informational only. This is helpful for SQL statement context but is not a direct DBU allocator at the statement level.",
+        None
+    )
+
+    warehouse_billing_sql = """
+    SELECT
+      u.workspace_id,
+      u.usage_metadata.warehouse_id AS warehouse_id,
+      w.warehouse_name,
+      w.warehouse_type,
+      w.warehouse_size,
+      COUNT(*) AS usage_rows,
+      SUM(u.usage_quantity) AS total_dbu,
+      SUM(u.list_cost_usd) AS total_list_cost_usd
+    FROM priced_usage u
+    LEFT JOIN latest_warehouses w
+      ON u.workspace_id = w.workspace_id
+     AND u.usage_metadata.warehouse_id = w.warehouse_id
+    WHERE u.billing_origin_product = 'SQL'
+      AND u.usage_metadata.warehouse_id IS NOT NULL
+    GROUP BY
+      u.workspace_id,
+      u.usage_metadata.warehouse_id,
+      w.warehouse_name,
+      w.warehouse_type,
+      w.warehouse_size
+    ORDER BY total_list_cost_usd DESC NULLS LAST, total_dbu DESC
+    """
+    run_test_with_diagnostics(
+        "Optional SQL warehouse DBU baseline",
+        "OPTIONAL_SQL",
+        "WAREHOUSE_LEVEL",
+        ["system.billing.usage"],
+        warehouse_billing_sql,
+        "Warehouse-level SQL DBU baseline. Useful if you want SQL included in the observability picture.",
+        None
+    )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 8) Final notebook summary
+
+# COMMAND ----------
+
+# Build summary dataframes
+table_probe_summary_df = spark.createDataFrame(table_probe_results)
+test_summary_df = spark.createDataFrame(test_results) if test_results else spark.createDataFrame([], "test_name string, category string, precision string, prerequisites string, status string, rows long, error_type string, notes string")
+
+print("\n================ FINAL SUMMARY ================\n")
+
+# Core access summary
+core_usage = "YES" if ACCESS.get("system.billing.usage", False) else "NO"
+core_prices = "YES" if ACCESS.get("system.billing.list_prices", False) else "NO"
+core_job_runs = "YES" if ACCESS.get("system.lakeflow.job_run_timeline", False) else "NO"
+core_job_tasks = "YES" if ACCESS.get("system.lakeflow.job_task_run_timeline", False) else "NO"
+core_clusters = "YES" if ACCESS.get("system.compute.clusters", False) else "NO"
+
+print(f"Window analyzed: last {DAYS_BACK} days")
+print(f"system.billing.usage accessible: {core_usage}")
+print(f"system.billing.list_prices accessible: {core_prices}")
+print(f"system.lakeflow.job_run_timeline accessible: {core_job_runs}")
+print(f"system.lakeflow.job_task_run_timeline accessible: {core_job_tasks}")
+print(f"system.compute.clusters accessible: {core_clusters}")
+print("")
+
+# Expected capability summary (doc-aligned)
+capability_rows = [
+    ("Serverless notebooks", "PRECISE", "Should work when billing rows exist with billing_origin_product='INTERACTIVE' and notebook_id populated."),
+    ("Serverless jobs", "PRECISE", "Should work when billing rows exist with billing_origin_product='JOBS' and job_id/job_run_id populated."),
+    ("Jobs compute / ephemeral job clusters", "PRECISE", "Should work when billing rows exist with billing_origin_product='JOBS' on classic jobs compute."),
+    ("Classic all-purpose compute", "CLUSTER_LEVEL_ONLY", "Billing is precise at cluster level via cluster_id."),
+    ("Jobs on all-purpose compute", "APPROXIMATE_ONLY", "Exact per-job cost is not possible on shared all-purpose clusters; only approximate estimates are reasonable."),
+    ("WORKFLOW_RUN notebook workflows", "NOT_SEPARATELY_BILLED", "Expected to be visible in job timelines, but not directly billed as separate job/job_run billing rows."),
 ]
 
-
-# ------------------------------------------------------------
-# 1) Read source MVs and persist history
-# ------------------------------------------------------------
-table_source_df = spark.table(qualify_name(TABLE_SOURCE_MV)).select(*TABLE_SOURCE_COLS)
-column_source_df = spark.table(qualify_name(COLUMN_SOURCE_MV)).select(*COLUMN_SOURCE_COLS)
-
-table_history_stage = with_hash_key(
-    table_source_df,
-    key_cols=[
-        "entity_type",
-        "entity_id",
-        "entity_run_id",
-        "source_table_full_name",
-        "source_table_catalog",
-        "source_table_schema",
-        "source_table_name",
-        "source_type",
-        "target_table_full_name",
-        "target_table_catalog",
-        "target_table_schema",
-        "target_table_name",
-        "target_type",
-        "created_by",
-        "event_time",
-        "event_date",
-        "event_id",
-    ],
-    key_name="lineage_row_id",
+capability_summary_df = spark.createDataFrame(
+    capability_rows,
+    "flow_type string, expected_precision string, documentation_expectation string"
 )
 
-column_history_stage = with_hash_key(
-    column_source_df,
-    key_cols=[
-        "entity_type",
-        "entity_id",
-        "entity_run_id",
-        "source_table_full_name",
-        "source_table_catalog",
-        "source_table_schema",
-        "source_table_name",
-        "source_type",
-        "source_column_name",
-        "target_table_full_name",
-        "target_table_catalog",
-        "target_table_schema",
-        "target_table_name",
-        "target_type",
-        "target_column_name",
-        "created_by",
-        "event_time",
-        "event_date",
-        "event_id",
-    ],
-    key_name="lineage_row_id",
-)
-
-merge_history(table_history_stage, TABLE_HISTORY_TARGET, key_col="lineage_row_id")
-merge_history(column_history_stage, COLUMN_HISTORY_TARGET, key_col="lineage_row_id")
-
-table_history_df = spark.table(qualify_name(TABLE_HISTORY_TARGET)).cache()
-column_history_df = spark.table(qualify_name(COLUMN_HISTORY_TARGET)).cache()
-
-_ = table_history_df.count()
-_ = column_history_df.count()
-
-
-# ------------------------------------------------------------
-# 2) Build table lineage versions + current direct edges
-# Current-state rule:
-#   latest event per TARGET TABLE wins
-# ------------------------------------------------------------
-table_target_events = (
-    table_history_df
-    .filter(F.col("target_table_full_name").isNotNull())
-    .select(
-        "target_table_full_name",
-        "target_table_catalog",
-        "target_table_schema",
-        "target_table_name",
-        "event_id",
-        "event_time",
-        "event_date",
-        "entity_type",
-        "entity_id",
-        "entity_run_id",
-        "created_by",
-    )
-    .dropDuplicates(["target_table_full_name", "event_id"])
-)
-
-table_event_source_counts = (
-    table_history_df
-    .filter(
-        F.col("target_table_full_name").isNotNull() &
-        F.col("source_table_full_name").isNotNull()
-    )
-    .groupBy("target_table_full_name", "event_id")
-    .agg(F.count("*").alias("source_edge_count"))
-)
-
-table_versions_asc_w = (
-    W.partitionBy("target_table_full_name")
-     .orderBy(F.col("event_time").asc(), F.col("event_id").asc())
-)
-table_versions_desc_w = (
-    W.partitionBy("target_table_full_name")
-     .orderBy(F.col("event_time").desc(), F.col("event_id").desc())
-)
-
-table_versions_df = (
-    table_target_events
-    .join(table_event_source_counts, ["target_table_full_name", "event_id"], "left")
-    .fillna({"source_edge_count": 0})
-    .withColumn("version_number", F.row_number().over(table_versions_asc_w))
-    .withColumn("valid_from_ts", F.col("event_time"))
-    .withColumn("valid_to_ts", F.lead("event_time").over(table_versions_asc_w))
-    .withColumn("version_rank_desc", F.row_number().over(table_versions_desc_w))
-    .withColumn("is_current", F.col("version_rank_desc") == 1)
-    .withColumn("has_source_lineage", F.col("source_edge_count") > 0)
-    .drop("version_rank_desc")
-)
-
-overwrite_delta(table_versions_df, TABLE_VERSIONS_TARGET)
-
-table_current_versions_df = (
-    table_versions_df
-    .filter(F.col("is_current"))
-    .select(
-        F.col("target_table_full_name").alias("version_target_table_full_name"),
-        F.col("event_id").alias("version_event_id"),
-        F.col("event_time").alias("version_event_time"),
-        F.col("valid_from_ts").alias("version_valid_from_ts"),
-        F.col("valid_to_ts").alias("version_valid_to_ts"),
-        F.col("version_number").alias("version_number"),
-        F.col("is_current").alias("version_is_current"),
-        F.col("source_edge_count").alias("version_source_edge_count"),
-        F.col("has_source_lineage").alias("version_has_source_lineage"),
-        F.col("created_by").alias("version_created_by"),
-        F.col("entity_type").alias("version_entity_type"),
-        F.col("entity_id").alias("version_entity_id"),
-        F.col("entity_run_id").alias("version_entity_run_id"),
-    )
-)
-
-table_current_edges_df = (
-    table_history_df.alias("h")
-    .join(
-        table_current_versions_df.alias("v"),
-        (F.col("h.target_table_full_name") == F.col("v.version_target_table_full_name")) &
-        (F.col("h.event_id") == F.col("v.version_event_id")),
-        "inner"
-    )
-    .filter(F.col("h.source_table_full_name").isNotNull())
-    .select(
-        F.col("h.source_table_full_name"),
-        F.col("h.source_table_catalog"),
-        F.col("h.source_table_schema"),
-        F.col("h.source_table_name"),
-        F.col("h.source_type"),
-
-        F.col("h.target_table_full_name"),
-        F.col("h.target_table_catalog"),
-        F.col("h.target_table_schema"),
-        F.col("h.target_table_name"),
-        F.col("h.target_type"),
-
-        F.col("v.version_event_id"),
-        F.col("v.version_event_time"),
-        F.col("v.version_valid_from_ts"),
-        F.col("v.version_valid_to_ts"),
-        F.col("v.version_number"),
-        F.col("v.version_is_current"),
-        F.col("v.version_source_edge_count"),
-        F.col("v.version_has_source_lineage"),
-        F.col("v.version_created_by"),
-        F.col("v.version_entity_type"),
-        F.col("v.version_entity_id"),
-        F.col("v.version_entity_run_id"),
-    )
-    .dropDuplicates(["source_table_full_name", "target_table_full_name", "version_event_id"])
-    .cache()
-)
-
-_ = table_current_edges_df.count()
-overwrite_delta(table_current_edges_df, TABLE_CURRENT_EDGES_TARGET)
-
-
-# ------------------------------------------------------------
-# 3) Build column lineage versions + current direct edges
-# Current-state rule:
-#   latest event per TARGET COLUMN wins
-#
-# Important limitation:
-#   column_lineage does not capture no-source writes.
-#   So a later table write can make current column lineage "best effort".
-# ------------------------------------------------------------
-table_current_write_times_df = (
-    table_current_versions_df
-    .select(
-        F.col("version_target_table_full_name").alias("target_table_full_name"),
-        F.col("version_event_time").alias("table_current_write_ts"),
-    )
-)
-
-column_target_events = (
-    column_history_df
-    .filter(
-        F.col("target_table_full_name").isNotNull() &
-        F.col("target_column_name").isNotNull()
-    )
-    .select(
-        "target_table_full_name",
-        "target_table_catalog",
-        "target_table_schema",
-        "target_table_name",
-        "target_type",
-        "target_column_name",
-        "event_id",
-        "event_time",
-        "event_date",
-        "entity_type",
-        "entity_id",
-        "entity_run_id",
-        "created_by",
-    )
-    .dropDuplicates(["target_table_full_name", "target_column_name", "event_id"])
-)
-
-column_event_source_counts = (
-    column_history_df
-    .filter(
-        F.col("target_table_full_name").isNotNull() &
-        F.col("target_column_name").isNotNull() &
-        F.col("source_table_full_name").isNotNull() &
-        F.col("source_column_name").isNotNull()
-    )
-    .groupBy("target_table_full_name", "target_column_name", "event_id")
-    .agg(F.count("*").alias("source_edge_count"))
-)
-
-column_versions_asc_w = (
-    W.partitionBy("target_table_full_name", "target_column_name")
-     .orderBy(F.col("event_time").asc(), F.col("event_id").asc())
-)
-column_versions_desc_w = (
-    W.partitionBy("target_table_full_name", "target_column_name")
-     .orderBy(F.col("event_time").desc(), F.col("event_id").desc())
-)
-
-column_versions_df = (
-    column_target_events
-    .join(column_event_source_counts, ["target_table_full_name", "target_column_name", "event_id"], "left")
-    .fillna({"source_edge_count": 0})
-    .withColumn("version_number", F.row_number().over(column_versions_asc_w))
-    .withColumn("valid_from_ts", F.col("event_time"))
-    .withColumn("valid_to_ts", F.lead("event_time").over(column_versions_asc_w))
-    .withColumn("version_rank_desc", F.row_number().over(column_versions_desc_w))
-    .withColumn("is_current", F.col("version_rank_desc") == 1)
-    .withColumn("has_source_lineage", F.col("source_edge_count") > 0)
-    .drop("version_rank_desc")
-    .join(table_current_write_times_df, ["target_table_full_name"], "left")
-    .withColumn(
-        "possible_staleness_due_to_later_table_write",
-        F.when(
-            F.col("table_current_write_ts").isNotNull() &
-            (F.col("table_current_write_ts") > F.col("event_time")),
-            F.lit(True)
-        ).otherwise(F.lit(False))
-    )
-)
-
-overwrite_delta(column_versions_df, COLUMN_VERSIONS_TARGET)
-
-column_current_versions_df = (
-    column_versions_df
-    .filter(F.col("is_current"))
-    .select(
-        F.col("target_table_full_name").alias("version_target_table_full_name"),
-        F.col("target_column_name").alias("version_target_column_name"),
-        F.col("event_id").alias("version_event_id"),
-        F.col("event_time").alias("version_event_time"),
-        F.col("valid_from_ts").alias("version_valid_from_ts"),
-        F.col("valid_to_ts").alias("version_valid_to_ts"),
-        F.col("version_number").alias("version_number"),
-        F.col("is_current").alias("version_is_current"),
-        F.col("source_edge_count").alias("version_source_edge_count"),
-        F.col("has_source_lineage").alias("version_has_source_lineage"),
-        F.col("possible_staleness_due_to_later_table_write"),
-        F.col("created_by").alias("version_created_by"),
-        F.col("entity_type").alias("version_entity_type"),
-        F.col("entity_id").alias("version_entity_id"),
-        F.col("entity_run_id").alias("version_entity_run_id"),
-    )
-)
-
-column_current_edges_df = (
-    column_history_df.alias("h")
-    .join(
-        column_current_versions_df.alias("v"),
-        (F.col("h.target_table_full_name") == F.col("v.version_target_table_full_name")) &
-        (F.col("h.target_column_name") == F.col("v.version_target_column_name")) &
-        (F.col("h.event_id") == F.col("v.version_event_id")),
-        "inner"
-    )
-    .filter(
-        F.col("h.source_table_full_name").isNotNull() &
-        F.col("h.source_column_name").isNotNull()
-    )
-    .select(
-        F.col("h.source_table_full_name"),
-        F.col("h.source_table_catalog"),
-        F.col("h.source_table_schema"),
-        F.col("h.source_table_name"),
-        F.col("h.source_type"),
-        F.col("h.source_column_name"),
-
-        F.col("h.target_table_full_name"),
-        F.col("h.target_table_catalog"),
-        F.col("h.target_table_schema"),
-        F.col("h.target_table_name"),
-        F.col("h.target_type"),
-        F.col("h.target_column_name"),
-
-        F.concat_ws("|", F.col("h.source_table_full_name"), F.col("h.source_column_name")).alias("source_node_key"),
-        F.concat_ws("|", F.col("h.target_table_full_name"), F.col("h.target_column_name")).alias("target_node_key"),
-
-        F.col("v.version_event_id"),
-        F.col("v.version_event_time"),
-        F.col("v.version_valid_from_ts"),
-        F.col("v.version_valid_to_ts"),
-        F.col("v.version_number"),
-        F.col("v.version_is_current"),
-        F.col("v.version_source_edge_count"),
-        F.col("v.version_has_source_lineage"),
-        F.col("v.possible_staleness_due_to_later_table_write"),
-        F.col("v.version_created_by"),
-        F.col("v.version_entity_type"),
-        F.col("v.version_entity_id"),
-        F.col("v.version_entity_run_id"),
-    )
-    .dropDuplicates(["source_node_key", "target_node_key", "version_event_id"])
-    .cache()
-)
-
-_ = column_current_edges_df.count()
-overwrite_delta(column_current_edges_df, COLUMN_CURRENT_EDGES_TARGET)
-
-
-# ------------------------------------------------------------
-# 4) Root-only rows
-# ------------------------------------------------------------
-def build_root_table_row():
-    return spark.createDataFrame(
-        [(ROOT_FULL_NAME, ROOT_SCHEMA, ROOT_NAME)],
-        ["root_table_full_name", "root_table_schema", "root_table_name"]
-    ).select(
-        "root_table_full_name",
-        "root_table_schema",
-        "root_table_name",
-
-        F.lit("ROOT").alias("direction"),
-        F.lit(0).cast("int").alias("hop_count"),
-
-        F.lit(ROOT_FULL_NAME).alias("reached_table_full_name"),
-        F.lit(ROOT_SCHEMA).alias("reached_table_schema"),
-        F.lit(ROOT_NAME).alias("reached_table_name"),
-        F.lit("TABLE").alias("reached_type"),
-
-        F.lit(None).cast("string").alias("adjacent_table_full_name"),
-        F.lit(None).cast("string").alias("adjacent_table_schema"),
-        F.lit(None).cast("string").alias("adjacent_table_name"),
-        F.lit(None).cast("string").alias("adjacent_type"),
-
-        F.lit(None).cast("string").alias("edge_source_table_full_name"),
-        F.lit(None).cast("string").alias("edge_source_table_schema"),
-        F.lit(None).cast("string").alias("edge_source_table_name"),
-        F.lit(None).cast("string").alias("edge_source_type"),
-
-        F.lit(None).cast("string").alias("edge_target_table_full_name"),
-        F.lit(None).cast("string").alias("edge_target_table_schema"),
-        F.lit(None).cast("string").alias("edge_target_table_name"),
-        F.lit(None).cast("string").alias("edge_target_type"),
-
-        F.lit(None).cast("string").alias("version_event_id"),
-        F.lit(None).cast("timestamp").alias("version_event_time"),
-        F.lit(None).cast("timestamp").alias("version_valid_from_ts"),
-        F.lit(None).cast("timestamp").alias("version_valid_to_ts"),
-        F.lit(None).cast("int").alias("version_number"),
-        F.lit(None).cast("boolean").alias("version_is_current"),
-        F.lit(None).cast("int").alias("version_source_edge_count"),
-        F.lit(None).cast("boolean").alias("version_has_source_lineage"),
-        F.lit(None).cast("string").alias("version_created_by"),
-        F.lit(None).cast("string").alias("version_entity_type"),
-        F.lit(None).cast("string").alias("version_entity_id"),
-        F.lit(None).cast("string").alias("version_entity_run_id"),
-
-        F.lit(ROOT_FULL_NAME).alias("path_from_root"),
-        F.lit(None).cast("boolean").alias("is_terminal"),
-        F.lit(None).cast("string").alias("terminal_reason"),
-        F.current_timestamp().alias("generated_at"),
-    )
-
-def build_root_column_rows():
-    root_cols = spark.table(ROOT_FULL_NAME).columns
-    root_cols_df = spark.createDataFrame([(c,) for c in root_cols], "root_column_name string")
-
-    return root_cols_df.select(
-        F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
-        F.lit(ROOT_SCHEMA).alias("root_table_schema"),
-        F.lit(ROOT_NAME).alias("root_table_name"),
-        F.col("root_column_name"),
-        F.concat_ws("|", F.lit(ROOT_FULL_NAME), F.col("root_column_name")).alias("root_node_key"),
-
-        F.lit("ROOT").alias("direction"),
-        F.lit(0).cast("int").alias("hop_count"),
-
-        F.lit(ROOT_FULL_NAME).alias("reached_table_full_name"),
-        F.lit(ROOT_SCHEMA).alias("reached_table_schema"),
-        F.lit(ROOT_NAME).alias("reached_table_name"),
-        F.col("root_column_name").alias("reached_column_name"),
-        F.lit("TABLE").alias("reached_type"),
-        F.concat_ws("|", F.lit(ROOT_FULL_NAME), F.col("root_column_name")).alias("reached_node_key"),
-
-        F.lit(None).cast("string").alias("adjacent_table_full_name"),
-        F.lit(None).cast("string").alias("adjacent_table_schema"),
-        F.lit(None).cast("string").alias("adjacent_table_name"),
-        F.lit(None).cast("string").alias("adjacent_column_name"),
-        F.lit(None).cast("string").alias("adjacent_type"),
-        F.lit(None).cast("string").alias("adjacent_node_key"),
-
-        F.lit(None).cast("string").alias("edge_source_table_full_name"),
-        F.lit(None).cast("string").alias("edge_source_table_schema"),
-        F.lit(None).cast("string").alias("edge_source_table_name"),
-        F.lit(None).cast("string").alias("edge_source_column_name"),
-        F.lit(None).cast("string").alias("edge_source_type"),
-
-        F.lit(None).cast("string").alias("edge_target_table_full_name"),
-        F.lit(None).cast("string").alias("edge_target_table_schema"),
-        F.lit(None).cast("string").alias("edge_target_table_name"),
-        F.lit(None).cast("string").alias("edge_target_column_name"),
-        F.lit(None).cast("string").alias("edge_target_type"),
-
-        F.lit(None).cast("string").alias("version_event_id"),
-        F.lit(None).cast("timestamp").alias("version_event_time"),
-        F.lit(None).cast("timestamp").alias("version_valid_from_ts"),
-        F.lit(None).cast("timestamp").alias("version_valid_to_ts"),
-        F.lit(None).cast("int").alias("version_number"),
-        F.lit(None).cast("boolean").alias("version_is_current"),
-        F.lit(None).cast("int").alias("version_source_edge_count"),
-        F.lit(None).cast("boolean").alias("version_has_source_lineage"),
-        F.lit(None).cast("boolean").alias("possible_staleness_due_to_later_table_write"),
-        F.lit(None).cast("string").alias("version_created_by"),
-        F.lit(None).cast("string").alias("version_entity_type"),
-        F.lit(None).cast("string").alias("version_entity_id"),
-        F.lit(None).cast("string").alias("version_entity_run_id"),
-
-        F.concat(F.lit(ROOT_FULL_NAME), F.lit("."), F.col("root_column_name")).alias("path_from_root"),
-        F.lit(None).cast("boolean").alias("is_terminal"),
-        F.lit(None).cast("string").alias("terminal_reason"),
-        F.current_timestamp().alias("generated_at"),
-    )
-
-
-# ------------------------------------------------------------
-# 5) Table traversal
-# Stores shortest path to each reachable table node.
-# Full current graph is still preserved separately in table_current_edges_df.
-# ------------------------------------------------------------
-EMPTY_TABLE_PATHS_SCHEMA_DF = build_root_table_row().limit(0)
-
-def traverse_table_direction(current_edges_df, direction: str):
-    frontier = spark.createDataFrame(
-        [(ROOT_FULL_NAME, ROOT_SCHEMA, ROOT_NAME, "TABLE", 0, ROOT_FULL_NAME)],
-        ["current_table_full_name", "current_table_schema", "current_table_name", "current_type", "hop_count", "path_from_root"]
-    )
-
-    visited = frontier.select(F.col("current_table_full_name").alias("visited_node")).dropDuplicates()
-    results = None
-    iteration = 0
-
-    if direction == "UPSTREAM":
-        expandable_nodes = current_edges_df.select(F.col("target_table_full_name").alias("expandable_node")).dropDuplicates().cache()
-    else:
-        expandable_nodes = current_edges_df.select(F.col("source_table_full_name").alias("expandable_node")).dropDuplicates().cache()
-
-    _ = expandable_nodes.count()
-
-    while df_has_rows(frontier):
-        iteration += 1
-
-        if direction == "UPSTREAM":
-            step = (
-                F.broadcast(frontier).alias("f")
-                .join(
-                    current_edges_df.alias("e"),
-                    F.col("f.current_table_full_name") == F.col("e.target_table_full_name"),
-                    "inner"
-                )
-                .select(
-                    F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
-                    F.lit(ROOT_SCHEMA).alias("root_table_schema"),
-                    F.lit(ROOT_NAME).alias("root_table_name"),
-
-                    F.lit("UPSTREAM").alias("direction"),
-                    (F.col("f.hop_count") + F.lit(1)).alias("hop_count"),
-
-                    F.col("e.source_table_full_name").alias("reached_table_full_name"),
-                    F.col("e.source_table_schema").alias("reached_table_schema"),
-                    F.col("e.source_table_name").alias("reached_table_name"),
-                    F.col("e.source_type").alias("reached_type"),
-
-                    F.col("f.current_table_full_name").alias("adjacent_table_full_name"),
-                    F.col("f.current_table_schema").alias("adjacent_table_schema"),
-                    F.col("f.current_table_name").alias("adjacent_table_name"),
-                    F.col("f.current_type").alias("adjacent_type"),
-
-                    F.col("e.source_table_full_name").alias("edge_source_table_full_name"),
-                    F.col("e.source_table_schema").alias("edge_source_table_schema"),
-                    F.col("e.source_table_name").alias("edge_source_table_name"),
-                    F.col("e.source_type").alias("edge_source_type"),
-
-                    F.col("e.target_table_full_name").alias("edge_target_table_full_name"),
-                    F.col("e.target_table_schema").alias("edge_target_table_schema"),
-                    F.col("e.target_table_name").alias("edge_target_table_name"),
-                    F.col("e.target_type").alias("edge_target_type"),
-
-                    F.col("e.version_event_id"),
-                    F.col("e.version_event_time"),
-                    F.col("e.version_valid_from_ts"),
-                    F.col("e.version_valid_to_ts"),
-                    F.col("e.version_number"),
-                    F.col("e.version_is_current"),
-                    F.col("e.version_source_edge_count"),
-                    F.col("e.version_has_source_lineage"),
-                    F.col("e.version_created_by"),
-                    F.col("e.version_entity_type"),
-                    F.col("e.version_entity_id"),
-                    F.col("e.version_entity_run_id"),
-
-                    F.concat(F.col("f.path_from_root"), F.lit(" <- "), F.col("e.source_table_full_name")).alias("path_from_root"),
-                )
-            )
-        else:
-            step = (
-                F.broadcast(frontier).alias("f")
-                .join(
-                    current_edges_df.alias("e"),
-                    F.col("f.current_table_full_name") == F.col("e.source_table_full_name"),
-                    "inner"
-                )
-                .select(
-                    F.lit(ROOT_FULL_NAME).alias("root_table_full_name"),
-                    F.lit(ROOT_SCHEMA).alias("root_table_schema"),
-                    F.lit(ROOT_NAME).alias("root_table_name"),
-
-                    F.lit("DOWNSTREAM").alias("direction"),
-                    (F.col("f.hop_count") + F.lit(1)).alias("hop_count"),
-
-                    F.col("e.target_table_full_name").alias("reached_table_full_name"),
-                    F.col("e.target_table_schema").alias("reached_table_schema"),
-                    F.col("e.target_table_name").alias("reached_table_name"),
-                    F.col("e.target_type").alias("reached_type"),
-
-                    F.col("f.current_table_full_name").alias("adjacent_table_full_name"),
-                    F.col("f.current_table_schema").alias("adjacent_table_schema"),
-                    F.col("f.current_table_name").alias("adjacent_table_name"),
-                    F.col("f.current_type").alias("adjacent_type"),
-
-                    F.col("e.source_table_full_name").alias("edge_source_table_full_name"),
-                    F.col("e.source_table_schema").alias("edge_source_table_schema"),
-                    F.col("e.source_table_name").alias("edge_source_table_name"),
-                    F.col("e.source_type").alias("edge_source_type"),
-
-                    F.col("e.target_table_full_name").alias("edge_target_table_full_name"),
-                    F.col("e.target_table_schema").alias("edge_target_table_schema"),
-                    F.col("e.target_table_name").alias("edge_target_table_name"),
-                    F.col("e.target_type").alias("edge_target_type"),
-
-                    F.col("e.version_event_id"),
-                    F.col("e.version_event_time"),
-                    F.col("e.version_valid_from_ts"),
-                    F.col("e.version_valid_to_ts"),
-                    F.col("e.version_number"),
-                    F.col("e.version_is_current"),
-                    F.col("e.version_source_edge_count"),
-                    F.col("e.version_has_source_lineage"),
-                    F.col("e.version_created_by"),
-                    F.col("e.version_entity_type"),
-                    F.col("e.version_entity_id"),
-                    F.col("e.version_entity_run_id"),
-
-                    F.concat(F.col("f.path_from_root"), F.lit(" -> "), F.col("e.target_table_full_name")).alias("path_from_root"),
-                )
-            )
-
-        if not df_has_rows(step):
-            break
-
-        step_rank_w = (
-            W.partitionBy("reached_table_full_name")
-             .orderBy(
-                 F.col("hop_count").asc(),
-                 F.col("adjacent_table_full_name").asc(),
-                 F.col("version_event_time").desc(),
-                 F.col("edge_source_table_full_name").asc(),
-                 F.col("edge_target_table_full_name").asc(),
-             )
-        )
-
-        step = (
-            step.withColumn("candidate_rank", F.row_number().over(step_rank_w))
-                .filter(F.col("candidate_rank") == 1)
-                .drop("candidate_rank")
-        )
-
-        new_step = (
-            step.alias("s")
-            .join(
-                visited.alias("v"),
-                F.col("s.reached_table_full_name") == F.col("v.visited_node"),
-                "leftanti"
-            )
-        )
-
-        if not df_has_rows(new_step):
-            break
-
-        results = new_step if results is None else results.unionByName(new_step)
-
-        frontier = (
-            new_step.select(
-                F.col("reached_table_full_name").alias("current_table_full_name"),
-                F.col("reached_table_schema").alias("current_table_schema"),
-                F.col("reached_table_name").alias("current_table_name"),
-                F.col("reached_type").alias("current_type"),
-                "hop_count",
-                "path_from_root",
-            )
-            .dropDuplicates(["current_table_full_name"])
-        )
-
-        visited = (
-            visited.unionByName(
-                frontier.select(F.col("current_table_full_name").alias("visited_node"))
-            )
-            .dropDuplicates(["visited_node"])
-        )
-
-        if iteration % 5 == 0:
-            frontier = frontier.localCheckpoint(eager=True)
-            visited = visited.localCheckpoint(eager=True)
-            if results is not None:
-                results = results.localCheckpoint(eager=True)
-
-    if results is None:
-        return EMPTY_TABLE_PATHS_SCHEMA_DF
-
-    terminal_reason = "NO_CURRENT_UPSTREAM_EDGE" if direction == "UPSTREAM" else "NO_CURRENT_DOWNSTREAM_EDGE"
-
-    results = (
-        results.alias("r")
-        .join(
-            expandable_nodes.alias("x"),
-            F.col("r.reached_table_full_name") == F.col("x.expandable_node"),
-            "left"
-        )
-        .withColumn("is_terminal", F.col("x.expandable_node").isNull())
-        .withColumn(
-            "terminal_reason",
-            F.when(F.col("x.expandable_node").isNull(), F.lit(terminal_reason)).otherwise(F.lit(None).cast("string"))
-        )
-        .drop("expandable_node")
-        .withColumn("generated_at", F.current_timestamp())
-    )
-
-    return results
-
-table_root_row_df = build_root_table_row()
-table_upstream_paths_df = traverse_table_direction(table_current_edges_df, "UPSTREAM")
-table_downstream_paths_df = traverse_table_direction(table_current_edges_df, "DOWNSTREAM")
-
-table_paths_df = (
-    table_root_row_df
-    .unionByName(table_upstream_paths_df)
-    .unionByName(table_downstream_paths_df)
-)
-
-replace_root_slice(
-    table_paths_df,
-    TABLE_PATHS_TARGET,
-    root_field="root_table_full_name",
-    root_value=ROOT_FULL_NAME
-)
-
-
-# ------------------------------------------------------------
-# 6) Column traversal
-# Stores shortest path to each reachable column node per root column.
-# Full current graph is still preserved separately in column_current_edges_df.
-# ------------------------------------------------------------
-root_column_rows_df = build_root_column_rows()
-EMPTY_COLUMN_PATHS_SCHEMA_DF = root_column_rows_df.limit(0)
-
-anchor_columns_df = (
-    root_column_rows_df
-    .select(
-        "root_table_full_name",
-        "root_table_schema",
-        "root_table_name",
-        "root_column_name",
-        "root_node_key"
-    )
-    .cache()
-)
-
-_ = anchor_columns_df.count()
-
-def traverse_column_direction(current_edges_df, anchor_df, direction: str):
-    if not df_has_rows(anchor_df):
-        return EMPTY_COLUMN_PATHS_SCHEMA_DF
-
-    frontier = (
-        anchor_df.select(
-            "root_table_full_name",
-            "root_table_schema",
-            "root_table_name",
-            "root_column_name",
-            "root_node_key",
-            F.lit(ROOT_FULL_NAME).alias("current_table_full_name"),
-            F.lit(ROOT_SCHEMA).alias("current_table_schema"),
-            F.lit(ROOT_NAME).alias("current_table_name"),
-            F.col("root_column_name").alias("current_column_name"),
-            F.col("root_node_key").alias("current_node_key"),
-            F.lit("TABLE").alias("current_type"),
-            F.lit(0).alias("hop_count"),
-            F.concat(F.lit(ROOT_FULL_NAME), F.lit("."), F.col("root_column_name")).alias("path_from_root"),
-        )
-    )
-
-    visited = (
-        frontier.select("root_node_key", F.col("current_node_key").alias("visited_node_key"))
-        .dropDuplicates(["root_node_key", "visited_node_key"])
-    )
-
-    results = None
-    iteration = 0
-
-    if direction == "UPSTREAM":
-        expandable_nodes = current_edges_df.select(F.col("target_node_key").alias("expandable_node_key")).dropDuplicates().cache()
-    else:
-        expandable_nodes = current_edges_df.select(F.col("source_node_key").alias("expandable_node_key")).dropDuplicates().cache()
-
-    _ = expandable_nodes.count()
-
-    while df_has_rows(frontier):
-        iteration += 1
-
-        if direction == "UPSTREAM":
-            step = (
-                F.broadcast(frontier).alias("f")
-                .join(
-                    current_edges_df.alias("e"),
-                    F.col("f.current_node_key") == F.col("e.target_node_key"),
-                    "inner"
-                )
-                .select(
-                    "f.root_table_full_name",
-                    "f.root_table_schema",
-                    "f.root_table_name",
-                    "f.root_column_name",
-                    "f.root_node_key",
-
-                    F.lit("UPSTREAM").alias("direction"),
-                    (F.col("f.hop_count") + F.lit(1)).alias("hop_count"),
-
-                    F.col("e.source_table_full_name").alias("reached_table_full_name"),
-                    F.col("e.source_table_schema").alias("reached_table_schema"),
-                    F.col("e.source_table_name").alias("reached_table_name"),
-                    F.col("e.source_column_name").alias("reached_column_name"),
-                    F.col("e.source_type").alias("reached_type"),
-                    F.col("e.source_node_key").alias("reached_node_key"),
-
-                    F.col("f.current_table_full_name").alias("adjacent_table_full_name"),
-                    F.col("f.current_table_schema").alias("adjacent_table_schema"),
-                    F.col("f.current_table_name").alias("adjacent_table_name"),
-                    F.col("f.current_column_name").alias("adjacent_column_name"),
-                    F.col("f.current_type").alias("adjacent_type"),
-                    F.col("f.current_node_key").alias("adjacent_node_key"),
-
-                    F.col("e.source_table_full_name").alias("edge_source_table_full_name"),
-                    F.col("e.source_table_schema").alias("edge_source_table_schema"),
-                    F.col("e.source_table_name").alias("edge_source_table_name"),
-                    F.col("e.source_column_name").alias("edge_source_column_name"),
-                    F.col("e.source_type").alias("edge_source_type"),
-
-                    F.col("e.target_table_full_name").alias("edge_target_table_full_name"),
-                    F.col("e.target_table_schema").alias("edge_target_table_schema"),
-                    F.col("e.target_table_name").alias("edge_target_table_name"),
-                    F.col("e.target_column_name").alias("edge_target_column_name"),
-                    F.col("e.target_type").alias("edge_target_type"),
-
-                    F.col("e.version_event_id"),
-                    F.col("e.version_event_time"),
-                    F.col("e.version_valid_from_ts"),
-                    F.col("e.version_valid_to_ts"),
-                    F.col("e.version_number"),
-                    F.col("e.version_is_current"),
-                    F.col("e.version_source_edge_count"),
-                    F.col("e.version_has_source_lineage"),
-                    F.col("e.possible_staleness_due_to_later_table_write"),
-                    F.col("e.version_created_by"),
-                    F.col("e.version_entity_type"),
-                    F.col("e.version_entity_id"),
-                    F.col("e.version_entity_run_id"),
-
-                    F.concat(
-                        F.col("f.path_from_root"),
-                        F.lit(" <- "),
-                        F.col("e.source_table_full_name"),
-                        F.lit("."),
-                        F.col("e.source_column_name")
-                    ).alias("path_from_root"),
-                )
-            )
-        else:
-            step = (
-                F.broadcast(frontier).alias("f")
-                .join(
-                    current_edges_df.alias("e"),
-                    F.col("f.current_node_key") == F.col("e.source_node_key"),
-                    "inner"
-                )
-                .select(
-                    "f.root_table_full_name",
-                    "f.root_table_schema",
-                    "f.root_table_name",
-                    "f.root_column_name",
-                    "f.root_node_key",
-
-                    F.lit("DOWNSTREAM").alias("direction"),
-                    (F.col("f.hop_count") + F.lit(1)).alias("hop_count"),
-
-                    F.col("e.target_table_full_name").alias("reached_table_full_name"),
-                    F.col("e.target_table_schema").alias("reached_table_schema"),
-                    F.col("e.target_table_name").alias("reached_table_name"),
-                    F.col("e.target_column_name").alias("reached_column_name"),
-                    F.col("e.target_type").alias("reached_type"),
-                    F.col("e.target_node_key").alias("reached_node_key"),
-
-                    F.col("f.current_table_full_name").alias("adjacent_table_full_name"),
-                    F.col("f.current_table_schema").alias("adjacent_table_schema"),
-                    F.col("f.current_table_name").alias("adjacent_table_name"),
-                    F.col("f.current_column_name").alias("adjacent_column_name"),
-                    F.col("f.current_type").alias("adjacent_type"),
-                    F.col("f.current_node_key").alias("adjacent_node_key"),
-
-                    F.col("e.source_table_full_name").alias("edge_source_table_full_name"),
-                    F.col("e.source_table_schema").alias("edge_source_table_schema"),
-                    F.col("e.source_table_name").alias("edge_source_table_name"),
-                    F.col("e.source_column_name").alias("edge_source_column_name"),
-                    F.col("e.source_type").alias("edge_source_type"),
-
-                    F.col("e.target_table_full_name").alias("edge_target_table_full_name"),
-                    F.col("e.target_table_schema").alias("edge_target_table_schema"),
-                    F.col("e.target_table_name").alias("edge_target_table_name"),
-                    F.col("e.target_column_name").alias("edge_target_column_name"),
-                    F.col("e.target_type").alias("edge_target_type"),
-
-                    F.col("e.version_event_id"),
-                    F.col("e.version_event_time"),
-                    F.col("e.version_valid_from_ts"),
-                    F.col("e.version_valid_to_ts"),
-                    F.col("e.version_number"),
-                    F.col("e.version_is_current"),
-                    F.col("e.version_source_edge_count"),
-                    F.col("e.version_has_source_lineage"),
-                    F.col("e.possible_staleness_due_to_later_table_write"),
-                    F.col("e.version_created_by"),
-                    F.col("e.version_entity_type"),
-                    F.col("e.version_entity_id"),
-                    F.col("e.version_entity_run_id"),
-
-                    F.concat(
-                        F.col("f.path_from_root"),
-                        F.lit(" -> "),
-                        F.col("e.target_table_full_name"),
-                        F.lit("."),
-                        F.col("e.target_column_name")
-                    ).alias("path_from_root"),
-                )
-            )
-
-        if not df_has_rows(step):
-            break
-
-        step_rank_w = (
-            W.partitionBy("root_node_key", "reached_node_key")
-             .orderBy(
-                 F.col("hop_count").asc(),
-                 F.col("adjacent_table_full_name").asc(),
-                 F.col("adjacent_column_name").asc(),
-                 F.col("version_event_time").desc(),
-                 F.col("edge_source_table_full_name").asc(),
-                 F.col("edge_source_column_name").asc(),
-             )
-        )
-
-        step = (
-            step.withColumn("candidate_rank", F.row_number().over(step_rank_w))
-                .filter(F.col("candidate_rank") == 1)
-                .drop("candidate_rank")
-        )
-
-        new_step = (
-            step.alias("s")
-            .join(
-                visited.alias("v"),
-                (F.col("s.root_node_key") == F.col("v.root_node_key")) &
-                (F.col("s.reached_node_key") == F.col("v.visited_node_key")),
-                "leftanti"
-            )
-        )
-
-        if not df_has_rows(new_step):
-            break
-
-        results = new_step if results is None else results.unionByName(new_step)
-
-        frontier = (
-            new_step.select(
-                "root_table_full_name",
-                "root_table_schema",
-                "root_table_name",
-                "root_column_name",
-                "root_node_key",
-                F.col("reached_table_full_name").alias("current_table_full_name"),
-                F.col("reached_table_schema").alias("current_table_schema"),
-                F.col("reached_table_name").alias("current_table_name"),
-                F.col("reached_column_name").alias("current_column_name"),
-                F.col("reached_node_key").alias("current_node_key"),
-                F.col("reached_type").alias("current_type"),
-                "hop_count",
-                "path_from_root",
-            )
-            .dropDuplicates(["root_node_key", "current_node_key"])
-        )
-
-        visited = (
-            visited.unionByName(
-                frontier.select("root_node_key", F.col("current_node_key").alias("visited_node_key"))
-            )
-            .dropDuplicates(["root_node_key", "visited_node_key"])
-        )
-
-        if iteration % 5 == 0:
-            frontier = frontier.localCheckpoint(eager=True)
-            visited = visited.localCheckpoint(eager=True)
-            if results is not None:
-                results = results.localCheckpoint(eager=True)
-
-    if results is None:
-        return EMPTY_COLUMN_PATHS_SCHEMA_DF
-
-    terminal_reason = "NO_CURRENT_UPSTREAM_EDGE" if direction == "UPSTREAM" else "NO_CURRENT_DOWNSTREAM_EDGE"
-
-    results = (
-        results.alias("r")
-        .join(
-            expandable_nodes.alias("x"),
-            F.col("r.reached_node_key") == F.col("x.expandable_node_key"),
-            "left"
-        )
-        .withColumn("is_terminal", F.col("x.expandable_node_key").isNull())
-        .withColumn(
-            "terminal_reason",
-            F.when(F.col("x.expandable_node_key").isNull(), F.lit(terminal_reason)).otherwise(F.lit(None).cast("string"))
-        )
-        .drop("expandable_node_key")
-        .withColumn("generated_at", F.current_timestamp())
-    )
-
-    return results
-
-column_upstream_paths_df = traverse_column_direction(column_current_edges_df, anchor_columns_df, "UPSTREAM")
-column_downstream_paths_df = traverse_column_direction(column_current_edges_df, anchor_columns_df, "DOWNSTREAM")
-
-column_paths_df = (
-    root_column_rows_df
-    .unionByName(column_upstream_paths_df)
-    .unionByName(column_downstream_paths_df)
-)
-
-replace_root_slice(
-    column_paths_df,
-    COLUMN_PATHS_TARGET,
-    root_field="root_table_full_name",
-    root_value=ROOT_FULL_NAME
-)
-
-
-# ------------------------------------------------------------
-# 7) Quick summary
-# ------------------------------------------------------------
-print("Root table:", ROOT_FULL_NAME)
-print("Table history target:       ", qualify_name(TABLE_HISTORY_TARGET))
-print("Column history target:      ", qualify_name(COLUMN_HISTORY_TARGET))
-print("Table versions target:      ", qualify_name(TABLE_VERSIONS_TARGET))
-print("Column versions target:     ", qualify_name(COLUMN_VERSIONS_TARGET))
-print("Table current edges target: ", qualify_name(TABLE_CURRENT_EDGES_TARGET))
-print("Column current edges target:", qualify_name(COLUMN_CURRENT_EDGES_TARGET))
-print("Table paths target:         ", qualify_name(TABLE_PATHS_TARGET))
-print("Column paths target:        ", qualify_name(COLUMN_PATHS_TARGET))
-
-print("table_history rows:", table_history_df.count())
-print("column_history rows:", column_history_df.count())
-print("table_current_edges rows:", table_current_edges_df.count())
-print("column_current_edges rows:", column_current_edges_df.count())
-
-display(
-    spark.table(qualify_name(TABLE_PATHS_TARGET))
-         .filter(F.col("root_table_full_name") == ROOT_FULL_NAME)
-         .orderBy("direction", "hop_count", "path_from_root")
-)
-
-display(
-    spark.table(qualify_name(COLUMN_PATHS_TARGET))
-         .filter(F.col("root_table_full_name") == ROOT_FULL_NAME)
-         .orderBy("root_column_name", "direction", "hop_count", "path_from_root")
-)
+print("Documentation-aligned capability expectations:")
+show_df(capability_summary_df, 20)
+
+print("\nTable access summary:")
+show_df(table_probe_summary_df.orderBy("requirement_level", "table_name"), 100)
+
+print("\nTest execution summary:")
+show_df(test_summary_df.orderBy("category", "test_name"), 200)
+
+# Short plaintext recap
+try:
+    test_summary_rows = [r.asDict() for r in test_summary_df.collect()]
+except Exception:
+    test_summary_rows = []
+
+def _status_for(name_substring):
+    matched = [r for r in test_summary_rows if name_substring.lower() in (r.get("test_name") or "").lower()]
+    if not matched:
+        return "NOT_RUN"
+    # Prefer PASS over NO_ROWS over ERROR over SKIPPED
+    status_rank = {"PASS": 4, "NO_ROWS": 3, "ERROR": 2, "SKIPPED": 1}
+    best = sorted(matched, key=lambda x: status_rank.get(x.get("status"), 0), reverse=True)[0]
+    return best.get("status")
+
+print("\nPlain-English recap:")
+print(f"  - Serverless notebooks precise test: {_status_for('serverless notebook')}")
+print(f"  - Serverless jobs precise test: {_status_for('serverless job runs')}")
+print(f"  - Jobs compute precise test: {_status_for('ephemeral job clusters')}")
+print(f"  - All-purpose cluster-level test: {_status_for('all-purpose compute DBU at cluster level')}")
+print(f"  - Jobs on all-purpose identification test: {_status_for('Identify jobs that ran on all-purpose compute')}")
+print(f"  - Jobs on all-purpose approximate allocation test: {_status_for('Approximate DBU allocation for jobs on all-purpose compute')}")
+print(f"  - SUBMIT_RUN coverage test: {_status_for('SUBMIT_RUN')}")
+print(f"  - WORKFLOW_RUN coverage test: {_status_for('WORKFLOW_RUN')}")
+print("")
+print("Interpretation guidance:")
+print("  - PASS means the notebook found evidence in your data window.")
+print("  - NO_ROWS means the logic ran correctly, but there was no matching data in the window.")
+print("  - SKIPPED means required system tables were inaccessible or unavailable.")
+print("  - ERROR means the logic needs investigation (usually permissions, enablement, or schema drift).")
+print("")
+print("Dollar translation guidance:")
+print("  - list_cost_usd is based on system list prices when system.billing.list_prices is readable.")
+print("  - If list prices are blocked, only SKUs in manual_price_overrides_json can be translated to dollars.")
+print("  - If you have private pricing/discounts/commitments, treat list_cost_usd as a list-price estimate unless you replace prices manually.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 9) Suggested next steps
+# MAGIC
+# MAGIC - If `system.billing.usage` is blocked, ask admins for `USE` + `SELECT` on the relevant `system` schemas.
+# MAGIC - If `system.billing.list_prices` is blocked, either request access or supply manual price overrides.
+# MAGIC - If `system.lakeflow.job_task_run_timeline` or `system.compute.clusters` is blocked, the notebook can still do direct job/serverless billing tests, but it will not be able to identify or approximate jobs on all-purpose clusters well.
+# MAGIC - If you want, you can promote the successful queries from this notebook into a dashboard or recurring job once you see which tests pass.
