@@ -1,25 +1,335 @@
-SELECT
-  COUNT(DISTINCT source_table_full_name) AS direct_upstream_tables_7d,
-  COLLECT_SET(source_table_full_name) AS upstream_tables_7d
-FROM information_schema.table_lineage
-WHERE target_table_full_name = 'eciscor_prod.npdataset.npd_current_pending'
-  AND source_table_full_name IS NOT NULL
-  AND target_table_full_name IS NOT NULL
-  AND event_time >= current_timestamp() - INTERVAL 7 DAYS
-  AND event_time <= current_timestamp();
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField, StringType, ArrayType, TimestampType, LongType
+)
+from functools import reduce
+from datetime import timedelta
 
+# ============================================================
+# REQUIRED PARAMETERS
+# ============================================================
+root_table_full_name = "eciscor_prod.npdataset.npd_current_pending"
+
+# OPTIONAL SAFETY SETTINGS
+max_hops = 15
+max_rows_per_hop = 250000
+max_total_rows = 3000000
+
+# ============================================================
+# FIXED 7-DAY WINDOW
+# ============================================================
+window_end = spark.sql("SELECT current_timestamp() AS ts").first()["ts"]
+window_start = window_end - timedelta(days=7)
+
+print(f"Root table: {root_table_full_name}")
+print(f"Window start: {window_start}")
+print(f"Window end:   {window_end}")
+print(f"Max hops: {max_hops}")
+print(f"Max rows per hop: {max_rows_per_hop:,}")
+print(f"Max total rows: {max_total_rows:,}")
+
+# ============================================================
+# 1. BUILD A 7-DAY TABLE-TO-TABLE EDGE GRAPH
+#    One row per source->target edge in the last 7 days
+# ============================================================
+edges_7d = spark.sql(f"""
 SELECT
   source_table_full_name,
   source_type,
+  target_table_full_name,
+  target_type,
+  MAX(event_time) AS latest_seen_time,
   COUNT(DISTINCT event_id) AS events_seen_7d,
-  MAX(event_time) AS latest_seen_time_7d
+  COLLECT_SET(COALESCE(created_by, 'UNKNOWN')) AS creators,
+  COLLECT_SET(COALESCE(entity_type, 'UNKNOWN')) AS entity_types
 FROM information_schema.table_lineage
-WHERE target_table_full_name = 'eciscor_prod.npdataset.npd_current_pending'
-  AND source_table_full_name IS NOT NULL
+WHERE source_table_full_name IS NOT NULL
   AND target_table_full_name IS NOT NULL
-  AND event_time >= current_timestamp() - INTERVAL 7 DAYS
-  AND event_time <= current_timestamp()
+  AND source_table_full_name <> target_table_full_name
+  AND event_time >= TIMESTAMP('{window_start}')
+  AND event_time <= TIMESTAMP('{window_end}')
 GROUP BY
   source_table_full_name,
-  source_type
-ORDER BY latest_seen_time_7d DESC, source_table_full_name;
+  source_type,
+  target_table_full_name,
+  target_type
+""").cache()
+
+edges_7d.createOrReplaceTempView("edges_7d")
+
+print(f"7-day table-to-table edges: {edges_7d.count():,}")
+
+# Sanity check for direct upstream of the root in the 7-day window
+root_upstream_7d = spark.sql(f"""
+SELECT
+  source_table_full_name,
+  source_type,
+  latest_seen_time,
+  events_seen_7d
+FROM edges_7d
+WHERE target_table_full_name = '{root_table_full_name}'
+ORDER BY latest_seen_time DESC, source_table_full_name
+""").cache()
+
+root_upstream_7d.createOrReplaceTempView("root_upstream_7d")
+
+print(f"Direct upstream tables for root in 7 days: {root_upstream_7d.count():,}")
+
+# ============================================================
+# 2. TRAVERSAL SCHEMA
+#    Keep path rows for recursion, then summarize unique objects
+# ============================================================
+schema = StructType([
+    StructField("reached_table_full_name", StringType(), True),
+    StructField("reached_type", StringType(), True),
+    StructField("from_table", StringType(), True),
+    StructField("from_type", StringType(), True),
+    StructField("path_tables", ArrayType(StringType()), True),
+    StructField("visited", ArrayType(StringType()), True),
+    StructField("edge_latest_seen_time", TimestampType(), True),
+    StructField("edge_events_seen_7d", LongType(), True),
+])
+
+def seed_frontier():
+    return spark.createDataFrame(
+        [(
+            root_table_full_name,         # reached_table_full_name
+            "ROOT",                       # reached_type
+            None,                         # from_table
+            None,                         # from_type
+            [root_table_full_name],       # path_tables
+            [root_table_full_name],       # visited
+            None,                         # edge_latest_seen_time
+            None                          # edge_events_seen_7d
+        )],
+        schema=schema
+    ).cache()
+
+# ============================================================
+# 3. GENERIC BFS OVER THE 7-DAY EDGE GRAPH
+# ============================================================
+def compute_direction(direction: str):
+    current = seed_frontier()
+    levels = []
+    level = 0
+    total_rows = 0
+
+    while level <= max_hops:
+        current_count = current.count()
+        current_objects = current.select("reached_table_full_name").distinct().count()
+
+        print(
+            f"{direction} hop {level}: "
+            f"{current_count:,} path rows, "
+            f"{current_objects:,} distinct objects"
+        )
+
+        if current_count == 0:
+            current.unpersist()
+            break
+
+        total_rows += current_count
+        if current_count > max_rows_per_hop:
+            current.unpersist()
+            raise ValueError(
+                f"{direction} hop {level} produced {current_count:,} rows, "
+                f"exceeding max_rows_per_hop={max_rows_per_hop:,}"
+            )
+
+        if total_rows > max_total_rows:
+            current.unpersist()
+            raise ValueError(
+                f"{direction} cumulative rows reached {total_rows:,}, "
+                f"exceeding max_total_rows={max_total_rows:,}"
+            )
+
+        levels.append(
+            current.withColumn("hop_count", F.lit(level))
+                   .withColumn("direction", F.lit(direction))
+        )
+
+        if level == max_hops:
+            current.unpersist()
+            break
+
+        if direction == "UPSTREAM":
+            next_df = (
+                current.alias("cur")
+                .join(
+                    edges_7d.alias("e"),
+                    F.col("cur.reached_table_full_name") == F.col("e.target_table_full_name"),
+                    "inner"
+                )
+                .filter(~F.array_contains(F.col("cur.visited"), F.col("e.source_table_full_name")))
+                .select(
+                    F.col("e.source_table_full_name").alias("reached_table_full_name"),
+                    F.col("e.source_type").alias("reached_type"),
+                    F.col("cur.reached_table_full_name").alias("from_table"),
+                    F.col("cur.reached_type").alias("from_type"),
+                    F.array_append(F.col("cur.path_tables"), F.col("e.source_table_full_name")).alias("path_tables"),
+                    F.array_append(F.col("cur.visited"), F.col("e.source_table_full_name")).alias("visited"),
+                    F.col("e.latest_seen_time").alias("edge_latest_seen_time"),
+                    F.col("e.events_seen_7d").cast("long").alias("edge_events_seen_7d")
+                )
+            )
+        else:
+            next_df = (
+                current.alias("cur")
+                .join(
+                    edges_7d.alias("e"),
+                    F.col("cur.reached_table_full_name") == F.col("e.source_table_full_name"),
+                    "inner"
+                )
+                .filter(~F.array_contains(F.col("cur.visited"), F.col("e.target_table_full_name")))
+                .select(
+                    F.col("e.target_table_full_name").alias("reached_table_full_name"),
+                    F.col("e.target_type").alias("reached_type"),
+                    F.col("cur.reached_table_full_name").alias("from_table"),
+                    F.col("cur.reached_type").alias("from_type"),
+                    F.array_append(F.col("cur.path_tables"), F.col("e.target_table_full_name")).alias("path_tables"),
+                    F.array_append(F.col("cur.visited"), F.col("e.target_table_full_name")).alias("visited"),
+                    F.col("e.latest_seen_time").alias("edge_latest_seen_time"),
+                    F.col("e.events_seen_7d").cast("long").alias("edge_events_seen_7d")
+                )
+            )
+
+        # Keep unique paths for recursion
+        next_df = (
+            next_df
+            .withColumn("path_key", F.array_join(F.col("path_tables"), "||"))
+            .dropDuplicates(["path_key"])
+            .drop("path_key")
+            .cache()
+        )
+
+        old_current = current
+        current = next_df
+        old_current.unpersist()
+
+        level += 1
+
+    return levels
+
+# ============================================================
+# 4. RUN UPSTREAM + DOWNSTREAM
+# ============================================================
+print("\nComputing UPSTREAM...")
+upstream_levels = compute_direction("UPSTREAM")
+
+print("\nComputing DOWNSTREAM...")
+downstream_levels = compute_direction("DOWNSTREAM")
+
+all_levels = upstream_levels + downstream_levels
+if not all_levels:
+    raise ValueError("No lineage rows were produced.")
+
+lineage_final = reduce(
+    lambda a, b: a.unionByName(b, allowMissingColumns=True),
+    all_levels
+)
+
+lineage_final = lineage_final.withColumn(
+    "path_id",
+    F.sha2(
+        F.concat_ws(
+            "||",
+            F.col("direction"),
+            F.lit(root_table_full_name),
+            F.array_join(F.col("path_tables"), "||")
+        ),
+        256
+    )
+)
+
+lineage_final.createOrReplaceTempView("lineage_final")
+print(f"\n✅ lineage_final rows: {lineage_final.count():,}")
+
+# ============================================================
+# 5. OBJECTS BY HOP
+#    Main answer for unique objects at each hop
+# ============================================================
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW lineage_objects_by_hop AS
+SELECT
+  direction,
+  hop_count,
+  reached_table_full_name,
+  MAX(reached_type) AS reached_type,
+  MAX(edge_latest_seen_time) AS latest_seen_time_to_child,
+  COUNT(DISTINCT from_table) AS downstream_objects_reached_from_here_at_this_hop,
+  COUNT(*) AS path_rows_for_object_at_hop
+FROM lineage_final
+GROUP BY
+  direction,
+  hop_count,
+  reached_table_full_name
+""")
+
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW lineage_hop_summary AS
+SELECT
+  direction,
+  hop_count,
+  COUNT(DISTINCT reached_table_full_name) AS distinct_objects_at_hop,
+  COUNT(*) AS path_rows_at_hop,
+  MAX(edge_latest_seen_time) AS latest_seen_time_any_object_at_hop,
+  ARRAY_SORT(COLLECT_SET(reached_table_full_name)) AS objects_at_hop
+FROM lineage_final
+GROUP BY
+  direction,
+  hop_count
+""")
+
+# ============================================================
+# 6. EDGES BY HOP
+#    Best for tracing parent/child links
+# ============================================================
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW lineage_edges_by_hop AS
+SELECT
+  direction,
+  hop_count,
+  from_table,
+  from_type,
+  reached_table_full_name AS to_table,
+  reached_type AS to_type,
+  MAX(edge_latest_seen_time) AS latest_seen_time,
+  MAX(edge_events_seen_7d) AS events_seen_7d,
+  COUNT(DISTINCT path_id) AS distinct_paths_through_edge
+FROM lineage_final
+WHERE hop_count > 0
+GROUP BY
+  direction,
+  hop_count,
+  from_table,
+  from_type,
+  reached_table_full_name,
+  reached_type
+""")
+
+# ============================================================
+# 7. OPTIONAL FULL PATHS
+# ============================================================
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW lineage_path_summary AS
+SELECT
+  direction,
+  path_id,
+  MAX(hop_count) AS max_hop_count,
+  MAX(edge_latest_seen_time) AS latest_seen_time_on_path,
+  path_tables
+FROM lineage_final
+GROUP BY
+  direction,
+  path_id,
+  path_tables
+""")
+
+print("\n✅ Created temp views:")
+print("  - edges_7d")
+print("  - root_upstream_7d")
+print("  - lineage_final")
+print("  - lineage_objects_by_hop")
+print("  - lineage_hop_summary")
+print("  - lineage_edges_by_hop")
+print("  - lineage_path_summary")
