@@ -1,3 +1,5 @@
+# Databricks notebook source
+
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from pyspark.sql.types import (
@@ -5,79 +7,135 @@ from pyspark.sql.types import (
 )
 from functools import reduce
 
-# -------------------------------
-# Parameters
-# -------------------------------
+# ============================================================
+# PARAMETERS
+# ============================================================
+# Example:
+# root_table_full_name = "eciscor_prod.npdataset.npd_current_pending"
+# as_of_date = None   # or "2026-04-01"
+
 max_hops = 30
 max_rows_per_hop = 200000
 max_total_path_rows = 2000000
 
-# -------------------------------
-# 1. Resolve root event time
-# -------------------------------
-as_of_filter = "TRUE" if as_of_date is None else f"event_time <= TIMESTAMP('{as_of_date} 23:59:59')"
+print(f"Root table: {root_table_full_name}")
+print(f"As-of date: {'latest' if as_of_date is None else as_of_date}")
+print(f"Max hops: {max_hops}")
+print(f"Max rows per hop: {max_rows_per_hop:,}")
+print(f"Max total path rows: {max_total_path_rows:,}")
 
-root_event_time_df = spark.sql(f"""
-  SELECT MAX(event_time) AS root_event_time
+# ============================================================
+# 1. RESOLVE ROOT EVENT TIME
+#    Pick the most recent lineage event for the root table
+#    on or before as_of_date (or latest if None)
+# ============================================================
+as_of_filter = (
+    "TRUE"
+    if as_of_date is None
+    else f"event_time <= TIMESTAMP('{as_of_date} 23:59:59')"
+)
+
+root_event_df = spark.sql(f"""
+WITH ranked_root AS (
+  SELECT
+    target_table_full_name,
+    target_type,
+    event_id,
+    event_time,
+    ROW_NUMBER() OVER (
+      PARTITION BY target_table_full_name
+      ORDER BY event_time DESC, event_id DESC
+    ) AS rn
   FROM information_schema.table_lineage
   WHERE target_table_full_name = '{root_table_full_name}'
     AND {as_of_filter}
+)
+SELECT
+  target_table_full_name,
+  target_type,
+  event_id,
+  event_time
+FROM ranked_root
+WHERE rn = 1
 """)
 
-root_row = root_event_time_df.first()
-if root_row is None or root_row["root_event_time"] is None:
+root_row = root_event_df.first()
+if root_row is None or root_row["event_time"] is None:
     raise ValueError(f"No lineage events found for root table {root_table_full_name}")
 
-root_event_time = root_row["root_event_time"]
+root_event_time = root_row["event_time"]
+root_type = root_row["target_type"] if root_row["target_type"] is not None else "ROOT"
+root_event_id = root_row["event_id"]
+
 print(f"Root event time used for both directions: {root_event_time}")
+print(f"Root event id: {root_event_id}")
+print(f"Root type: {root_type}")
 
-# -------------------------------
-# 2. Build one as-of edge snapshot
-#    One latest row per source->target pair
-# -------------------------------
-window = Window.partitionBy(
-    "source_table_full_name", "target_table_full_name"
-).orderBy(
-    F.col("event_time").desc(),
-    F.col("event_id").desc()
+# ============================================================
+# 2. BUILD EVENT-BASED EDGE SNAPSHOT
+#    For each target, keep ALL rows from its latest lineage event
+#    as of root_event_time
+# ============================================================
+edges = spark.sql(f"""
+WITH latest_target_event AS (
+  SELECT
+    target_table_full_name,
+    target_type,
+    event_id,
+    event_time,
+    ROW_NUMBER() OVER (
+      PARTITION BY target_table_full_name
+      ORDER BY event_time DESC, event_id DESC
+    ) AS rn
+  FROM information_schema.table_lineage
+  WHERE target_table_full_name IS NOT NULL
+    AND event_time <= TIMESTAMP('{root_event_time}')
+),
+target_snapshot AS (
+  SELECT
+    target_table_full_name,
+    target_type,
+    event_id,
+    event_time
+  FROM latest_target_event
+  WHERE rn = 1
 )
+SELECT
+  l.entity_type,
+  l.entity_id,
+  l.entity_run_id,
 
-edges = (
-    spark.sql(f"""
-      SELECT
-        entity_type,
-        entity_id,
-        entity_run_id,
-        source_table_full_name,
-        source_table_schema,
-        source_table_name,
-        source_type,
-        target_table_full_name,
-        target_table_schema,
-        target_table_name,
-        target_type,
-        created_by,
-        event_time,
-        event_id,
-        DATE(event_time) AS event_date
-      FROM information_schema.table_lineage
-      WHERE event_time <= TIMESTAMP('{root_event_time}')
-        AND source_table_full_name IS NOT NULL
-        AND target_table_full_name IS NOT NULL
-        AND source_table_full_name <> target_table_full_name
-    """)
-    .withColumn("rn", F.row_number().over(window))
-    .filter(F.col("rn") == 1)
-    .drop("rn")
-    .cache()
-)
+  l.source_table_full_name,
+  l.source_table_schema,
+  l.source_table_name,
+  l.source_type,
+
+  l.target_table_full_name,
+  l.target_table_schema,
+  l.target_table_name,
+  l.target_type,
+
+  l.created_by,
+  l.event_time,
+  l.event_id,
+  DATE(l.event_time) AS event_date
+FROM information_schema.table_lineage l
+INNER JOIN target_snapshot s
+  ON l.target_table_full_name = s.target_table_full_name
+ AND l.event_id = s.event_id
+WHERE l.source_table_full_name IS NOT NULL
+  AND l.target_table_full_name IS NOT NULL
+  AND l.source_table_full_name <> l.target_table_full_name
+""").cache()
 
 edge_count = edges.count()
-print(f"Edges after ranking: {edge_count:,} rows")
+print(f"Edges after target-event snapshot: {edge_count:,} rows")
 
-# -------------------------------
-# 3. Explicit traversal schema
-# -------------------------------
+edges.createOrReplaceTempView("edges_snapshot")
+
+# ============================================================
+# 3. EXPLICIT TRAVERSAL SCHEMA
+# ============================================================
 schema = StructType([
     StructField("reached_table_full_name", StringType(), True),
     StructField("reached_type", StringType(), True),
@@ -89,17 +147,18 @@ schema = StructType([
     StructField("entity_run_id", StringType(), True),
     StructField("event_time", TimestampType(), True),
     StructField("from_table", StringType(), True),
-    StructField("from_type", StringType(), True),
+    StructField("from_type", StringType(), True)
 ])
 
-# -------------------------------
-# 4. Iterative BFS
-# -------------------------------
+# ============================================================
+# 4. ITERATIVE BFS
+#    Produces path rows, but also prints distinct objects per hop
+# ============================================================
 def compute_direction(direction="UPSTREAM"):
     current = spark.createDataFrame(
         [(
             root_table_full_name,      # reached_table_full_name
-            "ROOT",                    # reached_type
+            root_type,                 # reached_type
             [root_table_full_name],    # path_tables
             [root_table_full_name],    # visited
             None,                      # created_by
@@ -128,15 +187,19 @@ def compute_direction(direction="UPSTREAM"):
         )
 
         if current_count == 0:
+            current.unpersist()
             break
 
         total_rows += current_count
         if current_count > max_rows_per_hop:
+            current.unpersist()
             raise ValueError(
                 f"{direction} hop {level} produced {current_count:,} path rows, "
                 f"which exceeds max_rows_per_hop={max_rows_per_hop:,}"
             )
+
         if total_rows > max_total_path_rows:
+            current.unpersist()
             raise ValueError(
                 f"{direction} cumulative path rows reached {total_rows:,}, "
                 f"which exceeds max_total_path_rows={max_total_path_rows:,}"
@@ -148,6 +211,7 @@ def compute_direction(direction="UPSTREAM"):
         )
 
         if level == max_hops:
+            current.unpersist()
             break
 
         if direction == "UPSTREAM":
@@ -158,12 +222,20 @@ def compute_direction(direction="UPSTREAM"):
                     F.col("cur.reached_table_full_name") == F.col("e.target_table_full_name"),
                     "inner"
                 )
-                .filter(~F.array_contains(F.col("cur.visited"), F.col("e.source_table_full_name")))
+                .filter(
+                    ~F.array_contains(F.col("cur.visited"), F.col("e.source_table_full_name"))
+                )
                 .select(
                     F.col("e.source_table_full_name").alias("reached_table_full_name"),
                     F.col("e.source_type").alias("reached_type"),
-                    F.array_append(F.col("cur.path_tables"), F.col("e.source_table_full_name")).alias("path_tables"),
-                    F.array_append(F.col("cur.visited"), F.col("e.source_table_full_name")).alias("visited"),
+                    F.array_append(
+                        F.col("cur.path_tables"),
+                        F.col("e.source_table_full_name")
+                    ).alias("path_tables"),
+                    F.array_append(
+                        F.col("cur.visited"),
+                        F.col("e.source_table_full_name")
+                    ).alias("visited"),
                     F.col("e.created_by"),
                     F.col("e.entity_type"),
                     F.col("e.entity_id"),
@@ -181,12 +253,20 @@ def compute_direction(direction="UPSTREAM"):
                     F.col("cur.reached_table_full_name") == F.col("e.source_table_full_name"),
                     "inner"
                 )
-                .filter(~F.array_contains(F.col("cur.visited"), F.col("e.target_table_full_name")))
+                .filter(
+                    ~F.array_contains(F.col("cur.visited"), F.col("e.target_table_full_name"))
+                )
                 .select(
                     F.col("e.target_table_full_name").alias("reached_table_full_name"),
                     F.col("e.target_type").alias("reached_type"),
-                    F.array_append(F.col("cur.path_tables"), F.col("e.target_table_full_name")).alias("path_tables"),
-                    F.array_append(F.col("cur.visited"), F.col("e.target_table_full_name")).alias("visited"),
+                    F.array_append(
+                        F.col("cur.path_tables"),
+                        F.col("e.target_table_full_name")
+                    ).alias("path_tables"),
+                    F.array_append(
+                        F.col("cur.visited"),
+                        F.col("e.target_table_full_name")
+                    ).alias("visited"),
                     F.col("e.created_by"),
                     F.col("e.entity_type"),
                     F.col("e.entity_id"),
@@ -197,7 +277,7 @@ def compute_direction(direction="UPSTREAM"):
                 )
             )
 
-        # dedupe NEXT frontier, not current frontier
+        # dedupe NEXT frontier by full path
         next_df = (
             next_df
             .withColumn("path_key", F.array_join(F.col("path_tables"), "||"))
@@ -214,6 +294,9 @@ def compute_direction(direction="UPSTREAM"):
 
     return levels
 
+# ============================================================
+# 5. COMPUTE BOTH DIRECTIONS
+# ============================================================
 print("\nComputing UPSTREAM...")
 upstream_levels = compute_direction("UPSTREAM")
 
@@ -221,7 +304,13 @@ print("\nComputing DOWNSTREAM...")
 downstream_levels = compute_direction("DOWNSTREAM")
 
 all_levels = upstream_levels + downstream_levels
-final_df = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), all_levels)
+if not all_levels:
+    raise ValueError("No lineage rows were produced.")
+
+final_df = reduce(
+    lambda a, b: a.unionByName(b, allowMissingColumns=True),
+    all_levels
+)
 
 final_df = final_df.withColumn(
     "path_id",
@@ -237,5 +326,75 @@ final_df = final_df.withColumn(
 )
 
 final_df.createOrReplaceTempView("lineage_final")
-
 print(f"\n✅ lineage_final created with {final_df.count():,} rows")
+
+# ============================================================
+# 6. OBJECTS BY HOP
+#    Main answer to: "what all made this root table?"
+# ============================================================
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW lineage_hop_summary AS
+SELECT
+  direction,
+  hop_count,
+  ARRAY_SORT(COLLECT_SET(reached_table_full_name)) AS objects_at_hop,
+  ARRAY_SORT(COLLECT_SET(COALESCE(reached_type, 'UNKNOWN'))) AS object_types_at_hop,
+  COUNT(*) AS path_rows_at_hop,
+  COUNT(DISTINCT reached_table_full_name) AS distinct_objects_at_hop
+FROM lineage_final
+GROUP BY direction, hop_count
+""")
+
+# ============================================================
+# 7. EDGES BY HOP
+#    Bridge between hop summaries and full paths
+# ============================================================
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW lineage_edge_summary AS
+SELECT
+  direction,
+  hop_count,
+  from_table,
+  from_type,
+  reached_table_full_name AS to_table,
+  reached_type AS to_type,
+  COUNT(*) AS path_rows_through_edge,
+  COUNT(DISTINCT path_id) AS distinct_paths_through_edge,
+  ARRAY_SORT(COLLECT_SET(COALESCE(created_by, 'UNKNOWN'))) AS creators,
+  ARRAY_SORT(COLLECT_SET(COALESCE(entity_type, 'UNKNOWN'))) AS entity_types,
+  ARRAY_SORT(COLLECT_SET(COALESCE(CAST(entity_id AS STRING), 'N/A'))) AS entity_ids,
+  ARRAY_SORT(COLLECT_SET(COALESCE(CAST(entity_run_id AS STRING), 'N/A'))) AS entity_run_ids,
+  MAX(event_time) AS latest_event_time_at_edge
+FROM lineage_final
+WHERE hop_count > 0
+GROUP BY
+  direction,
+  hop_count,
+  from_table,
+  from_type,
+  reached_table_full_name,
+  reached_type
+""")
+
+# ============================================================
+# 8. FULL PATHS
+#    Drill-down layer
+# ============================================================
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW lineage_path_summary AS
+SELECT
+  direction,
+  path_id,
+  MAX(hop_count) AS max_hop_count,
+  MAX(event_time) AS latest_event_time_on_path,
+  path_tables
+FROM lineage_final
+GROUP BY direction, path_id, path_tables
+""")
+
+print("\n✅ Created temp views:")
+print("  - edges_snapshot")
+print("  - lineage_final")
+print("  - lineage_hop_summary")
+print("  - lineage_edge_summary")
+print("  - lineage_path_summary")
