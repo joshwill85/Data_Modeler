@@ -1,147 +1,154 @@
-CREATE OR REPLACE TEMPORARY VIEW lineage_final AS
-WITH params AS (SELECT * FROM lineage_params),
+root_table_full_name = "eciscor_prod.npdataset.npd_current_pending"   # <<< CHANGE THIS
+as_of_date = None                                                     # None = latest, or "2026-04-01"
+target_schema = "cdo"
+target_table_prefix = "npd_lineage_paths"
 
-root_run AS (
+print(f"Root table: {root_table_full_name}")
+print(f"As-of date: {'latest' if as_of_date is None else as_of_date}")
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, StringType
+
+# 1. Resolve root event time
+root_df = spark.sql(f"""
   SELECT MAX(event_time) AS root_event_time
   FROM information_schema.table_lineage
-  WHERE target_table_full_name = (SELECT root_table_full_name FROM params)
-    AND ((SELECT as_of_date FROM params) = '' 
-         OR event_time <= TRY_CAST((SELECT as_of_date FROM params) || ' 23:59:59' AS TIMESTAMP))
-),
+  WHERE target_table_full_name = '{root_table_full_name}'
+    AND ({as_of_date is None} OR event_time <= '{as_of_date} 23:59:59')
+""")
+root_event_time = root_df.collect()[0]["root_event_time"]
+print(f"Root event time: {root_event_time}")
 
-edges_as_of AS (
+# 2. Latest edges as-of root time (broadcast this small table)
+edges = spark.sql(f"""
   SELECT 
     entity_type, entity_id, entity_run_id,
     source_table_full_name, source_table_schema, source_table_name, source_type,
     target_table_full_name, target_table_schema, target_table_name, target_type,
-    created_by, event_time, event_id,
-    ROW_NUMBER() OVER (
-      PARTITION BY source_table_full_name, target_table_full_name 
-      ORDER BY event_time DESC, event_id DESC
-    ) AS rn
+    created_by, event_time, event_id
   FROM information_schema.table_lineage
-  WHERE event_time <= (SELECT root_event_time FROM root_run)
+  WHERE event_time <= '{root_event_time}'
     AND source_table_full_name IS NOT NULL
     AND target_table_full_name IS NOT NULL
-),
+""").cache()
+edges = F.broadcast(edges)   # Critical optimization
 
-upstream_paths AS (
-  WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
-    SELECT 
-      p.root_table_full_name,
-      p.root_table_full_name AS reached_table_full_name,
-      SPLIT_PART(p.root_table_full_name, '.', 2) AS reached_table_schema,
-      SPLIT_PART(p.root_table_full_name, '.', 3) AS reached_table_name,
-      'TABLE' AS reached_type,
-      CAST(NULL AS STRING) AS edge_source_table_full_name,
-      CAST(NULL AS STRING) AS edge_target_table_full_name,
-      CAST(NULL AS STRING) AS edge_source_type,
-      CAST(NULL AS STRING) AS edge_target_type,
-      CAST(NULL AS STRING) AS event_id,
-      CAST(NULL AS TIMESTAMP) AS event_time,
-      CAST(NULL AS STRING) AS event_date,
-      CAST(NULL AS STRING) AS created_by,
-      CAST(NULL AS STRING) AS entity_type,
-      CAST(NULL AS STRING) AS entity_id,
-      CAST(NULL AS STRING) AS entity_run_id,
-      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS path_tables,
-      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS visited
-    FROM params p
+print(f"Edges loaded: {edges.count():,} rows")
 
-    UNION ALL
+# 3. Iterative BFS function
+def compute_direction(direction="UPSTREAM"):
+    # Start at root
+    current = spark.createDataFrame(
+        [(root_table_full_name, [root_table_full_name], [root_table_full_name])],
+        ["reached_table_full_name", "path_tables", "visited"]
+    ).cache()
+    
+    levels = []
+    level = 0
+    max_hops = 30   # practical safety — change if you need deeper
 
-    SELECT 
-      up.root_table_full_name,
-      e.source_table_full_name,
-      e.source_table_schema,
-      e.source_table_name,
-      e.source_type,
-      e.source_table_full_name,
-      e.target_table_full_name,
-      e.source_type,
-      e.target_type,
-      e.event_id,
-      e.event_time,
-      DATE(e.event_time) AS event_date,
-      e.created_by,
-      e.entity_type,
-      e.entity_id,
-      e.entity_run_id,
-      CAST(ARRAY_APPEND(up.path_tables, e.source_table_full_name) AS ARRAY<STRING>),
-      CAST(ARRAY_APPEND(up.visited, e.source_table_full_name) AS ARRAY<STRING>)
-    FROM cte up
-    JOIN edges_as_of e ON up.reached_table_full_name = e.target_table_full_name
-    WHERE e.rn = 1
-      AND NOT ARRAY_CONTAINS(up.visited, e.source_table_full_name)
-      AND SIZE(up.path_tables) < 20   -- reduced to reduce explosion; increase to 25 if it finishes
-  )
-  SELECT *, 'UPSTREAM' AS direction, SIZE(path_tables) - 1 AS hop_count
-  FROM cte
-  LIMIT ALL
-),
+    while level < max_hops:
+        levels.append(current.withColumn("hop_count", F.lit(level))
+                              .withColumn("direction", F.lit(direction))
+                              .withColumn("event_time", F.lit(None).cast("timestamp"))
+                              .withColumn("created_by", F.lit(None).cast("string"))
+                              .withColumn("entity_type", F.lit(None).cast("string"))
+                              .withColumn("entity_id", F.lit(None).cast("string"))
+                              .withColumn("entity_run_id", F.lit(None).cast("string")))
+        
+        if direction == "UPSTREAM":
+            next_df = current.alias("cur").join(
+                edges.alias("e"), F.col("cur.reached_table_full_name") == F.col("e.target_table_full_name")
+            ).filter(~F.array_contains(F.col("cur.visited"), F.col("e.source_table_full_name"))) \
+             .select(
+                F.col("e.source_table_full_name").alias("reached_table_full_name"),
+                F.array_append(F.col("cur.path_tables"), F.col("e.source_table_full_name")).alias("path_tables"),
+                F.array_append(F.col("cur.visited"), F.col("e.source_table_full_name")).alias("visited"),
+                F.col("e.created_by"),
+                F.col("e.entity_type"),
+                F.col("e.entity_id"),
+                F.col("e.entity_run_id"),
+                F.col("e.event_time")
+             )
+        else:  # DOWNSTREAM
+            next_df = current.alias("cur").join(
+                edges.alias("e"), F.col("cur.reached_table_full_name") == F.col("e.source_table_full_name")
+            ).filter(~F.array_contains(F.col("cur.visited"), F.col("e.target_table_full_name"))) \
+             .select(
+                F.col("e.target_table_full_name").alias("reached_table_full_name"),
+                F.array_append(F.col("cur.path_tables"), F.col("e.target_table_full_name")).alias("path_tables"),
+                F.array_append(F.col("cur.visited"), F.col("e.target_table_full_name")).alias("visited"),
+                F.col("e.created_by"),
+                F.col("e.entity_type"),
+                F.col("e.entity_id"),
+                F.col("e.entity_run_id"),
+                F.col("e.event_time")
+             )
+        
+        current = next_df.cache()
+        print(f"  {direction} hop {level+1}: {current.count():,} new rows")
+        
+        if current.count() == 0:
+            break
+        level += 1
+    
+    return levels
 
-downstream_paths AS (
-  WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
-    SELECT 
-      p.root_table_full_name,
-      p.root_table_full_name AS reached_table_full_name,
-      SPLIT_PART(p.root_table_full_name, '.', 2) AS reached_table_schema,
-      SPLIT_PART(p.root_table_full_name, '.', 3) AS reached_table_name,
-      'TABLE' AS reached_type,
-      CAST(NULL AS STRING) AS edge_source_table_full_name,
-      CAST(NULL AS STRING) AS edge_target_table_full_name,
-      CAST(NULL AS STRING) AS edge_source_type,
-      CAST(NULL AS STRING) AS edge_target_type,
-      CAST(NULL AS STRING) AS event_id,
-      CAST(NULL AS TIMESTAMP) AS event_time,
-      CAST(NULL AS STRING) AS event_date,
-      CAST(NULL AS STRING) AS created_by,
-      CAST(NULL AS STRING) AS entity_type,
-      CAST(NULL AS STRING) AS entity_id,
-      CAST(NULL AS STRING) AS entity_run_id,
-      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS path_tables,
-      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS visited
-    FROM params p
+# Compute both directions separately
+print("Computing UPSTREAM...")
+upstream_levels = compute_direction("UPSTREAM")
 
-    UNION ALL
+print("Computing DOWNSTREAM...")
+downstream_levels = compute_direction("DOWNSTREAM")
 
-    SELECT 
-      dp.root_table_full_name,
-      e.target_table_full_name,
-      e.target_table_schema,
-      e.target_table_name,
-      e.target_type,
-      e.source_table_full_name,
-      e.target_table_full_name,
-      e.source_type,
-      e.target_type,
-      e.event_id,
-      e.event_time,
-      DATE(e.event_time) AS event_date,
-      e.created_by,
-      e.entity_type,
-      e.entity_id,
-      e.entity_run_id,
-      CAST(ARRAY_APPEND(dp.path_tables, e.target_table_full_name) AS ARRAY<STRING>),
-      CAST(ARRAY_APPEND(dp.visited, e.target_table_full_name) AS ARRAY<STRING>)
-    FROM cte dp
-    JOIN edges_as_of e ON dp.reached_table_full_name = e.source_table_full_name
-    WHERE e.rn = 1
-      AND NOT ARRAY_CONTAINS(dp.visited, e.target_table_full_name)
-      AND SIZE(dp.path_tables) < 20
-  )
-  SELECT *, 'DOWNSTREAM' AS direction, SIZE(path_tables) - 1 AS hop_count
-  FROM cte
-  LIMIT ALL
-),
+# Combine
+all_levels = upstream_levels + downstream_levels
+final_df = spark.union([df for df in all_levels]) if all_levels else spark.createDataFrame([], schema=upstream_levels[0].schema)
 
-all_hops AS (
-  SELECT * FROM upstream_paths 
-  UNION ALL 
-  SELECT * FROM downstream_paths
+# Add path_id
+final_df = final_df.withColumn(
+    "path_id", 
+    F.sha2(F.concat_ws("||", F.col("direction"), F.lit(root_table_full_name), F.array_join(F.col("path_tables"), "||")), 256)
 )
 
+final_df.createOrReplaceTempView("lineage_final")
+print(f"✅ lineage_final temp view created with {final_df.count():,} rows")
+
+# Create the exact same tables as your SQL version
+final_df.write.mode("overwrite").saveAsTable(f"{target_schema}.{target_table_prefix}_full")
+
+spark.sql(f"""
+CREATE OR REPLACE TABLE {target_schema}.{target_table_prefix}_hop_edges_summary AS
 SELECT 
-  SHA2(CONCAT_WS('||', direction, root_table_full_name, ARRAY_JOIN(path_tables, '||')), 256) AS path_id,
-  *
-FROM all_hops;
+  direction,
+  hop_count - 1 AS from_hop,
+  ELEMENT_AT(path_tables, hop_count) AS from_table,
+  hop_count AS to_hop,
+  reached_table_full_name AS to_table,
+  COUNT(DISTINCT path_id) AS num_paths_through_edge,
+  COLLECT_SET(created_by) AS creators,
+  COLLECT_SET(CONCAT(COALESCE(entity_type, 'UNKNOWN'), ' ', COALESCE(entity_id, 'N/A'))) AS hop_entity_steps_at_to_hop,
+  MAX(event_time) AS latest_event_at_edge,
+  COLLECT_SET(DATE(event_time)) AS event_dates_at_edge
+FROM lineage_final
+WHERE hop_count > 0
+GROUP BY direction, from_hop, from_table, to_hop, to_table
+""")
+
+spark.sql(f"""
+CREATE OR REPLACE TABLE {target_schema}.{target_table_prefix}_hop_summary AS
+SELECT 
+  direction,
+  hop_count,
+  COLLECT_SET(reached_table_full_name) AS objects_at_hop,
+  COUNT(DISTINCT path_id) AS num_paths_reaching_this_hop,
+  COLLECT_SET(created_by) AS creators_at_hop,
+  MAX(event_time) AS latest_event_at_hop
+FROM lineage_final
+GROUP BY direction, hop_count
+""")
+
+print("✅ All tables created:")
+print(f"  - {target_schema}.{target_table_prefix}_full")
+print(f"  - {target_schema}.{target_table_prefix}_hop_edges_summary  ← BEST VIEW")
+print(f"  - {target_schema}.{target_table_prefix}_hop_summary")
