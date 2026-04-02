@@ -1,8 +1,5 @@
--- =====================================================
--- UC LINEAGE EXPLORER - SINGLE CELL VERSION (2025.40)
--- Explicit casts for arrays + recursion hint in correct position
--- =====================================================
-
+-- Cell 2: Build lineage_final temp view
+CREATE OR REPLACE TEMPORARY VIEW lineage_final AS
 WITH params AS (SELECT * FROM lineage_params),
 
 root_run AS (
@@ -29,7 +26,6 @@ edges_as_of AS (
     AND target_table_full_name IS NOT NULL
 ),
 
--- Upstream
 upstream_paths AS (
   WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
     SELECT 
@@ -72,8 +68,8 @@ upstream_paths AS (
       e.entity_type,
       e.entity_id,
       e.entity_run_id,
-      ARRAY_APPEND(up.path_tables, e.source_table_full_name),
-      ARRAY_APPEND(up.visited, e.source_table_full_name)
+      CAST(ARRAY_APPEND(up.path_tables, e.source_table_full_name) AS ARRAY<STRING>),
+      CAST(ARRAY_APPEND(up.visited, e.source_table_full_name) AS ARRAY<STRING>)
     FROM cte up
     JOIN edges_as_of e ON up.reached_table_full_name = e.target_table_full_name
     WHERE NOT ARRAY_CONTAINS(up.visited, e.source_table_full_name)
@@ -83,7 +79,6 @@ upstream_paths AS (
   FROM cte
 ),
 
--- Downstream
 downstream_paths AS (
   WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
     SELECT 
@@ -126,8 +121,8 @@ downstream_paths AS (
       e.entity_type,
       e.entity_id,
       e.entity_run_id,
-      ARRAY_APPEND(dp.path_tables, e.target_table_full_name),
-      ARRAY_APPEND(dp.visited, e.target_table_full_name)
+      CAST(ARRAY_APPEND(dp.path_tables, e.target_table_full_name) AS ARRAY<STRING>),
+      CAST(ARRAY_APPEND(dp.visited, e.target_table_full_name) AS ARRAY<STRING>)
     FROM cte dp
     JOIN edges_as_of e ON dp.reached_table_full_name = e.source_table_full_name
     WHERE NOT ARRAY_CONTAINS(dp.visited, e.target_table_full_name)
@@ -141,36 +136,9 @@ all_hops AS (
   SELECT * FROM upstream_paths 
   UNION ALL 
   SELECT * FROM downstream_paths
-),
-
-final AS (
-  SELECT 
-    SHA2(CONCAT_WS('||', direction, root_table_full_name, ARRAY_JOIN(path_tables, '||')), 256) AS path_id,
-    *
-  FROM all_hops
 )
 
--- Create the permanent tables directly
-CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_full') 
-AS SELECT * FROM final LIMIT ALL;
-
-CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_hop_edges_summary') 
-AS
 SELECT 
-  direction,
-  hop_count - 1 AS from_hop,
-  ELEMENT_AT(path_tables, hop_count) AS from_table,
-  hop_count AS to_hop,
-  reached_table_full_name AS to_table,
-  COUNT(DISTINCT path_id) AS num_paths_through_edge,
-  COLLECT_SET(created_by) AS creators,
-  COLLECT_SET(CONCAT(COALESCE(entity_type, 'UNKNOWN'), ' ', COALESCE(entity_id, 'N/A'))) AS hop_entity_steps_at_to_hop,
-  MAX(event_time) AS latest_event_at_edge,
-  COLLECT_SET(DATE(event_time)) AS event_dates_at_edge
-FROM final
-WHERE hop_count > 0
-GROUP BY direction, from_hop, from_table, to_hop, to_table;
-
-SELECT 
-  '✅ All tables created successfully on Unity Catalog!' AS status,
-  (SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_hop_edges_summary' AS best_view_for_analysis;
+  SHA2(CONCAT_WS('||', direction, root_table_full_name, ARRAY_JOIN(path_tables, '||')), 256) AS path_id,
+  *
+FROM all_hops;
