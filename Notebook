@@ -1,29 +1,46 @@
+root_table_full_name = "eciscor_prod.npdataset.npd_current_pending"   # <<< CHANGE THIS
+as_of_date = None                                                    # None = latest, or "2026-04-01"
+target_schema = "cdo"
+target_table_prefix = "npd_lineage_paths"
+
+print(f"Root: {root_table_full_name}")
+print(f"As-of date: {'latest' if as_of_date is None else as_of_date}")
+
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.types import StructType, StructField, StringType, ArrayType, TimestampType
 from functools import reduce
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType, TimestampType
 
-# 1. Get the latest event_time for the root table (upstream as-of)
+# 1. Resolve root event time
+as_of_filter = "TRUE" if as_of_date is None else f"event_time <= '{as_of_date} 23:59:59'"
 root_event_time_df = spark.sql(f"""
   SELECT MAX(event_time) AS root_event_time
   FROM information_schema.table_lineage
   WHERE target_table_full_name = '{root_table_full_name}'
+    AND {as_of_filter}
 """)
-root_event_time = root_event_time_df.collect()[0]["root_event_time"]
-print(f"Root latest event time (used for upstream): {root_event_time}")
 
-# 2. Upstream edges: latest edges <= root_event_time
+root_row = root_event_time_df.first()
+if root_row is None or root_row["root_event_time"] is None:
+    raise ValueError(f"No lineage events found for root table {root_table_full_name}")
+
+root_event_time = root_row["root_event_time"]
+print(f"Root event time used for both directions: {root_event_time}")
+
+# 2. Edges with date pruning + ranking
 window = Window.partitionBy("source_table_full_name", "target_table_full_name") \
                .orderBy(F.col("event_time").desc(), F.col("event_id").desc())
 
-upstream_edges = spark.sql(f"""
+edges = spark.sql(f"""
   SELECT 
     entity_type, entity_id, entity_run_id,
     source_table_full_name, source_table_schema, source_table_name, source_type,
     target_table_full_name, target_table_schema, target_table_name, target_type,
-    created_by, event_time, event_id
+    created_by, event_time, event_id,
+    DATE(event_time) AS event_date
   FROM information_schema.table_lineage
   WHERE event_time <= '{root_event_time}'
+    AND DATE(event_time) <= DATE('{root_event_time}')
     AND source_table_full_name IS NOT NULL
     AND target_table_full_name IS NOT NULL
 """).withColumn("rn", F.row_number().over(window)) \
@@ -31,26 +48,9 @@ upstream_edges = spark.sql(f"""
      .drop("rn") \
      .cache()
 
-print(f"Upstream edges after ranking: {upstream_edges.count():,} rows")
+print(f"Edges after ranking: {edges.count():,} rows")
 
-# 3. Downstream edges: absolute latest (current state)
-downstream_edges = spark.sql(f"""
-  SELECT 
-    entity_type, entity_id, entity_run_id,
-    source_table_full_name, source_table_schema, source_table_name, source_type,
-    target_table_full_name, target_table_schema, target_table_name, target_type,
-    created_by, event_time, event_id
-  FROM information_schema.table_lineage
-  WHERE source_table_full_name IS NOT NULL
-    AND target_table_full_name IS NOT NULL
-""").withColumn("rn", F.row_number().over(window)) \
-     .filter(F.col("rn") == 1) \
-     .drop("rn") \
-     .cache()
-
-print(f"Downstream edges after ranking: {downstream_edges.count():,} rows")
-
-# 4. Explicit schema for the starting DataFrame
+# 3. Explicit schema
 schema = StructType([
     StructField("reached_table_full_name", StringType(), True),
     StructField("path_tables", ArrayType(StringType()), True),
@@ -59,14 +59,14 @@ schema = StructType([
     StructField("entity_type", StringType(), True),
     StructField("entity_id", StringType(), True),
     StructField("entity_run_id", StringType(), True),
-    StructField("event_time", TimestampType(), True)
+    StructField("event_time", TimestampType(), True),
+    StructField("from_table", StringType(), True)
 ])
 
-# 5. Iterative BFS function
-def compute_direction(direction="UPSTREAM", edges_df=None):
-    # Hop 0: Root with explicit schema
+# 4. Iterative BFS with path deduplication
+def compute_direction(direction="UPSTREAM"):
     current = spark.createDataFrame(
-        [(root_table_full_name, [root_table_full_name], [root_table_full_name], None, None, None, None, None)],
+        [(root_table_full_name, [root_table_full_name], [root_table_full_name], None, None, None, None, None, root_table_full_name)],
         schema=schema
     ).cache()
     
@@ -75,12 +75,23 @@ def compute_direction(direction="UPSTREAM", edges_df=None):
     max_hops = 30
 
     while level < max_hops:
+        # Deduplicate identical paths before proceeding
+        current = current.withColumn("path_key", F.array_join(F.col("path_tables"), "||")) \
+                         .dropDuplicates(["path_key"]) \
+                         .drop("path_key")
+        
         levels.append(current.withColumn("hop_count", F.lit(level))
                               .withColumn("direction", F.lit(direction)))
         
+        current_count = current.count()
+        print(f"  {direction} hop {level+1}: {current_count:,} new rows (after dedup)")
+        
+        if current_count == 0:
+            break
+        
         if direction == "UPSTREAM":
             next_df = current.alias("cur").join(
-                edges_df.alias("e"), F.col("cur.reached_table_full_name") == F.col("e.target_table_full_name")
+                edges.alias("e"), F.col("cur.reached_table_full_name") == F.col("e.target_table_full_name")
             ).filter(~F.array_contains(F.col("cur.visited"), F.col("e.source_table_full_name"))) \
              .select(
                 F.col("e.source_table_full_name").alias("reached_table_full_name"),
@@ -90,11 +101,12 @@ def compute_direction(direction="UPSTREAM", edges_df=None):
                 F.col("e.entity_type"),
                 F.col("e.entity_id"),
                 F.col("e.entity_run_id"),
-                F.col("e.event_time")
+                F.col("e.event_time"),
+                F.col("cur.reached_table_full_name").alias("from_table")
              )
         else:
             next_df = current.alias("cur").join(
-                edges_df.alias("e"), F.col("cur.reached_table_full_name") == F.col("e.source_table_full_name")
+                edges.alias("e"), F.col("cur.reached_table_full_name") == F.col("e.source_table_full_name")
             ).filter(~F.array_contains(F.col("cur.visited"), F.col("e.target_table_full_name"))) \
              .select(
                 F.col("e.target_table_full_name").alias("reached_table_full_name"),
@@ -104,36 +116,69 @@ def compute_direction(direction="UPSTREAM", edges_df=None):
                 F.col("e.entity_type"),
                 F.col("e.entity_id"),
                 F.col("e.entity_run_id"),
-                F.col("e.event_time")
+                F.col("e.event_time"),
+                F.col("cur.reached_table_full_name").alias("from_table")
              )
         
         current.unpersist()
         current = next_df.cache()
-        
-        print(f"  {direction} hop {level+1}: {current.count():,} new rows")
-        
-        if current.count() == 0:
-            break
         level += 1
     
     return levels
 
-# Compute both directions
+# Compute
 print("\nComputing UPSTREAM...")
-upstream_levels = compute_direction("UPSTREAM", upstream_edges)
+upstream_levels = compute_direction("UPSTREAM")
 
 print("\nComputing DOWNSTREAM...")
-downstream_levels = compute_direction("DOWNSTREAM", downstream_edges)
+downstream_levels = compute_direction("DOWNSTREAM")
 
-# Combine safely
+# Combine
 all_levels = upstream_levels + downstream_levels
 final_df = reduce(lambda df1, df2: df1.unionByName(df2, allowMissingColumns=True), all_levels)
 
-# Add path_id
 final_df = final_df.withColumn(
     "path_id", 
     F.sha2(F.concat_ws("||", F.col("direction"), F.lit(root_table_full_name), F.array_join(F.col("path_tables"), "||")), 256)
 )
 
 final_df.createOrReplaceTempView("lineage_final")
-print(f"\n✅ lineage_final temp view created with {final_df.count():,} rows")
+print(f"\n✅ lineage_final created with {final_df.count():,} rows")
+
+final_df.write.mode("overwrite").saveAsTable(f"{target_schema}.{target_table_prefix}_full")
+
+spark.sql(f"""
+CREATE OR REPLACE TABLE {target_schema}.{target_table_prefix}_hop_edges_summary AS
+SELECT 
+  direction,
+  hop_count - 1 AS from_hop,
+  from_table,
+  hop_count AS to_hop,
+  reached_table_full_name AS to_table,
+  COUNT(DISTINCT path_id) AS num_paths_through_edge,
+  COLLECT_SET(created_by) AS creators,
+  COLLECT_SET(CONCAT(COALESCE(entity_type, 'UNKNOWN'), ' ', COALESCE(entity_id, 'N/A'))) AS hop_entity_steps_at_to_hop,
+  MAX(event_time) AS latest_event_at_edge,
+  COLLECT_SET(DATE(event_time)) AS event_dates_at_edge
+FROM lineage_final
+WHERE hop_count > 0
+GROUP BY direction, from_hop, from_table, to_hop, to_table
+""")
+
+spark.sql(f"""
+CREATE OR REPLACE TABLE {target_schema}.{target_table_prefix}_hop_summary AS
+SELECT 
+  direction,
+  hop_count,
+  COLLECT_SET(reached_table_full_name) AS objects_at_hop,
+  COUNT(DISTINCT path_id) AS num_paths_reaching_this_hop,
+  COLLECT_SET(created_by) AS creators_at_hop,
+  MAX(event_time) AS latest_event_at_hop
+FROM lineage_final
+GROUP BY direction, hop_count
+""")
+
+print("✅ All tables created successfully!")
+print(f"  • {target_schema}.{target_table_prefix}_full")
+print(f"  • {target_schema}.{target_table_prefix}_hop_edges_summary  ← BEST VIEW")
+print(f"  • {target_schema}.{target_table_prefix}_hop_summary")
