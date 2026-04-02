@@ -1,6 +1,6 @@
 -- =====================================================
--- UC LINEAGE EXPLORER - FIXED FOR 2025.40 SQL WAREHOUSE
--- Correct MAX RECURSION LEVEL placement
+-- UC LINEAGE EXPLORER - FIXED RECURSIVE SYNTAX FOR 2025.40
+-- Unity Catalog + Serverless SQL Warehouse
 -- =====================================================
 
 WITH params AS (SELECT * FROM lineage_params),
@@ -29,10 +29,10 @@ edges_as_of AS (
     AND target_table_full_name IS NOT NULL
 ),
 
--- Upstream recursive - CORRECT syntax
+-- Upstream - CORRECT syntax with MAX RECURSION LEVEL
 upstream_paths AS (
   WITH RECURSIVE cte AS (
-    -- Hop 0: Root
+    -- Hop 0
     SELECT 
       p.root_table_full_name,
       p.root_table_full_name AS reached_table_full_name,
@@ -86,7 +86,7 @@ upstream_paths AS (
   MAX RECURSION LEVEL 50
 ),
 
--- Downstream recursive - same correct pattern
+-- Downstream - same correct syntax
 downstream_paths AS (
   WITH RECURSIVE cte AS (
     SELECT 
@@ -150,7 +150,7 @@ final AS (
   FROM all_hops
 )
 
--- Create the tables (using the temp view from Cell 1)
+-- Create tables
 CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_full') 
 AS SELECT * FROM final LIMIT ALL;
 
@@ -171,4 +171,4 @@ FROM final
 WHERE hop_count > 0
 GROUP BY direction, from_hop, from_table, to_hop, to_table;
 
-SELECT '✅ Tables created successfully' AS status;
+SELECT '✅ Success! Check the _hop_edges_summary table' AS status;
