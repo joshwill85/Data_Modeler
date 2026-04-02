@@ -1,27 +1,9 @@
 -- =====================================================
--- EDIT THESE VALUES ONLY IN THIS CELL
--- =====================================================
-CREATE OR REPLACE TEMPORARY VIEW lineage_params AS
-SELECT 
-  'eciscor_prod.npdataset.npd_current_pending' AS root_table_full_name,   -- <<< CHANGE THIS TO YOUR ROOT TABLE
-  '' AS as_of_date,                                                       -- YYYY-MM-DD or empty string for latest
-  'cdo' AS target_schema,
-  'npd_lineage_paths' AS target_table_prefix;
-
-SELECT * FROM lineage_params;
-
-
-
-
--- =====================================================
--- UC LINEAGE EXPLORER - UNITY CATALOG + 2025.40
--- No parameters — uses temp view for values
--- MAX RECURSION LEVEL 50 + LIMIT ALL
+-- UC LINEAGE EXPLORER - FIXED FOR 2025.40 SQL WAREHOUSE
+-- Correct MAX RECURSION LEVEL placement
 -- =====================================================
 
-WITH params AS (
-  SELECT * FROM lineage_params
-),
+WITH params AS (SELECT * FROM lineage_params),
 
 root_run AS (
   SELECT MAX(event_time) AS root_event_time
@@ -47,9 +29,10 @@ edges_as_of AS (
     AND target_table_full_name IS NOT NULL
 ),
 
--- Upstream
+-- Upstream recursive - CORRECT syntax
 upstream_paths AS (
-  WITH RECURSIVE upstream_paths AS (
+  WITH RECURSIVE cte AS (
+    -- Hop 0: Root
     SELECT 
       p.root_table_full_name,
       p.root_table_full_name AS reached_table_full_name,
@@ -73,6 +56,7 @@ upstream_paths AS (
 
     UNION ALL
 
+    -- Recursive step
     SELECT 
       up.root_table_full_name,
       e.source_table_full_name,
@@ -92,19 +76,19 @@ upstream_paths AS (
       e.entity_run_id,
       ARRAY_APPEND(up.path_tables, e.source_table_full_name),
       ARRAY_APPEND(up.visited, e.source_table_full_name)
-    FROM upstream_paths up
+    FROM cte up
     JOIN edges_as_of e ON up.reached_table_full_name = e.target_table_full_name
     WHERE NOT ARRAY_CONTAINS(up.visited, e.source_table_full_name)
       AND SIZE(up.path_tables) < 25
   )
   SELECT *, 'UPSTREAM' AS direction, SIZE(path_tables) - 1 AS hop_count
-  FROM upstream_paths
+  FROM cte
   MAX RECURSION LEVEL 50
 ),
 
--- Downstream
+-- Downstream recursive - same correct pattern
 downstream_paths AS (
-  WITH RECURSIVE downstream_paths AS (
+  WITH RECURSIVE cte AS (
     SELECT 
       p.root_table_full_name,
       p.root_table_full_name AS reached_table_full_name,
@@ -147,13 +131,13 @@ downstream_paths AS (
       e.entity_run_id,
       ARRAY_APPEND(dp.path_tables, e.target_table_full_name),
       ARRAY_APPEND(dp.visited, e.target_table_full_name)
-    FROM downstream_paths dp
+    FROM cte dp
     JOIN edges_as_of e ON dp.reached_table_full_name = e.source_table_full_name
     WHERE NOT ARRAY_CONTAINS(dp.visited, e.target_table_full_name)
       AND SIZE(dp.path_tables) < 25
   )
   SELECT *, 'DOWNSTREAM' AS direction, SIZE(path_tables) - 1 AS hop_count
-  FROM downstream_paths
+  FROM cte
   MAX RECURSION LEVEL 50
 ),
 
@@ -166,21 +150,9 @@ final AS (
   FROM all_hops
 )
 
--- Create output tables
+-- Create the tables (using the temp view from Cell 1)
 CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_full') 
 AS SELECT * FROM final LIMIT ALL;
-
-CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_hop_summary') 
-AS
-SELECT 
-  direction,
-  hop_count,
-  COLLECT_SET(reached_table_full_name) AS objects_at_hop,
-  COUNT(DISTINCT path_id) AS num_paths_reaching_this_hop,
-  COLLECT_SET(created_by) AS creators_at_hop,
-  MAX(event_time) AS latest_event_at_hop
-FROM final
-GROUP BY direction, hop_count;
 
 CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_hop_edges_summary') 
 AS
@@ -199,6 +171,4 @@ FROM final
 WHERE hop_count > 0
 GROUP BY direction, from_hop, from_table, to_hop, to_table;
 
-SELECT 
-  '✅ All tables created successfully on Unity Catalog!' AS status,
-  (SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_hop_edges_summary' AS best_view;
+SELECT '✅ Tables created successfully' AS status;
