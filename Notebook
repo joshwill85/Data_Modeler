@@ -1,18 +1,17 @@
 -- =====================================================
--- PARAMETERS - CHANGE THESE VALUES HERE
+-- PARAMETERS - EDIT THESE VALUES
 -- =====================================================
-SET root_table_full_name = 'eciscor_prod.npdataset.npd_current_pending';  -- <<< CHANGE THIS
-SET as_of_date = '';                                                     -- YYYY-MM-DD or leave empty for latest
-SET target_schema = 'cdo';
-SET target_table_prefix = 'npd_lineage_paths';
+DECLARE OR REPLACE VARIABLE root_table_full_name STRING DEFAULT 'eciscor_prod.npdataset.npd_current_pending';
+DECLARE OR REPLACE VARIABLE as_of_date STRING DEFAULT '';                    -- YYYY-MM-DD or empty for latest
+DECLARE OR REPLACE VARIABLE target_schema STRING DEFAULT 'cdo';
+DECLARE OR REPLACE VARIABLE target_table_prefix STRING DEFAULT 'npd_lineage_paths';
 
 SELECT 
-  '✅ Parameters set successfully' AS status,
-  ${root_table_full_name} AS root_table_full_name,
-  ${as_of_date} AS as_of_date,
-  ${target_schema} AS target_schema,
-  ${target_table_prefix} AS target_table_prefix;
-
+  '✅ Parameters defined' AS status,
+  :root_table_full_name AS root_table_full_name,
+  :as_of_date AS as_of_date,
+  :target_schema AS target_schema,
+  :target_table_prefix AS target_table_prefix;
 
 
 
