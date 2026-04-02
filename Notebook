@@ -1,8 +1,513 @@
+# Databricks notebook source
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import (
+    StructType, StructField, StringType, ArrayType, TimestampType
+)
+from functools import reduce
+from datetime import timedelta
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+# REQUIRED:
+# root_table_full_name = "eciscor_prod.npdataset.npd_current_pending"
+#
+# OPTIONAL:
+# as_of_date = None              # None or "YYYY-MM-DD"
+# recent_days = 30              # supplement window for recent contributors
+# max_hops = 20
+# max_rows_per_hop = 200000
+# max_total_rows = 2000000
+
+try:
+    as_of_date
+except NameError:
+    as_of_date = None
+
+try:
+    recent_days
+except NameError:
+    recent_days = 30
+
+try:
+    max_hops
+except NameError:
+    max_hops = 20
+
+try:
+    max_rows_per_hop
+except NameError:
+    max_rows_per_hop = 200000
+
+try:
+    max_total_rows
+except NameError:
+    max_total_rows = 2000000
+
+print(f"Root table: {root_table_full_name}")
+print(f"As-of date: {'latest' if as_of_date is None else as_of_date}")
+print(f"Recent contributor window (days): {recent_days}")
+print(f"Max hops: {max_hops}")
+print(f"Max rows per hop: {max_rows_per_hop:,}")
+print(f"Max total rows: {max_total_rows:,}")
+
+# ============================================================
+# 1. ROOT LINEAGE CUTOFFS
+#    - latest visible lineage event of any kind for the root
+#    - latest visible read/write lineage event for the root
+# ============================================================
+as_of_filter = (
+    "TRUE"
+    if as_of_date is None
+    else f"event_time <= TIMESTAMP('{as_of_date} 23:59:59')"
+)
+
+root_any_event_df = spark.sql(f"""
 SELECT
-  COUNT(DISTINCT source_table_full_name) AS cumulative_direct_parents,
-  COLLECT_SET(source_table_full_name) AS cumulative_parent_list
+  MAX(event_time) AS root_latest_any_event_time
 FROM information_schema.table_lineage
-WHERE target_table_full_name = '<ROOT_TABLE>'
+WHERE target_table_full_name = '{root_table_full_name}'
+  AND {as_of_filter}
+""")
+
+root_any_row = root_any_event_df.first()
+if root_any_row is None or root_any_row["root_latest_any_event_time"] is None:
+    raise ValueError(f"No lineage events found for root table {root_table_full_name}")
+
+root_latest_any_event_time = root_any_row["root_latest_any_event_time"]
+
+root_rw_event_df = spark.sql(f"""
+WITH ranked_root_rw AS (
+  SELECT
+    target_type,
+    event_id,
+    event_time,
+    ROW_NUMBER() OVER (
+      ORDER BY event_time DESC, event_id DESC
+    ) AS rn
+  FROM information_schema.table_lineage
+  WHERE target_table_full_name = '{root_table_full_name}'
+    AND source_table_full_name IS NOT NULL
+    AND target_table_full_name IS NOT NULL
+    AND {as_of_filter}
+)
+SELECT
+  target_type,
+  event_id,
+  event_time
+FROM ranked_root_rw
+WHERE rn = 1
+""")
+
+root_rw_row = root_rw_event_df.first()
+if root_rw_row is None or root_rw_row["event_time"] is None:
+    raise ValueError(
+        f"No read/write lineage events found for root table {root_table_full_name}. "
+        f"That usually means the latest visible lineage is write-only or lineage is not inferable."
+    )
+
+root_latest_rw_event_time = root_rw_row["event_time"]
+root_latest_rw_event_id = root_rw_row["event_id"]
+root_type = root_rw_row["target_type"] if root_rw_row["target_type"] is not None else "ROOT"
+
+print(f"Root latest ANY lineage event time: {root_latest_any_event_time}")
+print(f"Root latest READ/WRITE event time: {root_latest_rw_event_time}")
+print(f"Root latest READ/WRITE event id:   {root_latest_rw_event_id}")
+print(f"Root type:                         {root_type}")
+
+# ============================================================
+# 2. TABLE HISTORY PROFILE
+#    Use this to judge whether the table behaves more like:
+#      - full refresh / overwrite
+#      - incremental / merge / update / delete
+# ============================================================
+history_df = spark.sql(f"DESCRIBE HISTORY {root_table_full_name}").cache()
+
+recent_window_start = root_latest_any_event_time - timedelta(days=recent_days)
+
+history_recent_df = (
+    history_df
+    .filter(F.col("timestamp") <= F.lit(root_latest_any_event_time))
+    .filter(F.col("timestamp") >= F.lit(recent_window_start))
+).cache()
+
+history_recent_df.createOrReplaceTempView("root_history_recent")
+
+history_profile_df = (
+    history_recent_df
+    .groupBy("operation")
+    .agg(F.count("*").alias("operation_count"))
+    .orderBy(F.desc("operation_count"))
+)
+history_profile_df.createOrReplaceTempView("root_history_profile")
+
+recent_incremental_ops = (
+    history_recent_df
+    .filter(F.col("operation").isin("MERGE", "UPDATE", "DELETE"))
+    .count()
+)
+
+recent_replace_where_ops = (
+    history_recent_df
+    .filter(F.col("operationParameters").cast("string").contains("replaceWhere"))
+    .count()
+)
+
+recent_overwrite_ops = (
+    history_recent_df
+    .filter(F.col("operationParameters").cast("string").contains("Overwrite"))
+    .count()
+)
+
+print(f"Recent incremental ops (MERGE/UPDATE/DELETE): {recent_incremental_ops:,}")
+print(f"Recent replaceWhere-like ops:                 {recent_replace_where_ops:,}")
+print(f"Recent overwrite-like ops:                    {recent_overwrite_ops:,}")
+
+# ============================================================
+# 3. RAW READ/WRITE LINEAGE EDGES UP TO ROOT R/W CUTOFF
+#    We use raw rows, not a global latest-event snapshot.
+#    Each frontier row finds its own latest qualifying event.
+# ============================================================
+rw_edges = spark.sql(f"""
+SELECT DISTINCT
+  source_table_full_name,
+  source_type,
+  target_table_full_name,
+  target_type,
+  created_by,
+  entity_type,
+  entity_id,
+  entity_run_id,
+  event_time,
+  event_id
+FROM information_schema.table_lineage
+WHERE source_table_full_name IS NOT NULL
+  AND target_table_full_name IS NOT NULL
+  AND source_table_full_name <> target_table_full_name
+  AND event_time <= TIMESTAMP('{root_latest_rw_event_time}')
+""").cache()
+
+rw_edge_count = rw_edges.count()
+rw_edges.createOrReplaceTempView("rw_edges")
+print(f"Raw read/write lineage rows up to root R/W cutoff: {rw_edge_count:,}")
+
+# Sanity check: how many source rows are in the root's latest read/write event?
+root_latest_event_sources_df = spark.sql(f"""
+SELECT
+  source_table_full_name,
+  source_type,
+  event_time,
+  event_id
+FROM information_schema.table_lineage
+WHERE target_table_full_name = '{root_table_full_name}'
   AND source_table_full_name IS NOT NULL
   AND target_table_full_name IS NOT NULL
-  AND event_time <= TIMESTAMP('<ROOT_EVENT_TIME>');
+  AND event_id = '{root_latest_rw_event_id}'
+""").cache()
+
+root_latest_event_sources_df.createOrReplaceTempView("root_latest_event_sources")
+print(f"Direct sources in root latest R/W event: {root_latest_event_sources_df.count():,}")
+
+# ============================================================
+# 4. PRIMARY ANSWER:
+#    RECURSIVE LATEST-READ/WRITE UPSTREAM LINEAGE
+#
+#    For each frontier row:
+#    - find all candidate read/write rows for that target
+#      with event_time <= row.as_of_time
+#    - keep ONLY the latest event for that row
+#    - carry all source rows from that latest event
+# ============================================================
+schema = StructType([
+    StructField("reached_table_full_name", StringType(), True),
+    StructField("reached_type", StringType(), True),
+    StructField("path_tables", ArrayType(StringType()), True),
+    StructField("visited", ArrayType(StringType()), True),
+    StructField("created_by", StringType(), True),
+    StructField("entity_type", StringType(), True),
+    StructField("entity_id", StringType(), True),
+    StructField("entity_run_id", StringType(), True),
+    StructField("event_time", TimestampType(), True),   # event that produced this hop
+    StructField("from_table", StringType(), True),
+    StructField("from_type", StringType(), True),
+    StructField("as_of_time", TimestampType(), True),   # upper bound for upstream expansion
+    StructField("current_path_key", StringType(), True)
+])
+
+root_frontier = spark.createDataFrame(
+    [(
+        root_table_full_name,        # reached_table_full_name
+        root_type,                   # reached_type
+        [root_table_full_name],      # path_tables
+        [root_table_full_name],      # visited
+        None,                        # created_by
+        None,                        # entity_type
+        None,                        # entity_id
+        None,                        # entity_run_id
+        None,                        # event_time
+        None,                        # from_table
+        None,                        # from_type
+        root_latest_rw_event_time,   # as_of_time
+        root_table_full_name         # current_path_key
+    )],
+    schema=schema
+).cache()
+
+def compute_upstream_latest_write():
+    current = root_frontier
+    levels = []
+    level = 0
+    total_rows = 0
+
+    while level <= max_hops:
+        current_count = current.count()
+        current_objects = current.select("reached_table_full_name").distinct().count()
+
+        print(
+            f"UPSTREAM_LATEST hop {level}: "
+            f"{current_count:,} path rows, {current_objects:,} distinct objects"
+        )
+
+        if current_count == 0:
+            current.unpersist()
+            break
+
+        total_rows += current_count
+        if current_count > max_rows_per_hop:
+            current.unpersist()
+            raise ValueError(
+                f"UPSTREAM_LATEST hop {level} produced {current_count:,} rows, "
+                f"exceeding max_rows_per_hop={max_rows_per_hop:,}"
+            )
+
+        if total_rows > max_total_rows:
+            current.unpersist()
+            raise ValueError(
+                f"UPSTREAM_LATEST cumulative rows reached {total_rows:,}, "
+                f"exceeding max_total_rows={max_total_rows:,}"
+            )
+
+        levels.append(
+            current.withColumn("hop_count", F.lit(level))
+                   .withColumn("direction", F.lit("UPSTREAM_LATEST"))
+        )
+
+        if level == max_hops:
+            current.unpersist()
+            break
+
+        # For each current path row, find candidate upstream rows up to that row's as_of_time
+        candidate = (
+            current.alias("cur")
+            .join(
+                rw_edges.alias("e"),
+                (F.col("cur.reached_table_full_name") == F.col("e.target_table_full_name")) &
+                (F.col("e.event_time") <= F.col("cur.as_of_time")),
+                "inner"
+            )
+            .select(
+                F.col("cur.current_path_key").alias("current_path_key"),
+                F.col("cur.reached_table_full_name").alias("current_reached_table"),
+                F.col("cur.reached_type").alias("current_reached_type"),
+                F.col("cur.path_tables").alias("cur_path_tables"),
+                F.col("cur.visited").alias("cur_visited"),
+                F.col("e.source_table_full_name").alias("source_table_full_name"),
+                F.col("e.source_type").alias("source_type"),
+                F.col("e.created_by").alias("created_by"),
+                F.col("e.entity_type").alias("entity_type"),
+                F.col("e.entity_id").alias("entity_id"),
+                F.col("e.entity_run_id").alias("entity_run_id"),
+                F.col("e.event_time").alias("candidate_event_time"),
+                F.col("e.event_id").alias("candidate_event_id")
+            )
+        )
+
+        # Keep ALL rows from the latest qualifying event for each frontier row
+        event_window = Window.partitionBy("current_path_key").orderBy(
+            F.col("candidate_event_time").desc(),
+            F.col("candidate_event_id").desc()
+        )
+
+        candidate_latest_event = (
+            candidate
+            .withColumn("event_rank", F.dense_rank().over(event_window))
+            .filter(F.col("event_rank") == 1)
+            .drop("event_rank")
+            .filter(~F.array_contains(F.col("cur_visited"), F.col("source_table_full_name")))
+        )
+
+        next_df = (
+            candidate_latest_event
+            .select(
+                F.col("source_table_full_name").alias("reached_table_full_name"),
+                F.col("source_type").alias("reached_type"),
+                F.array_append(F.col("cur_path_tables"), F.col("source_table_full_name")).alias("path_tables"),
+                F.array_append(F.col("cur_visited"), F.col("source_table_full_name")).alias("visited"),
+                F.col("created_by"),
+                F.col("entity_type"),
+                F.col("entity_id"),
+                F.col("entity_run_id"),
+                F.col("candidate_event_time").alias("event_time"),
+                F.col("current_reached_table").alias("from_table"),
+                F.col("current_reached_type").alias("from_type"),
+                F.col("candidate_event_time").alias("as_of_time"),
+                F.array_join(
+                    F.array_append(F.col("cur_path_tables"), F.col("source_table_full_name")),
+                    "||"
+                ).alias("current_path_key")
+            )
+            .dropDuplicates(["current_path_key"])
+            .cache()
+        )
+
+        old_current = current
+        current = next_df
+        old_current.unpersist()
+
+        level += 1
+
+    return levels
+
+print("\nComputing PRIMARY upstream lineage...")
+primary_levels = compute_upstream_latest_write()
+
+if not primary_levels:
+    raise ValueError("No primary upstream lineage rows were produced.")
+
+primary_df = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), primary_levels)
+
+primary_df = primary_df.withColumn(
+    "path_id",
+    F.sha2(
+        F.concat_ws(
+            "||",
+            F.col("direction"),
+            F.lit(root_table_full_name),
+            F.array_join(F.col("path_tables"), "||")
+        ),
+        256
+    )
+)
+
+primary_df.createOrReplaceTempView("primary_lineage_final")
+print(f"\n✅ primary_lineage_final rows: {primary_df.count():,}")
+
+# ============================================================
+# 5. PRIMARY SUMMARIES
+# ============================================================
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW primary_lineage_hop_summary AS
+SELECT
+  hop_count,
+  ARRAY_SORT(COLLECT_SET(reached_table_full_name)) AS objects_at_hop,
+  ARRAY_SORT(COLLECT_SET(COALESCE(reached_type, 'UNKNOWN'))) AS object_types_at_hop,
+  COUNT(*) AS path_rows_at_hop,
+  COUNT(DISTINCT reached_table_full_name) AS distinct_objects_at_hop
+FROM primary_lineage_final
+GROUP BY hop_count
+""")
+
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW primary_lineage_edge_summary AS
+SELECT
+  hop_count,
+  from_table,
+  from_type,
+  reached_table_full_name AS to_table,
+  reached_type AS to_type,
+  COUNT(*) AS path_rows_through_edge,
+  COUNT(DISTINCT path_id) AS distinct_paths_through_edge,
+  MIN(event_time) AS first_seen_event_time,
+  MAX(event_time) AS last_seen_event_time
+FROM primary_lineage_final
+WHERE hop_count > 0
+GROUP BY
+  hop_count,
+  from_table,
+  from_type,
+  reached_table_full_name,
+  reached_type
+""")
+
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW primary_lineage_path_summary AS
+SELECT
+  path_id,
+  MAX(hop_count) AS max_hop_count,
+  MIN(event_time) AS first_seen_event_time,
+  MAX(event_time) AS last_seen_event_time,
+  path_tables
+FROM primary_lineage_final
+GROUP BY path_id, path_tables
+""")
+
+# ============================================================
+# 6. SECONDARY ANSWER:
+#    RECENT DIRECT CONTRIBUTORS TO THE ROOT
+#
+#    Use this as a supplement when history suggests incremental writes.
+#    It is deliberately direct-to-root only.
+# ============================================================
+recent_root_contributors_df = spark.sql(f"""
+SELECT
+  source_table_full_name,
+  source_type,
+  MIN(event_time) AS first_seen_event_time,
+  MAX(event_time) AS last_seen_event_time,
+  COUNT(DISTINCT event_id) AS root_write_events_seen_in
+FROM information_schema.table_lineage
+WHERE target_table_full_name = '{root_table_full_name}'
+  AND source_table_full_name IS NOT NULL
+  AND target_table_full_name IS NOT NULL
+  AND event_time >= TIMESTAMP('{recent_window_start}')
+  AND event_time <= TIMESTAMP('{root_latest_any_event_time}')
+GROUP BY
+  source_table_full_name,
+  source_type
+""").cache()
+
+recent_root_contributors_df.createOrReplaceTempView("recent_root_contributors")
+print(f"Recent direct contributors to root: {recent_root_contributors_df.count():,}")
+
+recent_root_events_df = spark.sql(f"""
+SELECT
+  event_id,
+  event_time,
+  COUNT(*) AS rw_rows_in_event,
+  COUNT(DISTINCT source_table_full_name) AS distinct_parents_in_event,
+  COLLECT_SET(source_table_full_name) AS parents
+FROM information_schema.table_lineage
+WHERE target_table_full_name = '{root_table_full_name}'
+  AND source_table_full_name IS NOT NULL
+  AND target_table_full_name IS NOT NULL
+  AND event_time >= TIMESTAMP('{recent_window_start}')
+  AND event_time <= TIMESTAMP('{root_latest_any_event_time}')
+GROUP BY event_id, event_time
+ORDER BY event_time DESC, event_id DESC
+""")
+
+recent_root_events_df.createOrReplaceTempView("recent_root_events")
+
+# ============================================================
+# 7. WHAT TO USE WHEN
+# ============================================================
+print("\n✅ Created temp views:")
+print("  - root_history_recent")
+print("  - root_history_profile")
+print("  - rw_edges")
+print("  - root_latest_event_sources")
+print("  - primary_lineage_final")
+print("  - primary_lineage_hop_summary")
+print("  - primary_lineage_edge_summary")
+print("  - primary_lineage_path_summary")
+print("  - recent_root_contributors")
+print("  - recent_root_events")
+
+print("\nUse these views like this:")
+print("  primary_lineage_hop_summary  -> main answer: what made this table now?")
+print("  primary_lineage_edge_summary -> how each hop connects")
+print("  primary_lineage_path_summary -> exact chains / drill-down")
+print("  recent_root_contributors     -> supplement for MERGE/update/delete style tables")
+print("  root_history_profile         -> tells you whether the table behaves incrementally")
