@@ -1,89 +1,85 @@
 -- =====================================================
--- PARAMETERS - CHANGE THESE VALUES
+-- PARAMETERS - CHANGE THESE VALUES HERE
 -- =====================================================
-SET root_table_full_name = 'eciscor_prod.npdataset.npd_current_pending';   -- Change to your root table
-SET as_of_date = '';                                                       -- YYYY-MM-DD or leave empty for latest
+SET root_table_full_name = 'eciscor_prod.npdataset.npd_current_pending';  -- <<< CHANGE THIS
+SET as_of_date = '';                                                     -- YYYY-MM-DD or leave empty for latest
 SET target_schema = 'cdo';
 SET target_table_prefix = 'npd_lineage_paths';
 
 SELECT 
-  'Parameters set:' AS message,
-  ${root_table_full_name} AS root_table,
+  '✅ Parameters set successfully' AS status,
+  ${root_table_full_name} AS root_table_full_name,
   ${as_of_date} AS as_of_date,
   ${target_schema} AS target_schema,
   ${target_table_prefix} AS target_table_prefix;
 
+
+
+
+
 -- =====================================================
--- UC LINEAGE EXPLORER - FULL SQL VERSION (2025.40 Optimized)
--- Full paths + Hop summary + Edge summary with jobs, creators, dates, path counts
--- MAX RECURSION LEVEL 50 + LIMIT ALL for 2025.40 SQL Warehouse
+-- UC LINEAGE EXPLORER - FULL SQL (2025.40 Serverless Optimized)
+-- MAX RECURSION LEVEL 50 + LIMIT ALL to bypass 1M limit
 -- =====================================================
 
 WITH 
--- 1. Resolve root event time
 root_run AS (
-  SELECT 
-    MAX(event_time) AS root_event_time
+  SELECT MAX(event_time) AS root_event_time
   FROM information_schema.table_lineage
   WHERE target_table_full_name = ${root_table_full_name}
     AND (${as_of_date} = '' OR event_time <= TRY_CAST(${as_of_date} || ' 23:59:59' AS TIMESTAMP))
 ),
 
--- 2. Latest edges as-of root time
 edges_as_of AS (
   SELECT 
     entity_type, entity_id, entity_run_id,
-    source_table_full_name, source_table_catalog, source_table_schema, source_table_name, source_type,
-    target_table_full_name, target_table_catalog, target_table_schema, target_table_name, target_type,
+    source_table_full_name, source_table_schema, source_table_name, source_type,
+    target_table_full_name, target_table_schema, target_table_name, target_type,
     created_by, event_time, event_id,
-    ROW_NUMBER() OVER (
-      PARTITION BY source_table_full_name, target_table_full_name 
-      ORDER BY event_time DESC, event_id DESC
-    ) AS rn
+    ROW_NUMBER() OVER (PARTITION BY source_table_full_name, target_table_full_name 
+                       ORDER BY event_time DESC, event_id DESC) AS rn
   FROM information_schema.table_lineage
   WHERE event_time <= (SELECT root_event_time FROM root_run)
     AND source_table_full_name IS NOT NULL
     AND target_table_full_name IS NOT NULL
 ),
 
--- 3. RECURSIVE UPSTREAM PATHS
+-- Upstream recursive (with MAX RECURSION LEVEL for 2025.40)
 upstream_paths AS (
   WITH RECURSIVE upstream_paths AS (
-    -- Hop 0: Root
     SELECT 
       ${root_table_full_name} AS root_table_full_name,
       ${root_table_full_name} AS reached_table_full_name,
       SPLIT_PART(${root_table_full_name}, '.', 2) AS reached_table_schema,
       SPLIT_PART(${root_table_full_name}, '.', 3) AS reached_table_name,
       'TABLE' AS reached_type,
-      CAST(NULL AS STRING) AS edge_source_table_full_name,
-      CAST(NULL AS STRING) AS edge_target_table_full_name,
-      CAST(NULL AS STRING) AS edge_source_type,
-      CAST(NULL AS STRING) AS edge_target_type,
-      CAST(NULL AS STRING) AS event_id,
-      CAST(NULL AS TIMESTAMP) AS event_time,
-      CAST(NULL AS STRING) AS event_date,
-      CAST(NULL AS STRING) AS created_by,
-      CAST(NULL AS STRING) AS entity_type,
-      CAST(NULL AS STRING) AS entity_id,
-      CAST(NULL AS STRING) AS entity_run_id,
+      NULL AS edge_source_table_full_name,
+      NULL AS edge_target_table_full_name,
+      NULL AS edge_source_type,
+      NULL AS edge_target_type,
+      NULL AS event_id,
+      NULL AS event_time,
+      NULL AS event_date,
+      NULL AS created_by,
+      NULL AS entity_type,
+      NULL AS entity_id,
+      NULL AS entity_run_id,
       ARRAY(${root_table_full_name}) AS path_tables,
       ARRAY(${root_table_full_name}) AS visited
     FROM root_run
 
     UNION ALL
 
-    -- Follow upstream (target → source)
     SELECT 
       up.root_table_full_name,
       e.source_table_full_name AS reached_table_full_name,
-      e.source_table_schema AS reached_table_schema,
-      e.source_table_name AS reached_table_name,
-      e.source_type AS reached_type,
-      e.source_table_full_name AS edge_source_table_full_name,
-      e.target_table_full_name AS edge_target_table_full_name,
-      e.source_type AS edge_source_type,
-      e.target_type AS edge_target_type,
+      e.source_table_schema,
+      e.source_table_name,
+      e.source_type,
+      e.source_table_full_name,
+      e.target_table_full_name,
+      e.source_type,
+      e.target_type,
       e.event_id,
       e.event_time,
       DATE(e.event_time) AS event_date,
@@ -91,192 +87,111 @@ upstream_paths AS (
       e.entity_type,
       e.entity_id,
       e.entity_run_id,
-      ARRAY_APPEND(up.path_tables, e.source_table_full_name) AS path_tables,
-      ARRAY_APPEND(up.visited, e.source_table_full_name) AS visited
+      ARRAY_APPEND(up.path_tables, e.source_table_full_name),
+      ARRAY_APPEND(up.visited, e.source_table_full_name)
     FROM upstream_paths up
     JOIN edges_as_of e ON up.reached_table_full_name = e.target_table_full_name
     WHERE NOT ARRAY_CONTAINS(up.visited, e.source_table_full_name)
       AND SIZE(up.path_tables) < 25
   )
-  SELECT 
-    root_table_full_name,
-    'UPSTREAM' AS direction,
-    SIZE(path_tables) - 1 AS hop_count,
-    reached_table_full_name,
-    reached_table_schema,
-    reached_table_name,
-    reached_type,
-    edge_source_table_full_name,
-    edge_target_table_full_name,
-    edge_source_type,
-    edge_target_type,
-    event_id, event_time, event_date, created_by,
-    entity_type, entity_id, entity_run_id,
-    path_tables,
-    visited
+  SELECT *, 'UPSTREAM' AS direction, SIZE(path_tables)-1 AS hop_count
   FROM upstream_paths
   MAX RECURSION LEVEL 50
 ),
 
--- 4. RECURSIVE DOWNSTREAM PATHS
+-- Downstream recursive (similar)
 downstream_paths AS (
   WITH RECURSIVE downstream_paths AS (
-    -- Hop 0: Root
     SELECT 
       ${root_table_full_name} AS root_table_full_name,
       ${root_table_full_name} AS reached_table_full_name,
       SPLIT_PART(${root_table_full_name}, '.', 2) AS reached_table_schema,
       SPLIT_PART(${root_table_full_name}, '.', 3) AS reached_table_name,
       'TABLE' AS reached_type,
-      CAST(NULL AS STRING) AS edge_source_table_full_name,
-      CAST(NULL AS STRING) AS edge_target_table_full_name,
-      CAST(NULL AS STRING) AS edge_source_type,
-      CAST(NULL AS STRING) AS edge_target_type,
-      CAST(NULL AS STRING) AS event_id,
-      CAST(NULL AS TIMESTAMP) AS event_time,
-      CAST(NULL AS STRING) AS event_date,
-      CAST(NULL AS STRING) AS created_by,
-      CAST(NULL AS STRING) AS entity_type,
-      CAST(NULL AS STRING) AS entity_id,
-      CAST(NULL AS STRING) AS entity_run_id,
+      NULL AS edge_source_table_full_name,
+      NULL AS edge_target_table_full_name,
+      NULL AS edge_source_type,
+      NULL AS edge_target_type,
+      NULL AS event_id,
+      NULL AS event_time,
+      NULL AS event_date,
+      NULL AS created_by,
+      NULL AS entity_type,
+      NULL AS entity_id,
+      NULL AS entity_run_id,
       ARRAY(${root_table_full_name}) AS path_tables,
       ARRAY(${root_table_full_name}) AS visited
     FROM root_run
 
     UNION ALL
 
-    -- Follow downstream (source → target)
     SELECT 
       dp.root_table_full_name,
-      e.target_table_full_name AS reached_table_full_name,
-      e.target_table_schema AS reached_table_schema,
-      e.target_table_name AS reached_table_name,
-      e.target_type AS reached_type,
-      e.source_table_full_name AS edge_source_table_full_name,
-      e.target_table_full_name AS edge_target_table_full_name,
-      e.source_type AS edge_source_type,
-      e.target_type AS edge_target_type,
+      e.target_table_full_name,
+      e.target_table_schema,
+      e.target_table_name,
+      e.target_type,
+      e.source_table_full_name,
+      e.target_table_full_name,
+      e.source_type,
+      e.target_type,
       e.event_id,
       e.event_time,
-      DATE(e.event_time) AS event_date,
+      DATE(e.event_time),
       e.created_by,
       e.entity_type,
       e.entity_id,
       e.entity_run_id,
-      ARRAY_APPEND(dp.path_tables, e.target_table_full_name) AS path_tables,
-      ARRAY_APPEND(dp.visited, e.target_table_full_name) AS visited
+      ARRAY_APPEND(dp.path_tables, e.target_table_full_name),
+      ARRAY_APPEND(dp.visited, e.target_table_full_name)
     FROM downstream_paths dp
     JOIN edges_as_of e ON dp.reached_table_full_name = e.source_table_full_name
     WHERE NOT ARRAY_CONTAINS(dp.visited, e.target_table_full_name)
       AND SIZE(dp.path_tables) < 25
   )
-  SELECT 
-    root_table_full_name,
-    'DOWNSTREAM' AS direction,
-    SIZE(path_tables) - 1 AS hop_count,
-    reached_table_full_name,
-    reached_table_schema,
-    reached_table_name,
-    reached_type,
-    edge_source_table_full_name,
-    edge_target_table_full_name,
-    edge_source_type,
-    edge_target_type,
-    event_id, event_time, event_date, created_by,
-    entity_type, entity_id, entity_run_id,
-    path_tables,
-    visited
+  SELECT *, 'DOWNSTREAM' AS direction, SIZE(path_tables)-1 AS hop_count
   FROM downstream_paths
   MAX RECURSION LEVEL 50
 ),
 
--- 5. Combine + path_id
-all_hops AS (
-  SELECT * FROM upstream_paths UNION ALL SELECT * FROM downstream_paths
-),
+all_hops AS (SELECT * FROM upstream_paths UNION ALL SELECT * FROM downstream_paths),
 
-base AS (
+final AS (
   SELECT 
     SHA2(CONCAT_WS('||', direction, root_table_full_name, ARRAY_JOIN(path_tables, '||')), 256) AS path_id,
     *
   FROM all_hops
-),
-
-final AS (
-  SELECT 
-    path_id,
-    root_table_full_name,
-    direction,
-    hop_count,
-    reached_table_full_name,
-    reached_table_schema,
-    reached_table_name,
-    reached_type,
-    edge_source_table_full_name,
-    edge_target_table_full_name,
-    edge_source_type,
-    edge_target_type,
-    event_id, event_time, event_date, created_by,
-    entity_type, entity_id, entity_run_id,
-    path_tables,
-
-    TRANSFORM(path_tables, (tbl, idx) -> CONCAT('Hop ', idx, ': ', SPLIT_PART(tbl, '.', 2), '.', SPLIT_PART(tbl, '.', 3))) AS hop_steps,
-    TRANSFORM(path_tables, (tbl, idx) -> CONCAT('Hop ', idx, ': ', COALESCE(entity_type, 'UNKNOWN'), ' ', COALESCE(entity_id, 'N/A'))) AS hop_entity_steps,
-    TRANSFORM(path_tables, (tbl, idx) -> CONCAT('Hop ', idx, ': ', COALESCE(event_date, 'N/A'))) AS hop_event_dates
-  FROM base
-  GROUP BY 
-    path_id, root_table_full_name, direction, hop_count,
-    reached_table_full_name, reached_table_schema, reached_table_name, reached_type,
-    edge_source_table_full_name, edge_target_table_full_name,
-    edge_source_type, edge_target_type,
-    event_id, event_time, event_date, created_by,
-    entity_type, entity_id, entity_run_id, path_tables
 )
 
--- =====================================================
--- CREATE OUTPUT TABLES
--- =====================================================
-
--- 1. Full detailed paths (one row per path)
+-- Create the three useful tables
 CREATE OR REPLACE TABLE ${target_schema}.${target_table_prefix}_full AS
-SELECT * FROM final
-LIMIT ALL;
+SELECT * FROM final LIMIT ALL;
 
--- 2. Hop-level summary (objects per hop + path counts)
 CREATE OR REPLACE TABLE ${target_schema}.${target_table_prefix}_hop_summary AS
 SELECT 
-  direction,
-  hop_count,
+  direction, hop_count,
   COLLECT_SET(reached_table_full_name) AS objects_at_hop,
-  ARRAY_SIZE(COLLECT_SET(reached_table_full_name)) AS num_objects_at_hop,
   COUNT(DISTINCT path_id) AS num_paths_reaching_this_hop,
-  COLLECT_LIST(DISTINCT created_by) AS creators_at_hop,
-  MAX(event_time) AS latest_event_at_hop
+  COLLECT_SET(created_by) AS creators_at_hop,
+  MAX(event_time) AS latest_event
 FROM final
-GROUP BY direction, hop_count
-ORDER BY direction, hop_count;
+GROUP BY direction, hop_count;
 
--- 3. Edge-level summary (BEST VIEW: parent → child with jobs, creators, dates, path counts)
 CREATE OR REPLACE TABLE ${target_schema}.${target_table_prefix}_hop_edges_summary AS
 SELECT 
   direction,
-  hop_count - 1 AS from_hop,
+  hop_count-1 AS from_hop,
   ELEMENT_AT(path_tables, hop_count) AS from_table,
   hop_count AS to_hop,
   reached_table_full_name AS to_table,
   COUNT(DISTINCT path_id) AS num_paths_through_edge,
   COLLECT_SET(created_by) AS creators,
-  COLLECT_SET(CONCAT(COALESCE(entity_type, 'UNKNOWN'), ' ', COALESCE(entity_id, 'N/A'))) AS hop_entity_steps_at_to_hop,
-  MAX(event_time) AS latest_event_at_edge,
-  COLLECT_SET(DATE(event_time)) AS event_dates_at_edge
+  COLLECT_SET(CONCAT(COALESCE(entity_type,'UNKNOWN'),' ',COALESCE(entity_id,'N/A'))) AS entity_steps,
+  MAX(event_time) AS latest_event
 FROM final
 WHERE hop_count > 0
-GROUP BY direction, from_hop, from_table, to_hop, to_table
-ORDER BY direction, from_hop, from_table, to_table;
+GROUP BY direction, from_hop, from_table, to_hop, to_table;
 
--- Status
-SELECT 
-  '✅ Lineage tables created successfully on 2025.40 SQL Warehouse!' AS status,
-  '${target_schema}.${target_table_prefix}_full' AS full_paths_table,
-  '${target_schema}.${target_table_prefix}_hop_summary' AS hop_summary_table,
-  '${target_schema}.${target_table_prefix}_hop_edges_summary' AS best_edge_summary_table;
+SELECT '✅ Success! Tables created:' AS status,
+       ${target_schema} || '.' || ${target_table_prefix} || '_full' AS full_table,
+       ${target_schema} || '.' || ${target_table_prefix} || '_hop_edges_summary' AS best_view_for_analysis;
