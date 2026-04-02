@@ -1,7 +1,6 @@
 # Databricks notebook source
 
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 from pyspark.sql.types import (
     StructType, StructField, StringType, ArrayType, TimestampType
 )
@@ -25,9 +24,10 @@ print(f"Max rows per hop: {max_rows_per_hop:,}")
 print(f"Max total path rows: {max_total_path_rows:,}")
 
 # ============================================================
-# 1. RESOLVE ROOT EVENT TIME
-#    Pick the most recent lineage event for the root table
-#    on or before as_of_date (or latest if None)
+# 1. RESOLVE ROOT EVENT TIME FOR UPSTREAM
+#    IMPORTANT:
+#    Choose the latest READ-AND-WRITE event for the root table,
+#    not just any target event.
 # ============================================================
 as_of_filter = (
     "TRUE"
@@ -48,6 +48,8 @@ WITH ranked_root AS (
     ) AS rn
   FROM information_schema.table_lineage
   WHERE target_table_full_name = '{root_table_full_name}'
+    AND source_table_full_name IS NOT NULL
+    AND target_table_full_name IS NOT NULL
     AND {as_of_filter}
 )
 SELECT
@@ -61,23 +63,28 @@ WHERE rn = 1
 
 root_row = root_event_df.first()
 if root_row is None or root_row["event_time"] is None:
-    raise ValueError(f"No lineage events found for root table {root_table_full_name}")
+    raise ValueError(
+        f"No read-and-write lineage events found for root table {root_table_full_name}. "
+        f"This usually means the latest visible lineage for the table is write-only or lineage is incomplete."
+    )
 
 root_event_time = root_row["event_time"]
 root_type = root_row["target_type"] if root_row["target_type"] is not None else "ROOT"
 root_event_id = root_row["event_id"]
 
-print(f"Root event time used for both directions: {root_event_time}")
-print(f"Root event id: {root_event_id}")
-print(f"Root type: {root_type}")
+print(f"Root upstream anchor event time: {root_event_time}")
+print(f"Root upstream anchor event id:   {root_event_id}")
+print(f"Root type:                       {root_type}")
 
 # ============================================================
-# 2. BUILD EVENT-BASED EDGE SNAPSHOT
-#    For each target, keep ALL rows from its latest lineage event
-#    as of root_event_time
+# 2. BUILD UPSTREAM/DOWNSTREAM EDGE SNAPSHOT
+#    Use latest READ-AND-WRITE event per target as of root_event_time
+#    This avoids:
+#      - mixing old/new parents for same target
+#      - anchoring to write-only events with no source rows
 # ============================================================
 edges = spark.sql(f"""
-WITH latest_target_event AS (
+WITH latest_target_rw_event AS (
   SELECT
     target_table_full_name,
     target_type,
@@ -89,6 +96,7 @@ WITH latest_target_event AS (
     ) AS rn
   FROM information_schema.table_lineage
   WHERE target_table_full_name IS NOT NULL
+    AND source_table_full_name IS NOT NULL
     AND event_time <= TIMESTAMP('{root_event_time}')
 ),
 target_snapshot AS (
@@ -97,7 +105,7 @@ target_snapshot AS (
     target_type,
     event_id,
     event_time
-  FROM latest_target_event
+  FROM latest_target_rw_event
   WHERE rn = 1
 )
 SELECT
@@ -117,8 +125,7 @@ SELECT
 
   l.created_by,
   l.event_time,
-  l.event_id,
-  DATE(l.event_time) AS event_date
+  l.event_id
 FROM information_schema.table_lineage l
 INNER JOIN target_snapshot s
   ON l.target_table_full_name = s.target_table_full_name
@@ -129,9 +136,21 @@ WHERE l.source_table_full_name IS NOT NULL
 """).cache()
 
 edge_count = edges.count()
-print(f"Edges after target-event snapshot: {edge_count:,} rows")
+print(f"Edges after target read-write event snapshot: {edge_count:,} rows")
 
 edges.createOrReplaceTempView("edges_snapshot")
+
+# Quick sanity check: does the root have upstream parents in the edge snapshot?
+root_parent_check = spark.sql(f"""
+SELECT
+  COUNT(*) AS root_parent_rows,
+  COUNT(DISTINCT source_table_full_name) AS root_distinct_parents
+FROM edges_snapshot
+WHERE target_table_full_name = '{root_table_full_name}'
+""").first()
+
+print(f"Root parent rows in snapshot:      {root_parent_check['root_parent_rows']:,}")
+print(f"Root distinct parents in snapshot: {root_parent_check['root_distinct_parents']:,}")
 
 # ============================================================
 # 3. EXPLICIT TRAVERSAL SCHEMA
@@ -152,7 +171,9 @@ schema = StructType([
 
 # ============================================================
 # 4. ITERATIVE BFS
-#    Produces path rows, but also prints distinct objects per hop
+#    Main metric printed:
+#      - path rows
+#      - distinct objects
 # ============================================================
 def compute_direction(direction="UPSTREAM"):
     current = spark.createDataFrame(
@@ -277,7 +298,6 @@ def compute_direction(direction="UPSTREAM"):
                 )
             )
 
-        # dedupe NEXT frontier by full path
         next_df = (
             next_df
             .withColumn("path_key", F.array_join(F.col("path_tables"), "||"))
@@ -329,8 +349,7 @@ final_df.createOrReplaceTempView("lineage_final")
 print(f"\n✅ lineage_final created with {final_df.count():,} rows")
 
 # ============================================================
-# 6. OBJECTS BY HOP
-#    Main answer to: "what all made this root table?"
+# 6. SUMMARIES
 # ============================================================
 spark.sql("""
 CREATE OR REPLACE TEMP VIEW lineage_hop_summary AS
@@ -345,10 +364,6 @@ FROM lineage_final
 GROUP BY direction, hop_count
 """)
 
-# ============================================================
-# 7. EDGES BY HOP
-#    Bridge between hop summaries and full paths
-# ============================================================
 spark.sql("""
 CREATE OR REPLACE TEMP VIEW lineage_edge_summary AS
 SELECT
@@ -376,10 +391,6 @@ GROUP BY
   reached_type
 """)
 
-# ============================================================
-# 8. FULL PATHS
-#    Drill-down layer
-# ============================================================
 spark.sql("""
 CREATE OR REPLACE TEMP VIEW lineage_path_summary AS
 SELECT
