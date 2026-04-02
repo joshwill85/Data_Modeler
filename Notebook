@@ -1,8 +1,7 @@
 -- =====================================================
--- UC LINEAGE EXPLORER - CORRECT RECURSIVE SYNTAX FOR 2025.40
--- MAX RECURSION LEVEL now in the exact required position
+-- STEP 1: Build the final result set (no CREATE yet)
 -- =====================================================
-
+CREATE OR REPLACE TEMPORARY VIEW lineage_final AS
 WITH params AS (SELECT * FROM lineage_params),
 
 root_run AS (
@@ -29,10 +28,9 @@ edges_as_of AS (
     AND target_table_full_name IS NOT NULL
 ),
 
--- Upstream - CORRECT syntax
+-- Upstream
 upstream_paths AS (
   WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
-    -- Hop 0: Root
     SELECT 
       p.root_table_full_name,
       p.root_table_full_name AS reached_table_full_name,
@@ -56,7 +54,6 @@ upstream_paths AS (
 
     UNION ALL
 
-    -- Recursive step
     SELECT 
       up.root_table_full_name,
       e.source_table_full_name,
@@ -85,7 +82,7 @@ upstream_paths AS (
   FROM cte
 ),
 
--- Downstream - CORRECT syntax
+-- Downstream
 downstream_paths AS (
   WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
     SELECT 
@@ -139,20 +136,28 @@ downstream_paths AS (
   FROM cte
 ),
 
-all_hops AS (SELECT * FROM upstream_paths UNION ALL SELECT * FROM downstream_paths),
+all_hops AS (SELECT * FROM upstream_paths UNION ALL SELECT * FROM downstream_paths)
 
-final AS (
-  SELECT 
-    SHA2(CONCAT_WS('||', direction, root_table_full_name, ARRAY_JOIN(path_tables, '||')), 256) AS path_id,
-    *
-  FROM all_hops
-)
+SELECT 
+  SHA2(CONCAT_WS('||', direction, root_table_full_name, ARRAY_JOIN(path_tables, '||')), 256) AS path_id,
+  *
+FROM all_hops;
 
--- Create tables
-CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_full') 
-AS SELECT * FROM final LIMIT ALL;
 
-CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_hop_edges_summary') 
+
+
+
+
+
+
+
+-- =====================================================
+-- STEP 2: Create permanent tables from the temp view
+-- =====================================================
+CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_full') 
+AS SELECT * FROM lineage_final LIMIT ALL;
+
+CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_hop_edges_summary') 
 AS
 SELECT 
   direction,
@@ -165,8 +170,11 @@ SELECT
   COLLECT_SET(CONCAT(COALESCE(entity_type, 'UNKNOWN'), ' ', COALESCE(entity_id, 'N/A'))) AS hop_entity_steps_at_to_hop,
   MAX(event_time) AS latest_event_at_edge,
   COLLECT_SET(DATE(event_time)) AS event_dates_at_edge
-FROM final
+FROM lineage_final
 WHERE hop_count > 0
 GROUP BY direction, from_hop, from_table, to_hop, to_table;
 
-SELECT '✅ Success! Tables created' AS status;
+SELECT 
+  '✅ All tables created successfully!' AS status,
+  (SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_hop_edges_summary' AS best_view;
+
