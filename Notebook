@@ -1,31 +1,34 @@
 -- =====================================================
--- PARAMETERS - EDIT THESE VALUES
+-- EDIT THESE VALUES ONLY IN THIS CELL
 -- =====================================================
-SET root_table_full_name = 'eciscor_prod.npdataset.npd_current_pending';   -- <<< CHANGE THIS TO YOUR ROOT TABLE
-SET as_of_date = '';                                                       -- Leave empty for latest, or '2026-03-15'
-SET target_schema = 'cdo';
-SET target_table_prefix = 'npd_lineage_paths';
-
+CREATE OR REPLACE TEMPORARY VIEW lineage_params AS
 SELECT 
-  '✅ Parameters set' AS status,
-  ${root_table_full_name} AS root_table,
-  ${as_of_date} AS as_of_date,
-  ${target_schema} AS target_schema,
-  ${target_table_prefix} AS prefix;
+  'eciscor_prod.npdataset.npd_current_pending' AS root_table_full_name,   -- <<< CHANGE THIS TO YOUR ROOT TABLE
+  '' AS as_of_date,                                                       -- YYYY-MM-DD or empty string for latest
+  'cdo' AS target_schema,
+  'npd_lineage_paths' AS target_table_prefix;
+
+SELECT * FROM lineage_params;
+
 
 
 
 -- =====================================================
--- UC LINEAGE EXPLORER - 2025.40 SQL WAREHOUSE (Unity Catalog)
--- MAX RECURSION LEVEL 50 + LIMIT ALL to bypass 1M limit
+-- UC LINEAGE EXPLORER - UNITY CATALOG + 2025.40
+-- No parameters — uses temp view for values
+-- MAX RECURSION LEVEL 50 + LIMIT ALL
 -- =====================================================
 
-WITH 
+WITH params AS (
+  SELECT * FROM lineage_params
+),
+
 root_run AS (
   SELECT MAX(event_time) AS root_event_time
   FROM information_schema.table_lineage
-  WHERE target_table_full_name = ${root_table_full_name}
-    AND (${as_of_date} = '' OR event_time <= TRY_CAST(${as_of_date} || ' 23:59:59' AS TIMESTAMP))
+  WHERE target_table_full_name = (SELECT root_table_full_name FROM params)
+    AND ((SELECT as_of_date FROM params) = '' 
+         OR event_time <= TRY_CAST((SELECT as_of_date FROM params) || ' 23:59:59' AS TIMESTAMP))
 ),
 
 edges_as_of AS (
@@ -40,19 +43,18 @@ edges_as_of AS (
     ) AS rn
   FROM information_schema.table_lineage
   WHERE event_time <= (SELECT root_event_time FROM root_run)
-    AND source_table_full_name IS NOT NULL 
+    AND source_table_full_name IS NOT NULL
     AND target_table_full_name IS NOT NULL
 ),
 
--- Upstream recursive
+-- Upstream
 upstream_paths AS (
   WITH RECURSIVE upstream_paths AS (
-    -- Hop 0: Root
     SELECT 
-      ${root_table_full_name} AS root_table_full_name,
-      ${root_table_full_name} AS reached_table_full_name,
-      SPLIT_PART(${root_table_full_name}, '.', 2) AS reached_table_schema,
-      SPLIT_PART(${root_table_full_name}, '.', 3) AS reached_table_name,
+      p.root_table_full_name,
+      p.root_table_full_name AS reached_table_full_name,
+      SPLIT_PART(p.root_table_full_name, '.', 2) AS reached_table_schema,
+      SPLIT_PART(p.root_table_full_name, '.', 3) AS reached_table_name,
       'TABLE' AS reached_type,
       NULL AS edge_source_table_full_name,
       NULL AS edge_target_table_full_name,
@@ -65,9 +67,9 @@ upstream_paths AS (
       NULL AS entity_type,
       NULL AS entity_id,
       NULL AS entity_run_id,
-      ARRAY(${root_table_full_name}) AS path_tables,
-      ARRAY(${root_table_full_name}) AS visited
-    FROM root_run
+      ARRAY(p.root_table_full_name) AS path_tables,
+      ARRAY(p.root_table_full_name) AS visited
+    FROM params p
 
     UNION ALL
 
@@ -91,8 +93,7 @@ upstream_paths AS (
       ARRAY_APPEND(up.path_tables, e.source_table_full_name),
       ARRAY_APPEND(up.visited, e.source_table_full_name)
     FROM upstream_paths up
-    JOIN edges_as_of e 
-      ON up.reached_table_full_name = e.target_table_full_name
+    JOIN edges_as_of e ON up.reached_table_full_name = e.target_table_full_name
     WHERE NOT ARRAY_CONTAINS(up.visited, e.source_table_full_name)
       AND SIZE(up.path_tables) < 25
   )
@@ -101,14 +102,14 @@ upstream_paths AS (
   MAX RECURSION LEVEL 50
 ),
 
--- Downstream recursive
+-- Downstream
 downstream_paths AS (
   WITH RECURSIVE downstream_paths AS (
     SELECT 
-      ${root_table_full_name} AS root_table_full_name,
-      ${root_table_full_name} AS reached_table_full_name,
-      SPLIT_PART(${root_table_full_name}, '.', 2) AS reached_table_schema,
-      SPLIT_PART(${root_table_full_name}, '.', 3) AS reached_table_name,
+      p.root_table_full_name,
+      p.root_table_full_name AS reached_table_full_name,
+      SPLIT_PART(p.root_table_full_name, '.', 2) AS reached_table_schema,
+      SPLIT_PART(p.root_table_full_name, '.', 3) AS reached_table_name,
       'TABLE' AS reached_type,
       NULL AS edge_source_table_full_name,
       NULL AS edge_target_table_full_name,
@@ -121,9 +122,9 @@ downstream_paths AS (
       NULL AS entity_type,
       NULL AS entity_id,
       NULL AS entity_run_id,
-      ARRAY(${root_table_full_name}) AS path_tables,
-      ARRAY(${root_table_full_name}) AS visited
-    FROM root_run
+      ARRAY(p.root_table_full_name) AS path_tables,
+      ARRAY(p.root_table_full_name) AS visited
+    FROM params p
 
     UNION ALL
 
@@ -147,8 +148,7 @@ downstream_paths AS (
       ARRAY_APPEND(dp.path_tables, e.target_table_full_name),
       ARRAY_APPEND(dp.visited, e.target_table_full_name)
     FROM downstream_paths dp
-    JOIN edges_as_of e 
-      ON dp.reached_table_full_name = e.source_table_full_name
+    JOIN edges_as_of e ON dp.reached_table_full_name = e.source_table_full_name
     WHERE NOT ARRAY_CONTAINS(dp.visited, e.target_table_full_name)
       AND SIZE(dp.path_tables) < 25
   )
@@ -157,11 +157,7 @@ downstream_paths AS (
   MAX RECURSION LEVEL 50
 ),
 
-all_hops AS (
-  SELECT * FROM upstream_paths 
-  UNION ALL 
-  SELECT * FROM downstream_paths
-),
+all_hops AS (SELECT * FROM upstream_paths UNION ALL SELECT * FROM downstream_paths),
 
 final AS (
   SELECT 
@@ -170,11 +166,12 @@ final AS (
   FROM all_hops
 )
 
--- Create the three tables
-CREATE OR REPLACE TABLE ${target_schema}.${target_table_prefix}_full AS
-SELECT * FROM final LIMIT ALL;
+-- Create output tables
+CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_full') 
+AS SELECT * FROM final LIMIT ALL;
 
-CREATE OR REPLACE TABLE ${target_schema}.${target_table_prefix}_hop_summary AS
+CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_hop_summary') 
+AS
 SELECT 
   direction,
   hop_count,
@@ -185,7 +182,8 @@ SELECT
 FROM final
 GROUP BY direction, hop_count;
 
-CREATE OR REPLACE TABLE ${target_schema}.${target_table_prefix}_hop_edges_summary AS
+CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_hop_edges_summary') 
+AS
 SELECT 
   direction,
   hop_count - 1 AS from_hop,
@@ -202,5 +200,5 @@ WHERE hop_count > 0
 GROUP BY direction, from_hop, from_table, to_hop, to_table;
 
 SELECT 
-  '✅ Success! Tables created on Unity Catalog + 2025.40' AS status,
-  ${target_schema} || '.' || ${target_table_prefix} || '_hop_edges_summary' AS recommended_view_for_analysis;
+  '✅ All tables created successfully on Unity Catalog!' AS status,
+  (SELECT target_schema FROM params) || '.' || (SELECT target_table_prefix FROM params) || '_hop_edges_summary' AS best_view;
