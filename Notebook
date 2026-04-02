@@ -1,144 +1,24 @@
--- Cell 2: Build lineage_final temp view
-CREATE OR REPLACE TEMPORARY VIEW lineage_final AS
-WITH params AS (SELECT * FROM lineage_params),
+-- Create permanent tables from the temp view built in Cell 2
+CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_full') 
+AS SELECT * FROM lineage_final LIMIT ALL;
 
-root_run AS (
-  SELECT MAX(event_time) AS root_event_time
-  FROM information_schema.table_lineage
-  WHERE target_table_full_name = (SELECT root_table_full_name FROM params)
-    AND ((SELECT as_of_date FROM params) = '' 
-         OR event_time <= TRY_CAST((SELECT as_of_date FROM params) || ' 23:59:59' AS TIMESTAMP))
-),
-
-edges_as_of AS (
-  SELECT 
-    entity_type, entity_id, entity_run_id,
-    source_table_full_name, source_table_schema, source_table_name, source_type,
-    target_table_full_name, target_table_schema, target_table_name, target_type,
-    created_by, event_time, event_id,
-    ROW_NUMBER() OVER (
-      PARTITION BY source_table_full_name, target_table_full_name 
-      ORDER BY event_time DESC, event_id DESC
-    ) AS rn
-  FROM information_schema.table_lineage
-  WHERE event_time <= (SELECT root_event_time FROM root_run)
-    AND source_table_full_name IS NOT NULL
-    AND target_table_full_name IS NOT NULL
-),
-
-upstream_paths AS (
-  WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
-    SELECT 
-      p.root_table_full_name,
-      p.root_table_full_name AS reached_table_full_name,
-      SPLIT_PART(p.root_table_full_name, '.', 2) AS reached_table_schema,
-      SPLIT_PART(p.root_table_full_name, '.', 3) AS reached_table_name,
-      'TABLE' AS reached_type,
-      CAST(NULL AS STRING) AS edge_source_table_full_name,
-      CAST(NULL AS STRING) AS edge_target_table_full_name,
-      CAST(NULL AS STRING) AS edge_source_type,
-      CAST(NULL AS STRING) AS edge_target_type,
-      CAST(NULL AS STRING) AS event_id,
-      CAST(NULL AS TIMESTAMP) AS event_time,
-      CAST(NULL AS STRING) AS event_date,
-      CAST(NULL AS STRING) AS created_by,
-      CAST(NULL AS STRING) AS entity_type,
-      CAST(NULL AS STRING) AS entity_id,
-      CAST(NULL AS STRING) AS entity_run_id,
-      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS path_tables,
-      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS visited
-    FROM params p
-
-    UNION ALL
-
-    SELECT 
-      up.root_table_full_name,
-      e.source_table_full_name,
-      e.source_table_schema,
-      e.source_table_name,
-      e.source_type,
-      e.source_table_full_name,
-      e.target_table_full_name,
-      e.source_type,
-      e.target_type,
-      e.event_id,
-      e.event_time,
-      DATE(e.event_time) AS event_date,
-      e.created_by,
-      e.entity_type,
-      e.entity_id,
-      e.entity_run_id,
-      CAST(ARRAY_APPEND(up.path_tables, e.source_table_full_name) AS ARRAY<STRING>),
-      CAST(ARRAY_APPEND(up.visited, e.source_table_full_name) AS ARRAY<STRING>)
-    FROM cte up
-    JOIN edges_as_of e ON up.reached_table_full_name = e.target_table_full_name
-    WHERE NOT ARRAY_CONTAINS(up.visited, e.source_table_full_name)
-      AND SIZE(up.path_tables) < 25
-  )
-  SELECT *, 'UPSTREAM' AS direction, SIZE(path_tables) - 1 AS hop_count
-  FROM cte
-),
-
-downstream_paths AS (
-  WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
-    SELECT 
-      p.root_table_full_name,
-      p.root_table_full_name AS reached_table_full_name,
-      SPLIT_PART(p.root_table_full_name, '.', 2) AS reached_table_schema,
-      SPLIT_PART(p.root_table_full_name, '.', 3) AS reached_table_name,
-      'TABLE' AS reached_type,
-      CAST(NULL AS STRING) AS edge_source_table_full_name,
-      CAST(NULL AS STRING) AS edge_target_table_full_name,
-      CAST(NULL AS STRING) AS edge_source_type,
-      CAST(NULL AS STRING) AS edge_target_type,
-      CAST(NULL AS STRING) AS event_id,
-      CAST(NULL AS TIMESTAMP) AS event_time,
-      CAST(NULL AS STRING) AS event_date,
-      CAST(NULL AS STRING) AS created_by,
-      CAST(NULL AS STRING) AS entity_type,
-      CAST(NULL AS STRING) AS entity_id,
-      CAST(NULL AS STRING) AS entity_run_id,
-      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS path_tables,
-      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS visited
-    FROM params p
-
-    UNION ALL
-
-    SELECT 
-      dp.root_table_full_name,
-      e.target_table_full_name,
-      e.target_table_schema,
-      e.target_table_name,
-      e.target_type,
-      e.source_table_full_name,
-      e.target_table_full_name,
-      e.source_type,
-      e.target_type,
-      e.event_id,
-      e.event_time,
-      DATE(e.event_time) AS event_date,
-      e.created_by,
-      e.entity_type,
-      e.entity_id,
-      e.entity_run_id,
-      CAST(ARRAY_APPEND(dp.path_tables, e.target_table_full_name) AS ARRAY<STRING>),
-      CAST(ARRAY_APPEND(dp.visited, e.target_table_full_name) AS ARRAY<STRING>)
-    FROM cte dp
-    JOIN edges_as_of e ON dp.reached_table_full_name = e.source_table_full_name
-    WHERE NOT ARRAY_CONTAINS(dp.visited, e.target_table_full_name)
-      AND SIZE(dp.path_tables) < 25
-  )
-  SELECT *, 'DOWNSTREAM' AS direction, SIZE(path_tables) - 1 AS hop_count
-  FROM cte
-),
-
-all_hops AS (
-  SELECT * FROM upstream_paths 
-  UNION ALL 
-  SELECT * FROM downstream_paths
-)
+CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_hop_edges_summary') 
+AS
+SELECT 
+  direction,
+  hop_count - 1 AS from_hop,
+  ELEMENT_AT(path_tables, hop_count) AS from_table,
+  hop_count AS to_hop,
+  reached_table_full_name AS to_table,
+  COUNT(DISTINCT path_id) AS num_paths_through_edge,
+  COLLECT_SET(created_by) AS creators,
+  COLLECT_SET(CONCAT(COALESCE(entity_type, 'UNKNOWN'), ' ', COALESCE(entity_id, 'N/A'))) AS hop_entity_steps_at_to_hop,
+  MAX(event_time) AS latest_event_at_edge,
+  COLLECT_SET(DATE(event_time)) AS event_dates_at_edge
+FROM lineage_final
+WHERE hop_count > 0
+GROUP BY direction, from_hop, from_table, to_hop, to_table;
 
 SELECT 
-  SHA2(CONCAT_WS('||', direction, root_table_full_name, ARRAY_JOIN(path_tables, '||')), 256) AS path_id,
-  *
-FROM all_hops;
+  '✅ All tables created successfully on Unity Catalog!' AS status,
+  (SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_hop_edges_summary' AS best_view_for_analysis;
