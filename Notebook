@@ -1,45 +1,25 @@
 SELECT
-  event_id,
-  event_time,
-  COUNT(*) AS rw_rows_in_event,
-  COUNT(DISTINCT source_table_full_name) AS distinct_parents_in_event,
-  COLLECT_SET(source_table_full_name) AS parents
+  COUNT(DISTINCT source_table_full_name) AS direct_upstream_tables_7d,
+  COLLECT_SET(source_table_full_name) AS upstream_tables_7d
 FROM information_schema.table_lineage
-WHERE target_table_full_name = '<ROOT_TABLE>'
+WHERE target_table_full_name = 'eciscor_prod.npdataset.npd_current_pending'
   AND source_table_full_name IS NOT NULL
   AND target_table_full_name IS NOT NULL
-GROUP BY event_id, event_time
-ORDER BY event_time DESC, event_id DESC
-LIMIT 10;
-
-
-WITH ranked_root_rw AS (
-  SELECT
-    event_id,
-    event_time,
-    ROW_NUMBER() OVER (
-      ORDER BY event_time DESC, event_id DESC
-    ) AS rn
-  FROM information_schema.table_lineage
-  WHERE target_table_full_name = '<ROOT_TABLE>'
-    AND source_table_full_name IS NOT NULL
-    AND target_table_full_name IS NOT NULL
-)
-SELECT
-  COUNT(DISTINCT l.source_table_full_name) AS expected_hop1_distinct_objects,
-  COLLECT_SET(l.source_table_full_name) AS expected_hop1_sources
-FROM information_schema.table_lineage l
-INNER JOIN ranked_root_rw r
-  ON l.event_id = r.event_id
-WHERE r.rn = 1
-  AND l.target_table_full_name = '<ROOT_TABLE>'
-  AND l.source_table_full_name IS NOT NULL
-  AND l.target_table_full_name IS NOT NULL;
-
-
+  AND event_time >= current_timestamp() - INTERVAL 7 DAYS
+  AND event_time <= current_timestamp();
 
 SELECT
-  COUNT(DISTINCT reached_table_full_name) AS actual_hop1_distinct_objects,
-  COLLECT_SET(reached_table_full_name) AS actual_hop1_sources
-FROM primary_lineage_final
-WHERE hop_count = 1;
+  source_table_full_name,
+  source_type,
+  COUNT(DISTINCT event_id) AS events_seen_7d,
+  MAX(event_time) AS latest_seen_time_7d
+FROM information_schema.table_lineage
+WHERE target_table_full_name = 'eciscor_prod.npdataset.npd_current_pending'
+  AND source_table_full_name IS NOT NULL
+  AND target_table_full_name IS NOT NULL
+  AND event_time >= current_timestamp() - INTERVAL 7 DAYS
+  AND event_time <= current_timestamp()
+GROUP BY
+  source_table_full_name,
+  source_type
+ORDER BY latest_seen_time_7d DESC, source_table_full_name;
