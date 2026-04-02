@@ -1,8 +1,8 @@
--- Create permanent tables from the temp view built in Cell 2
-CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_full') 
+-- Cell 3: Create permanent tables (hard-coded names — no dynamic IDENTIFIER)
+CREATE OR REPLACE TABLE cdo.npd_lineage_paths_full 
 AS SELECT * FROM lineage_final LIMIT ALL;
 
-CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_hop_edges_summary') 
+CREATE OR REPLACE TABLE cdo.npd_lineage_paths_hop_edges_summary 
 AS
 SELECT 
   direction,
@@ -20,5 +20,5 @@ WHERE hop_count > 0
 GROUP BY direction, from_hop, from_table, to_hop, to_table;
 
 SELECT 
-  '✅ All tables created successfully on Unity Catalog!' AS status,
-  (SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_hop_edges_summary' AS best_view_for_analysis;
+  '✅ All tables created successfully!' AS status,
+  'cdo.npd_lineage_paths_hop_edges_summary' AS best_view_for_analysis;
