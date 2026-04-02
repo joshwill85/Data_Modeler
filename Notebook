@@ -1,14 +1,8 @@
 SELECT
-  event_id,
-  event_time,
-  COUNT(*) AS rw_rows_in_event,
-  COUNT(DISTINCT source_table_full_name) AS distinct_parents_in_event,
-  COLLECT_SET(source_table_full_name) AS parents
+  COUNT(DISTINCT source_table_full_name) AS cumulative_direct_parents,
+  COLLECT_SET(source_table_full_name) AS cumulative_parent_list
 FROM information_schema.table_lineage
 WHERE target_table_full_name = '<ROOT_TABLE>'
   AND source_table_full_name IS NOT NULL
   AND target_table_full_name IS NOT NULL
-  AND event_time <= TIMESTAMP('<ROOT_EVENT_TIME>')
-GROUP BY event_id, event_time
-ORDER BY event_time DESC, event_id DESC
-LIMIT 50;
+  AND event_time <= TIMESTAMP('<ROOT_EVENT_TIME>');
