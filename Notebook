@@ -1,5 +1,5 @@
 -- =====================================================
--- FIXED: Explicit CASTs to avoid VOID vs STRING/TIMESTAMP merge error
+-- FIXED RECURSIVE LINEAGE QUERY - ARRAY TYPE MERGE SOLVED
 -- =====================================================
 
 WITH params AS (SELECT * FROM lineage_params),
@@ -31,7 +31,7 @@ edges_as_of AS (
 -- Upstream
 upstream_paths AS (
   WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
-    -- Hop 0: Root (explicit casts to prevent VOID)
+    -- Hop 0 - explicit ARRAY<STRING> cast
     SELECT 
       p.root_table_full_name,
       p.root_table_full_name AS reached_table_full_name,
@@ -49,8 +49,8 @@ upstream_paths AS (
       CAST(NULL AS STRING) AS entity_type,
       CAST(NULL AS STRING) AS entity_id,
       CAST(NULL AS STRING) AS entity_run_id,
-      ARRAY(p.root_table_full_name) AS path_tables,
-      ARRAY(p.root_table_full_name) AS visited
+      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS path_tables,
+      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS visited
     FROM params p
 
     UNION ALL
@@ -103,8 +103,8 @@ downstream_paths AS (
       CAST(NULL AS STRING) AS entity_type,
       CAST(NULL AS STRING) AS entity_id,
       CAST(NULL AS STRING) AS entity_run_id,
-      ARRAY(p.root_table_full_name) AS path_tables,
-      ARRAY(p.root_table_full_name) AS visited
+      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS path_tables,
+      CAST(ARRAY(p.root_table_full_name) AS ARRAY<STRING>) AS visited
     FROM params p
 
     UNION ALL
@@ -137,7 +137,11 @@ downstream_paths AS (
   FROM cte
 ),
 
-all_hops AS (SELECT * FROM upstream_paths UNION ALL SELECT * FROM downstream_paths)
+all_hops AS (
+  SELECT * FROM upstream_paths 
+  UNION ALL 
+  SELECT * FROM downstream_paths
+)
 
 SELECT 
   SHA2(CONCAT_WS('||', direction, root_table_full_name, ARRAY_JOIN(path_tables, '||')), 256) AS path_id,
