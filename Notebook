@@ -1,7 +1,7 @@
 -- =====================================================
--- STEP 1: Build the final result set (no CREATE yet)
+-- FIXED: Explicit CASTs to avoid VOID vs STRING/TIMESTAMP merge error
 -- =====================================================
-CREATE OR REPLACE TEMPORARY VIEW lineage_final AS
+
 WITH params AS (SELECT * FROM lineage_params),
 
 root_run AS (
@@ -31,23 +31,24 @@ edges_as_of AS (
 -- Upstream
 upstream_paths AS (
   WITH RECURSIVE cte MAX RECURSION LEVEL 50 AS (
+    -- Hop 0: Root (explicit casts to prevent VOID)
     SELECT 
       p.root_table_full_name,
       p.root_table_full_name AS reached_table_full_name,
       SPLIT_PART(p.root_table_full_name, '.', 2) AS reached_table_schema,
       SPLIT_PART(p.root_table_full_name, '.', 3) AS reached_table_name,
       'TABLE' AS reached_type,
-      NULL AS edge_source_table_full_name,
-      NULL AS edge_target_table_full_name,
-      NULL AS edge_source_type,
-      NULL AS edge_target_type,
-      NULL AS event_id,
-      NULL AS event_time,
-      NULL AS event_date,
-      NULL AS created_by,
-      NULL AS entity_type,
-      NULL AS entity_id,
-      NULL AS entity_run_id,
+      CAST(NULL AS STRING) AS edge_source_table_full_name,
+      CAST(NULL AS STRING) AS edge_target_table_full_name,
+      CAST(NULL AS STRING) AS edge_source_type,
+      CAST(NULL AS STRING) AS edge_target_type,
+      CAST(NULL AS STRING) AS event_id,
+      CAST(NULL AS TIMESTAMP) AS event_time,
+      CAST(NULL AS STRING) AS event_date,
+      CAST(NULL AS STRING) AS created_by,
+      CAST(NULL AS STRING) AS entity_type,
+      CAST(NULL AS STRING) AS entity_id,
+      CAST(NULL AS STRING) AS entity_run_id,
       ARRAY(p.root_table_full_name) AS path_tables,
       ARRAY(p.root_table_full_name) AS visited
     FROM params p
@@ -91,17 +92,17 @@ downstream_paths AS (
       SPLIT_PART(p.root_table_full_name, '.', 2) AS reached_table_schema,
       SPLIT_PART(p.root_table_full_name, '.', 3) AS reached_table_name,
       'TABLE' AS reached_type,
-      NULL AS edge_source_table_full_name,
-      NULL AS edge_target_table_full_name,
-      NULL AS edge_source_type,
-      NULL AS edge_target_type,
-      NULL AS event_id,
-      NULL AS event_time,
-      NULL AS event_date,
-      NULL AS created_by,
-      NULL AS entity_type,
-      NULL AS entity_id,
-      NULL AS entity_run_id,
+      CAST(NULL AS STRING) AS edge_source_table_full_name,
+      CAST(NULL AS STRING) AS edge_target_table_full_name,
+      CAST(NULL AS STRING) AS edge_source_type,
+      CAST(NULL AS STRING) AS edge_target_type,
+      CAST(NULL AS STRING) AS event_id,
+      CAST(NULL AS TIMESTAMP) AS event_time,
+      CAST(NULL AS STRING) AS event_date,
+      CAST(NULL AS STRING) AS created_by,
+      CAST(NULL AS STRING) AS entity_type,
+      CAST(NULL AS STRING) AS entity_id,
+      CAST(NULL AS STRING) AS entity_run_id,
       ARRAY(p.root_table_full_name) AS path_tables,
       ARRAY(p.root_table_full_name) AS visited
     FROM params p
@@ -142,39 +143,3 @@ SELECT
   SHA2(CONCAT_WS('||', direction, root_table_full_name, ARRAY_JOIN(path_tables, '||')), 256) AS path_id,
   *
 FROM all_hops;
-
-
-
-
-
-
-
-
-
--- =====================================================
--- STEP 2: Create permanent tables from the temp view
--- =====================================================
-CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_full') 
-AS SELECT * FROM lineage_final LIMIT ALL;
-
-CREATE OR REPLACE TABLE IDENTIFIER((SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_hop_edges_summary') 
-AS
-SELECT 
-  direction,
-  hop_count - 1 AS from_hop,
-  ELEMENT_AT(path_tables, hop_count) AS from_table,
-  hop_count AS to_hop,
-  reached_table_full_name AS to_table,
-  COUNT(DISTINCT path_id) AS num_paths_through_edge,
-  COLLECT_SET(created_by) AS creators,
-  COLLECT_SET(CONCAT(COALESCE(entity_type, 'UNKNOWN'), ' ', COALESCE(entity_id, 'N/A'))) AS hop_entity_steps_at_to_hop,
-  MAX(event_time) AS latest_event_at_edge,
-  COLLECT_SET(DATE(event_time)) AS event_dates_at_edge
-FROM lineage_final
-WHERE hop_count > 0
-GROUP BY direction, from_hop, from_table, to_hop, to_table;
-
-SELECT 
-  '✅ All tables created successfully!' AS status,
-  (SELECT target_schema FROM lineage_params) || '.' || (SELECT target_table_prefix FROM lineage_params) || '_hop_edges_summary' AS best_view;
-
