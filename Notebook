@@ -182,8 +182,8 @@ def write_paths_current_table(state_df):
     """
     out = (
         state_df
-        .withColumn("run_id", F.lit(run_id))
-        .withColumn("root_table_full_name", F.lit(root_table_full_name))
+        .withColumn("run_id", F.lit(run_id).cast("string"))
+        .withColumn("root_table_full_name", F.lit(root_table_full_name).cast("string"))
         .withColumn("window_start", F.lit(window_start).cast("timestamp"))
         .withColumn("window_end", F.lit(window_end).cast("timestamp"))
         .withColumn("written_at", F.current_timestamp())
@@ -226,32 +226,22 @@ def append_run_log_row(
     """
     Append one row to the run log for the just-written state.
     """
-    log_df = spark.createDataFrame(
-        [(
-            run_id,
-            root_table_full_name,
-            window_start,
-            window_end,
-            int(max_hop_in_state) if max_hop_in_state is not None else None,
-            int(state_rows),
-            int(distinct_leaf_objects),
-            int(terminal_paths),
-            int(active_paths),
-            stop_reason,
-        )],
-        [
-            "run_id",
-            "root_table_full_name",
-            "window_start",
-            "window_end",
-            "max_hop_in_state",
-            "state_rows",
-            "distinct_leaf_objects",
-            "terminal_paths",
-            "active_paths",
-            "stop_reason",
-        ],
-    ).withColumn("written_at", F.current_timestamp())
+    log_df = (
+        spark.range(1)
+        .select(
+            F.lit(run_id).cast("string").alias("run_id"),
+            F.lit(root_table_full_name).cast("string").alias("root_table_full_name"),
+            F.lit(window_start).cast("timestamp").alias("window_start"),
+            F.lit(window_end).cast("timestamp").alias("window_end"),
+            F.lit(max_hop_in_state).cast("int").alias("max_hop_in_state"),
+            F.lit(state_rows).cast("long").alias("state_rows"),
+            F.lit(distinct_leaf_objects).cast("long").alias("distinct_leaf_objects"),
+            F.lit(terminal_paths).cast("long").alias("terminal_paths"),
+            F.lit(active_paths).cast("long").alias("active_paths"),
+            F.lit(stop_reason).cast("string").alias("stop_reason"),
+            F.current_timestamp().alias("written_at"),
+        )
+    )
 
     (
         log_df.write
@@ -514,10 +504,10 @@ WITH exploded_edges AS (
     run_id,
     path_id,
     edge_pos + 1 AS hop_count,
-    element_at(path_tables, edge_pos + 2) AS from_table,
-    element_at(path_types, edge_pos + 2) AS from_type,
-    element_at(path_tables, edge_pos + 1) AS to_table,
-    element_at(path_types, edge_pos + 1) AS to_type,
+    element_at(path_tables, edge_pos + 1) AS from_table,
+    element_at(path_types, edge_pos + 1) AS from_type,
+    element_at(path_tables, edge_pos + 2) AS to_table,
+    element_at(path_types, edge_pos + 2) AS to_type,
     latest_seen_time,
     element_at(edge_events_seen_7d_arr, edge_pos + 1) AS events_seen_7d,
     element_at(edge_creators_per_hop, edge_pos + 1) AS creators,
