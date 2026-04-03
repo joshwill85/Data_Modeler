@@ -16,13 +16,14 @@ from datetime import timedelta
 # ============================================================
 root_table_full_name = "eciscor_prod.npdataset.npd_current_pending"
 
-# Persisted tables
-output_paths_current_table = "cdo.npd_current_pending_upstream_paths_current_7d"
+# Persisted outputs
+output_paths_snapshots_table = "cdo.npd_current_pending_upstream_paths_snapshots_7d"
+output_paths_current_view = "cdo.npd_current_pending_upstream_paths_current_7d_v"
 output_run_log_table = "cdo.npd_current_pending_upstream_run_log_7d"
 
 # SAFETY GUARDS
-# These are evaluated AFTER the current state is written,
-# so the table always contains the last fully-built state.
+# These are evaluated AFTER the snapshot is written,
+# so the latest completed state is always persisted.
 max_upstream_hops = 15
 max_upstream_rows_per_state = 250000
 max_upstream_total_rows_seen = 3000000
@@ -38,7 +39,8 @@ window_end_str = window_end.strftime("%Y-%m-%d %H:%M:%S")
 run_id = spark.sql("SELECT uuid() AS run_id").first()["run_id"]
 
 print(f"Root table: {root_table_full_name}")
-print(f"Output paths table: {output_paths_current_table}")
+print(f"Output snapshots table: {output_paths_snapshots_table}")
+print(f"Output current view: {output_paths_current_view}")
 print(f"Output run log table: {output_run_log_table}")
 print(f"Run id: {run_id}")
 print(f"Window start: {window_start_str}")
@@ -106,7 +108,6 @@ root_upstream_7d_raw = (
         "entity_types"
     )
     .orderBy(F.col("latest_seen_time").desc(), F.col("source_table_full_name"))
-    .cache()
 )
 root_upstream_7d_raw.createOrReplaceTempView("root_upstream_7d_raw")
 
@@ -122,7 +123,6 @@ root_upstream_7d_traversal = (
         "entity_types"
     )
     .orderBy(F.col("latest_seen_time").desc(), F.col("source_table_full_name"))
-    .cache()
 )
 root_upstream_7d_traversal.createOrReplaceTempView("root_upstream_7d_traversal")
 
@@ -175,10 +175,9 @@ def seed_current_state():
     )
     return decorate_state(seed).cache()
 
-def write_paths_current_table(state_df):
+def append_paths_snapshot(state_df, snapshot_hop):
     """
-    Overwrite the current-state paths table.
-    One row per maximal path in the current state.
+    Append one snapshot of the current maximal-path state.
     """
     out = (
         state_df
@@ -186,12 +185,14 @@ def write_paths_current_table(state_df):
         .withColumn("root_table_full_name", F.lit(root_table_full_name).cast("string"))
         .withColumn("window_start", F.lit(window_start).cast("timestamp"))
         .withColumn("window_end", F.lit(window_end).cast("timestamp"))
+        .withColumn("snapshot_hop", F.lit(snapshot_hop).cast("int"))
         .withColumn("written_at", F.current_timestamp())
         .select(
             "run_id",
             "root_table_full_name",
             "window_start",
             "window_end",
+            "snapshot_hop",
             "hop_count",
             "path_id",
             "path_tables",
@@ -210,10 +211,21 @@ def write_paths_current_table(state_df):
     (
         out.write
         .format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(output_paths_current_table)
+        .mode("append")
+        .saveAsTable(output_paths_snapshots_table)
     )
+
+def refresh_current_view(snapshot_hop):
+    """
+    Repoint the persistent current view to the latest snapshot for THIS run.
+    """
+    spark.sql(f"""
+    CREATE OR REPLACE VIEW {output_paths_current_view} AS
+    SELECT *
+    FROM {output_paths_snapshots_table}
+    WHERE run_id = '{run_id}'
+      AND snapshot_hop = {int(snapshot_hop)}
+    """)
 
 def append_run_log_row(
     state_rows,
@@ -259,9 +271,10 @@ def append_run_log_row(
 # - current_state always contains ONE row per maximal path
 # - shorter prefixes are replaced by their longer children
 # - terminal paths are kept
-# - the paths table is overwritten AFTER EVERY COMPLETED HOP
+# - one snapshot rowset is APPENDED AFTER EVERY COMPLETED HOP
+# - the current view is repointed AFTER EVERY COMPLETED HOP
 # - the run log is appended AFTER EVERY COMPLETED HOP
-# - if a safety guard is hit, it is checked AFTER the state is written
+# - if a safety guard is hit, it is checked AFTER the snapshot is written
 # ============================================================
 current_state = seed_current_state()
 total_rows_seen = 0
@@ -299,8 +312,9 @@ while True:
     elif total_rows_seen > max_upstream_total_rows_seen:
         stop_reason = f"MAX_TOTAL_ROWS_SEEN_EXCEEDED_AT_HOP_{max_hop_in_state}"
 
-    # WRITE THE CURRENT STATE FIRST
-    write_paths_current_table(current_state)
+    # WRITE SNAPSHOT + REFRESH CURRENT VIEW + APPEND RUN LOG
+    append_paths_snapshot(current_state, max_hop_in_state)
+    refresh_current_view(max_hop_in_state)
     append_run_log_row(
         state_rows=state_rows,
         distinct_leaf_objects=distinct_leaf_objects,
@@ -311,7 +325,7 @@ while True:
     )
 
     print(
-        f"WROTE CURRENT STATE | max_hop={max_hop_in_state} | "
+        f"WROTE SNAPSHOT | hop={max_hop_in_state} | "
         f"rows={state_rows:,} | distinct_leaf_objects={distinct_leaf_objects:,} | "
         f"terminal_paths={terminal_paths:,} | active_paths={active_paths:,} | "
         f"stop_reason={stop_reason}"
@@ -419,24 +433,28 @@ while True:
 # COMMAND ----------
 
 # ============================================================
-# 4. READ THE WRITTEN CURRENT-STATE TABLE BACK
+# 4. READ THE CURRENT VIEW + RUN LOG BACK
 # ============================================================
-upstream_paths_current = spark.read.table(output_paths_current_table).cache()
+upstream_paths_current = spark.read.table(output_paths_current_view).cache()
 upstream_paths_current.createOrReplaceTempView("upstream_paths_current")
 
-upstream_run_log = spark.read.table(output_run_log_table).filter(F.col("run_id") == run_id).cache()
+upstream_run_log = (
+    spark.read.table(output_run_log_table)
+    .filter(F.col("run_id") == run_id)
+    .cache()
+)
 upstream_run_log.createOrReplaceTempView("upstream_run_log")
 
-print(f"✅ Current-state path rows in {output_paths_current_table}: {upstream_paths_current.count():,}")
+print(f"✅ Current-state path rows in {output_paths_current_view}: {upstream_paths_current.count():,}")
 print(f"✅ Run-log rows for this run: {upstream_run_log.count():,}")
 
 # COMMAND ----------
 
 # ============================================================
-# 5. DERIVED VIEWS FROM THE CONSOLIDATED CURRENT-STATE TABLE
+# 5. DERIVED VIEWS FROM THE CONSOLIDATED CURRENT-STATE VIEW
 #
-# Because the table stores only maximal paths, hop summaries are derived
-# by exploding path_tables / path_types / edge metadata arrays.
+# Because the current view stores only maximal paths, hop summaries are
+# derived by exploding path_tables / path_types / edge metadata arrays.
 # ============================================================
 
 # Objects by hop
@@ -465,7 +483,7 @@ WITH exploded AS (
       WHEN hop_pos = 0 THEN CAST(NULL AS ARRAY<STRING>)
       ELSE element_at(edge_entity_types_per_hop, hop_pos)
     END AS entity_types_on_edge_to_child
-  FROM {output_paths_current_table}
+  FROM {output_paths_current_view}
   LATERAL VIEW posexplode(path_tables) p AS hop_pos, table_name
 )
 SELECT
@@ -474,8 +492,20 @@ SELECT
   MAX(reached_type) AS reached_type,
   MAX(latest_seen_time_to_child) AS latest_seen_time_to_child,
   MAX(events_seen_7d_on_edge_to_child) AS max_events_seen_7d_on_edge_to_child,
-  ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(creators_on_edge_to_child)))) AS creators_on_edge_to_child,
-  ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(entity_types_on_edge_to_child)))) AS entity_types_on_edge_to_child,
+  ARRAY_SORT(
+    ARRAY_DISTINCT(
+      FLATTEN(
+        COLLECT_LIST(COALESCE(creators_on_edge_to_child, CAST(array() AS ARRAY<STRING>)))
+      )
+    )
+  ) AS creators_on_edge_to_child,
+  ARRAY_SORT(
+    ARRAY_DISTINCT(
+      FLATTEN(
+        COLLECT_LIST(COALESCE(entity_types_on_edge_to_child, CAST(array() AS ARRAY<STRING>)))
+      )
+    )
+  ) AS entity_types_on_edge_to_child,
   COUNT(DISTINCT path_id) AS paths_through_object
 FROM exploded
 GROUP BY
@@ -512,7 +542,7 @@ WITH exploded_edges AS (
     element_at(edge_events_seen_7d_arr, edge_pos + 1) AS events_seen_7d,
     element_at(edge_creators_per_hop, edge_pos + 1) AS creators,
     element_at(edge_entity_types_per_hop, edge_pos + 1) AS entity_types
-  FROM {output_paths_current_table}
+  FROM {output_paths_current_view}
   LATERAL VIEW posexplode(edge_latest_seen_times) p AS edge_pos, latest_seen_time
 )
 SELECT
@@ -523,8 +553,20 @@ SELECT
   to_type,
   MAX(latest_seen_time) AS latest_seen_time,
   MAX(events_seen_7d) AS events_seen_7d,
-  ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(creators)))) AS creators,
-  ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(entity_types)))) AS entity_types,
+  ARRAY_SORT(
+    ARRAY_DISTINCT(
+      FLATTEN(
+        COLLECT_LIST(COALESCE(creators, CAST(array() AS ARRAY<STRING>)))
+      )
+    )
+  ) AS creators,
+  ARRAY_SORT(
+    ARRAY_DISTINCT(
+      FLATTEN(
+        COLLECT_LIST(COALESCE(entity_types, CAST(array() AS ARRAY<STRING>)))
+      )
+    )
+  ) AS entity_types,
   COUNT(DISTINCT path_id) AS distinct_paths_through_edge
 FROM exploded_edges
 GROUP BY
@@ -548,13 +590,14 @@ SELECT
   path_tables,
   path_types,
   is_terminal
-FROM {output_paths_current_table}
+FROM {output_paths_current_view}
 """)
 
 # COMMAND ----------
 
-print("✅ Created persistent tables + temp views:")
-print(f"  - {output_paths_current_table}")
+print("✅ Created persistent outputs + temp views:")
+print(f"  - {output_paths_snapshots_table}  (append-only snapshots)")
+print(f"  - {output_paths_current_view}     (latest snapshot for this run)")
 print(f"  - {output_run_log_table}")
 print("  - edges_7d_raw")
 print("  - edges_7d_traversal")
