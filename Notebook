@@ -5,56 +5,44 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType, StructField, StringType, ArrayType, TimestampType, LongType
 )
-from functools import reduce
 from datetime import timedelta
+import uuid
 
 # ============================================================
 # HARD-CODED ROOT + FIXED 7-DAY WINDOW
 # ============================================================
 root_table_full_name = "eciscor_prod.npdataset.npd_current_pending"
+output_table_full_name = "cdo.npd_current_pending_upstream_lineage_7d"
 
 # SAFETY GUARDS
 max_upstream_hops = 15
-max_downstream_hops = 15
 max_upstream_rows_per_hop = 250000
 max_upstream_total_rows = 3000000
-max_downstream_objects_per_hop = 500000
-max_downstream_total_objects = 3000000
 
-# Capture ONE window end so the 7-day window is stable across all queries
+# Stable 7-day window for the whole run
 window_end = spark.sql("SELECT current_timestamp() AS ts").first()["ts"]
 window_start = window_end - timedelta(days=7)
 
 window_start_str = window_start.strftime("%Y-%m-%d %H:%M:%S")
 window_end_str = window_end.strftime("%Y-%m-%d %H:%M:%S")
 
+run_id = str(uuid.uuid4())
+
 print(f"Root table: {root_table_full_name}")
+print(f"Output table: {output_table_full_name}")
+print(f"Run id: {run_id}")
 print(f"Window start: {window_start_str}")
 print(f"Window end:   {window_end_str}")
-print(f"Upstream max hops: {max_upstream_hops}")
-print(f"Downstream max hops: {max_downstream_hops}")
-
-# COMMAND ----------
-
-# ============================================================
-# HELPERS
-# ============================================================
-def union_all_or_empty(dfs, empty_df):
-    if not dfs:
-        return empty_df
-    return reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), dfs)
+print(f"Max upstream hops: {max_upstream_hops}")
+print(f"Max rows per hop:  {max_upstream_rows_per_hop:,}")
+print(f"Max total rows:    {max_upstream_total_rows:,}")
 
 # COMMAND ----------
 
 # ============================================================
 # 1. BUILD A 7-DAY TABLE-TO-TABLE EDGE GRAPH
-#
-# edges_7d_raw:
-#   one row per source->target edge seen in the last 7 days
-#   keeps latest_seen_time + events_seen_7d
-#
-# edges_7d_traversal:
-#   same thing, but excludes self-links for recursion
+#    raw view keeps self-links for inspection
+#    traversal view removes self-links for recursion
 # ============================================================
 edges_7d_raw = spark.sql(f"""
 SELECT
@@ -80,9 +68,17 @@ GROUP BY
 
 edges_7d_raw.createOrReplaceTempView("edges_7d_raw")
 
-print(f"7-day raw table-to-table edges: {edges_7d_raw.count():,}")
+edges_7d_traversal = (
+    edges_7d_raw
+    .filter(F.col("source_table_full_name") != F.col("target_table_full_name"))
+    .cache()
+)
+edges_7d_traversal.createOrReplaceTempView("edges_7d_traversal")
 
-# Raw direct upstream for the root (matches your direct 7-day SQL more closely)
+print(f"7-day raw table-to-table edges:        {edges_7d_raw.count():,}")
+print(f"7-day traversal-safe table-to-table edges: {edges_7d_traversal.count():,}")
+
+# Sanity-check views for the root
 root_upstream_7d_raw = (
     edges_7d_raw
     .filter(F.col("target_table_full_name") == root_table_full_name)
@@ -98,15 +94,6 @@ root_upstream_7d_raw = (
     .cache()
 )
 root_upstream_7d_raw.createOrReplaceTempView("root_upstream_7d_raw")
-print(f"Direct upstream tables for root in 7 days (raw): {root_upstream_7d_raw.count():,}")
-
-# Traversal graph excludes self-links
-edges_7d_traversal = (
-    edges_7d_raw
-    .filter(F.col("source_table_full_name") != F.col("target_table_full_name"))
-    .cache()
-)
-edges_7d_traversal.createOrReplaceTempView("edges_7d_traversal")
 
 root_upstream_7d_traversal = (
     edges_7d_traversal
@@ -123,19 +110,14 @@ root_upstream_7d_traversal = (
     .cache()
 )
 root_upstream_7d_traversal.createOrReplaceTempView("root_upstream_7d_traversal")
+
+print(f"Direct upstream tables for root in 7 days (raw):            {root_upstream_7d_raw.count():,}")
 print(f"Direct upstream tables for root in 7 days (traversal-safe): {root_upstream_7d_traversal.count():,}")
 
 # COMMAND ----------
 
 # ============================================================
-# 2. UPSTREAM = PATH-AWARE BFS
-#
-# Goal:
-#   hop 1 = direct upstream tables in the 7-day graph
-#   hop 2 = upstream tables of those hop-1 tables
-#   ...
-#
-# Keeps unique paths for recursion, then summarizes unique objects by hop.
+# 2. UPSTREAM PATH-AWARE BFS SCHEMA
 # ============================================================
 upstream_schema = StructType([
     StructField("reached_table_full_name", StringType(), True),
@@ -167,47 +149,114 @@ def seed_upstream_frontier():
         schema=upstream_schema
     ).cache()
 
-def compute_upstream_path_aware():
-    current = seed_upstream_frontier()
-    levels = []
-    level = 0
-    total_rows = 0
+# COMMAND ----------
 
-    while level <= max_upstream_hops:
+# ============================================================
+# 3. HELPERS TO WRITE EACH HOP TO A PERSISTENT TABLE
+# ============================================================
+def prepare_hop_for_write(frontier_df, hop_count: int):
+    out = (
+        frontier_df
+        .withColumn("run_id", F.lit(run_id))
+        .withColumn("root_table_full_name", F.lit(root_table_full_name))
+        .withColumn("window_start", F.lit(window_start).cast("timestamp"))
+        .withColumn("window_end", F.lit(window_end).cast("timestamp"))
+        .withColumn("hop_count", F.lit(hop_count).cast("int"))
+        .withColumn(
+            "path_id",
+            F.sha2(
+                F.concat_ws(
+                    "||",
+                    F.lit(root_table_full_name),
+                    F.array_join(F.col("path_tables"), "||")
+                ),
+                256
+            )
+        )
+        .withColumn("written_at", F.current_timestamp())
+        .select(
+            "run_id",
+            "root_table_full_name",
+            "window_start",
+            "window_end",
+            "hop_count",
+            "reached_table_full_name",
+            "reached_type",
+            "from_table",
+            "from_type",
+            "path_tables",
+            "visited",
+            "edge_latest_seen_time",
+            "edge_events_seen_7d",
+            "edge_creators",
+            "edge_entity_types",
+            "path_id",
+            "written_at"
+        )
+    )
+    return out
+
+def write_hop(frontier_df, hop_count: int, mode: str):
+    hop_out = prepare_hop_for_write(frontier_df, hop_count)
+    (
+        hop_out.write
+        .format("delta")
+        .mode(mode)
+        .option("overwriteSchema", "true" if mode == "overwrite" else "false")
+        .saveAsTable(output_table_full_name)
+    )
+
+# COMMAND ----------
+
+# ============================================================
+# 4. UPSTREAM PATH-AWARE BFS
+#
+# IMPORTANT LOOP ORDER:
+#   - write current hop first
+#   - then check guards
+#   - then compute next hop
+#
+# This guarantees the table contains the full hop even when a guard stops the run.
+# ============================================================
+def compute_upstream_and_write():
+    current = seed_upstream_frontier()
+    hop = 0
+    total_rows_written = 0
+    stop_reason = None
+
+    while True:
         current_count = current.count()
         current_objects = current.select("reached_table_full_name").distinct().count()
 
+        if current_count == 0:
+            stop_reason = "NO_MORE_UPSTREAM"
+            current.unpersist()
+            break
+
+        write_mode = "overwrite" if hop == 0 else "append"
+        write_hop(current, hop, write_mode)
+
+        total_rows_written += current_count
+
         print(
-            f"UPSTREAM hop {level}: "
+            f"WROTE hop {hop}: "
             f"{current_count:,} path rows, "
             f"{current_objects:,} distinct objects"
         )
 
-        if current_count == 0:
+        # Safety guards run AFTER the hop is written
+        if current_count > max_upstream_rows_per_hop:
+            stop_reason = f"MAX_ROWS_PER_HOP_EXCEEDED_AT_HOP_{hop}"
             current.unpersist()
             break
 
-        total_rows += current_count
-        if current_count > max_upstream_rows_per_hop:
+        if total_rows_written > max_upstream_total_rows:
+            stop_reason = f"MAX_TOTAL_ROWS_EXCEEDED_AT_HOP_{hop}"
             current.unpersist()
-            raise ValueError(
-                f"UPSTREAM hop {level} produced {current_count:,} path rows, "
-                f"exceeding max_upstream_rows_per_hop={max_upstream_rows_per_hop:,}"
-            )
+            break
 
-        if total_rows > max_upstream_total_rows:
-            current.unpersist()
-            raise ValueError(
-                f"UPSTREAM cumulative rows reached {total_rows:,}, "
-                f"exceeding max_upstream_total_rows={max_upstream_total_rows:,}"
-            )
-
-        levels.append(
-            current.withColumn("hop_count", F.lit(level))
-                   .withColumn("direction", F.lit("UPSTREAM"))
-        )
-
-        if level == max_upstream_hops:
+        if hop >= max_upstream_hops:
+            stop_reason = f"MAX_HOPS_REACHED_AT_HOP_{hop}"
             current.unpersist()
             break
 
@@ -241,44 +290,24 @@ def compute_upstream_path_aware():
         current = next_df
         old_current.unpersist()
 
-        level += 1
+        hop += 1
 
-    return levels
+    return stop_reason
 
-upstream_levels = compute_upstream_path_aware()
-
-upstream_empty_df = spark.createDataFrame([], schema=StructType(
-    upstream_schema.fields + [
-        StructField("hop_count", LongType(), True),
-        StructField("direction", StringType(), True),
-    ]
-))
-
-upstream_lineage_final = union_all_or_empty(upstream_levels, upstream_empty_df)
-
-if "path_tables" in upstream_lineage_final.columns:
-    upstream_lineage_final = upstream_lineage_final.withColumn(
-        "path_id",
-        F.sha2(
-            F.concat_ws(
-                "||",
-                F.col("direction"),
-                F.lit(root_table_full_name),
-                F.array_join(F.col("path_tables"), "||")
-            ),
-            256
-        )
-    )
-
-upstream_lineage_final.createOrReplaceTempView("upstream_lineage_final")
-print(f"✅ upstream_lineage_final rows: {upstream_lineage_final.count():,}")
+stop_reason = compute_upstream_and_write()
+print(f"STOP REASON: {stop_reason}")
 
 # COMMAND ----------
 
 # ============================================================
-# 3. UPSTREAM VIEWS
+# 5. READ THE WRITTEN TABLE BACK AND CREATE HELPER VIEWS
 # ============================================================
-spark.sql("""
+upstream_written = spark.read.table(output_table_full_name).cache()
+upstream_written.createOrReplaceTempView("upstream_written")
+
+print(f"Persisted rows in {output_table_full_name}: {upstream_written.count():,}")
+
+spark.sql(f"""
 CREATE OR REPLACE TEMP VIEW upstream_objects_by_hop AS
 SELECT
   hop_count,
@@ -288,13 +317,13 @@ SELECT
   MAX(edge_events_seen_7d) AS max_events_seen_7d_on_edge_to_child,
   COUNT(*) AS path_rows_for_object_at_hop,
   COUNT(DISTINCT from_table) AS distinct_from_objects_at_prior_hop
-FROM upstream_lineage_final
+FROM {output_table_full_name}
 GROUP BY
   hop_count,
   reached_table_full_name
 """)
 
-spark.sql("""
+spark.sql(f"""
 CREATE OR REPLACE TEMP VIEW upstream_hop_summary AS
 SELECT
   hop_count,
@@ -302,12 +331,12 @@ SELECT
   COUNT(*) AS path_rows_at_hop,
   MAX(edge_latest_seen_time) AS latest_seen_time_any_object_at_hop,
   ARRAY_SORT(COLLECT_SET(reached_table_full_name)) AS objects_at_hop
-FROM upstream_lineage_final
+FROM {output_table_full_name}
 GROUP BY
   hop_count
 """)
 
-spark.sql("""
+spark.sql(f"""
 CREATE OR REPLACE TEMP VIEW upstream_edges_by_hop AS
 SELECT
   hop_count,
@@ -320,7 +349,7 @@ SELECT
   ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(edge_creators)))) AS creators,
   ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(edge_entity_types)))) AS entity_types,
   COUNT(DISTINCT path_id) AS distinct_paths_through_edge
-FROM upstream_lineage_final
+FROM {output_table_full_name}
 WHERE hop_count > 0
 GROUP BY
   hop_count,
@@ -330,14 +359,14 @@ GROUP BY
   reached_type
 """)
 
-spark.sql("""
+spark.sql(f"""
 CREATE OR REPLACE TEMP VIEW upstream_path_summary AS
 SELECT
   path_id,
   MAX(hop_count) AS max_hop_count,
   MAX(edge_latest_seen_time) AS latest_seen_time_on_path,
   path_tables
-FROM upstream_lineage_final
+FROM {output_table_full_name}
 GROUP BY
   path_id,
   path_tables
@@ -345,295 +374,13 @@ GROUP BY
 
 # COMMAND ----------
 
-# ============================================================
-# 4. DOWNSTREAM = OBJECT-LEVEL BFS
-#
-# Goal:
-#   the full downstream picture with UNIQUE OBJECTS and UNIQUE EDGES
-#   over the same 7-day graph
-#
-# No path expansion here, so it won't explode combinatorially.
-# ============================================================
-downstream_frontier_schema = StructType([
-    StructField("reached_table_full_name", StringType(), True),
-    StructField("reached_type", StringType(), True),
-    StructField("edge_latest_seen_time", TimestampType(), True),
-    StructField("edge_events_seen_7d", LongType(), True),
-    StructField("edge_creators", ArrayType(StringType()), True),
-    StructField("edge_entity_types", ArrayType(StringType()), True),
-])
-
-downstream_edge_schema = StructType([
-    StructField("from_table", StringType(), True),
-    StructField("from_type", StringType(), True),
-    StructField("reached_table_full_name", StringType(), True),
-    StructField("reached_type", StringType(), True),
-    StructField("edge_latest_seen_time", TimestampType(), True),
-    StructField("edge_events_seen_7d", LongType(), True),
-    StructField("edge_creators", ArrayType(StringType()), True),
-    StructField("edge_entity_types", ArrayType(StringType()), True),
-    StructField("hop_count", LongType(), True),
-    StructField("direction", StringType(), True),
-])
-
-def seed_downstream_frontier():
-    return spark.createDataFrame(
-        [(
-            root_table_full_name,       # reached_table_full_name
-            "ROOT",                     # reached_type
-            None,                       # edge_latest_seen_time
-            None,                       # edge_events_seen_7d
-            None,                       # edge_creators
-            None                        # edge_entity_types
-        )],
-        schema=downstream_frontier_schema
-    ).cache()
-
-def compute_downstream_unique_objects():
-    current_frontier = seed_downstream_frontier()
-    seen_objects = current_frontier.select("reached_table_full_name").cache()
-
-    object_levels = []
-    edge_levels = []
-
-    hop = 0
-    total_objects = 0
-
-    while hop <= max_downstream_hops:
-        frontier_count = current_frontier.count()
-
-        print(f"DOWNSTREAM hop {hop}: {frontier_count:,} distinct objects")
-
-        if frontier_count == 0:
-            current_frontier.unpersist()
-            seen_objects.unpersist()
-            break
-
-        total_objects += frontier_count
-        if frontier_count > max_downstream_objects_per_hop:
-            current_frontier.unpersist()
-            seen_objects.unpersist()
-            raise ValueError(
-                f"DOWNSTREAM hop {hop} produced {frontier_count:,} objects, "
-                f"exceeding max_downstream_objects_per_hop={max_downstream_objects_per_hop:,}"
-            )
-
-        if total_objects > max_downstream_total_objects:
-            current_frontier.unpersist()
-            seen_objects.unpersist()
-            raise ValueError(
-                f"DOWNSTREAM cumulative objects reached {total_objects:,}, "
-                f"exceeding max_downstream_total_objects={max_downstream_total_objects:,}"
-            )
-
-        object_levels.append(
-            current_frontier.withColumn("hop_count", F.lit(hop))
-                            .withColumn("direction", F.lit("DOWNSTREAM"))
-        )
-
-        if hop == max_downstream_hops:
-            current_frontier.unpersist()
-            seen_objects.unpersist()
-            break
-
-        edge_rows = (
-            current_frontier.alias("cur")
-            .join(
-                edges_7d_traversal.alias("e"),
-                F.col("cur.reached_table_full_name") == F.col("e.source_table_full_name"),
-                "inner"
-            )
-            .select(
-                F.col("cur.reached_table_full_name").alias("from_table"),
-                F.col("cur.reached_type").alias("from_type"),
-                F.col("e.target_table_full_name").alias("reached_table_full_name"),
-                F.col("e.target_type").alias("reached_type"),
-                F.col("e.latest_seen_time").alias("edge_latest_seen_time"),
-                F.col("e.events_seen_7d").cast("long").alias("edge_events_seen_7d"),
-                F.col("e.creators").alias("edge_creators"),
-                F.col("e.entity_types").alias("edge_entity_types"),
-            )
-            .dropDuplicates(["from_table", "reached_table_full_name"])
-            .cache()
-        )
-
-        edge_levels.append(
-            edge_rows.withColumn("hop_count", F.lit(hop + 1))
-                     .withColumn("direction", F.lit("DOWNSTREAM"))
-        )
-
-        next_frontier = (
-            edge_rows
-            .groupBy("reached_table_full_name", "reached_type")
-            .agg(
-                F.max("edge_latest_seen_time").alias("edge_latest_seen_time"),
-                F.max("edge_events_seen_7d").alias("edge_events_seen_7d"),
-                F.array_distinct(F.flatten(F.collect_list("edge_creators"))).alias("edge_creators"),
-                F.array_distinct(F.flatten(F.collect_list("edge_entity_types"))).alias("edge_entity_types"),
-            )
-            .join(seen_objects, on="reached_table_full_name", how="left_anti")
-            .cache()
-        )
-
-        old_seen = seen_objects
-        seen_objects = (
-            seen_objects
-            .unionByName(next_frontier.select("reached_table_full_name"))
-            .dropDuplicates(["reached_table_full_name"])
-            .cache()
-        )
-        old_seen.unpersist()
-
-        old_frontier = current_frontier
-        current_frontier = next_frontier
-        old_frontier.unpersist()
-        edge_rows.unpersist()
-
-        hop += 1
-
-    return object_levels, edge_levels
-
-downstream_object_levels, downstream_edge_levels = compute_downstream_unique_objects()
-
-downstream_objects_empty_df = spark.createDataFrame([], schema=StructType(
-    downstream_frontier_schema.fields + [
-        StructField("hop_count", LongType(), True),
-        StructField("direction", StringType(), True),
-    ]
-))
-downstream_edges_empty_df = spark.createDataFrame([], schema=downstream_edge_schema)
-
-downstream_objects_final = union_all_or_empty(downstream_object_levels, downstream_objects_empty_df)
-downstream_edges_final = union_all_or_empty(downstream_edge_levels, downstream_edges_empty_df)
-
-downstream_objects_final.createOrReplaceTempView("downstream_objects_final")
-downstream_edges_final.createOrReplaceTempView("downstream_edges_final")
-
-print(f"✅ downstream_objects_final rows: {downstream_objects_final.count():,}")
-print(f"✅ downstream_edges_final rows:   {downstream_edges_final.count():,}")
-
-# COMMAND ----------
-
-# ============================================================
-# 5. DOWNSTREAM VIEWS
-# ============================================================
-spark.sql("""
-CREATE OR REPLACE TEMP VIEW downstream_objects_by_hop AS
-SELECT
-  hop_count,
-  reached_table_full_name,
-  reached_type,
-  edge_latest_seen_time,
-  edge_events_seen_7d,
-  edge_creators,
-  edge_entity_types
-FROM downstream_objects_final
-""")
-
-spark.sql("""
-CREATE OR REPLACE TEMP VIEW downstream_hop_summary AS
-SELECT
-  hop_count,
-  COUNT(DISTINCT reached_table_full_name) AS distinct_objects_at_hop,
-  MAX(edge_latest_seen_time) AS latest_seen_time_any_object_at_hop,
-  ARRAY_SORT(COLLECT_SET(reached_table_full_name)) AS objects_at_hop
-FROM downstream_objects_final
-GROUP BY
-  hop_count
-""")
-
-spark.sql("""
-CREATE OR REPLACE TEMP VIEW downstream_edges_by_hop AS
-SELECT
-  hop_count,
-  from_table,
-  from_type,
-  reached_table_full_name AS to_table,
-  reached_type AS to_type,
-  MAX(edge_latest_seen_time) AS latest_seen_time,
-  MAX(edge_events_seen_7d) AS events_seen_7d,
-  ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(edge_creators)))) AS creators,
-  ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(edge_entity_types)))) AS entity_types
-FROM downstream_edges_final
-GROUP BY
-  hop_count,
-  from_table,
-  from_type,
-  reached_table_full_name,
-  reached_type
-""")
-
-# COMMAND ----------
-
-# ============================================================
-# 6. COMBINED SUMMARY VIEWS
-# ============================================================
-spark.sql("""
-CREATE OR REPLACE TEMP VIEW lineage_hop_summary_all AS
-SELECT
-  'UPSTREAM' AS direction,
-  hop_count,
-  distinct_objects_at_hop,
-  path_rows_at_hop,
-  latest_seen_time_any_object_at_hop,
-  objects_at_hop
-FROM upstream_hop_summary
-
-UNION ALL
-
-SELECT
-  'DOWNSTREAM' AS direction,
-  hop_count,
-  distinct_objects_at_hop,
-  CAST(NULL AS BIGINT) AS path_rows_at_hop,
-  latest_seen_time_any_object_at_hop,
-  objects_at_hop
-FROM downstream_hop_summary
-""")
-
-spark.sql("""
-CREATE OR REPLACE TEMP VIEW lineage_edges_by_hop_all AS
-SELECT
-  'UPSTREAM' AS direction,
-  hop_count,
-  from_table,
-  from_type,
-  to_table,
-  to_type,
-  latest_seen_time,
-  events_seen_7d
-FROM upstream_edges_by_hop
-
-UNION ALL
-
-SELECT
-  'DOWNSTREAM' AS direction,
-  hop_count,
-  from_table,
-  from_type,
-  to_table,
-  to_type,
-  latest_seen_time,
-  events_seen_7d
-FROM downstream_edges_by_hop
-""")
-
-# COMMAND ----------
-
-print("✅ Created temp views:")
-print("  - edges_7d_raw")
-print("  - edges_7d_traversal")
+print("✅ Created persistent table + temp views:")
+print(f"  - {output_table_full_name}")
 print("  - root_upstream_7d_raw")
 print("  - root_upstream_7d_traversal")
-print("  - upstream_lineage_final")
+print("  - upstream_written")
 print("  - upstream_objects_by_hop")
 print("  - upstream_hop_summary")
 print("  - upstream_edges_by_hop")
 print("  - upstream_path_summary")
-print("  - downstream_objects_final")
-print("  - downstream_edges_final")
-print("  - downstream_objects_by_hop")
-print("  - downstream_hop_summary")
-print("  - downstream_edges_by_hop")
-print("  - lineage_hop_summary_all")
-print("  - lineage_edges_by_hop_all")
+print(f"  - stop_reason = {stop_reason}")
