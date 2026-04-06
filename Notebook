@@ -1,1 +1,593 @@
+%md
+# Upstream Lineage Builder for `eciscor_prod.npdataset.npd_current_pending` (7-Day Window)
 
+## What this notebook does
+
+This notebook builds a **persistent, queryable upstream lineage model** for the table:
+
+`eciscor_prod.npdataset.npd_current_pending`
+
+It looks at **table-to-table lineage seen in the last 7 days**, then walks **upstream hop by hop** from the root table.
+
+The notebook is designed to answer questions like:
+
+- What tables directly fed this root table in the last 7 days?
+- What are the upstream tables behind those tables?
+- Where do lineage paths branch?
+- Where do lineage paths stop?
+- What is the latest current upstream path state for this run?
+
+This notebook is **upstream only**. It does **not** build downstream lineage.
+
+---
+
+## What problem this notebook is solving
+
+Raw lineage is event-based and can be noisy. If you query it directly, you usually get:
+
+- multiple events for the same source/target pair
+- repeated relationships across the window
+- no easy way to see hop-by-hop upstream paths
+- no persistent current state for the run
+
+This notebook solves that by turning raw lineage into:
+
+1. a **7-day edge table**
+2. a **7-day object type lookup table**
+3. a **working state** for upstream path growth
+4. **append-only snapshots** of the path state after each hop
+5. a **current view** that always points to the latest snapshot for the current run
+6. helper views that summarize:
+   - objects by hop
+   - hop-level counts
+   - edges by hop
+   - full current paths
+
+---
+
+## What “7-day lineage” means here
+
+This notebook only considers lineage rows where `event_time` falls inside:
+
+- `window_start = current_timestamp() - 7 days`
+- `window_end = current_timestamp()`
+
+That means all results in this notebook are limited to **what was visible in lineage during the last 7 days**.
+
+This is important:
+
+- If upstream lineage exists **outside** the 7-day window, this notebook will not include it.
+- If a path stops, that does **not** always mean lineage truly ends forever. It may just mean there was no visible upstream edge in the last 7 days.
+
+---
+
+## High-level flow
+
+The notebook runs in **two main stages**.
+
+### Stage 1: Build the reusable 7-day graph
+
+It reads raw lineage from `information_schema.table_lineage` and turns it into a smaller, reusable edge table.
+
+This gives one row per:
+
+`source_table_full_name -> target_table_full_name`
+
+with rollups like:
+
+- latest time the edge was seen
+- how many distinct lineage events used that edge in the 7-day window
+- creator values seen on that edge
+- entity types seen on that edge
+
+It also builds a small lookup table of table names to table types.
+
+### Stage 2: Walk upstream hop by hop
+
+Starting from the root table, the notebook repeatedly:
+
+1. reads the current working state
+2. finds all upstream parent tables for the current leaf tables
+3. grows each path by one hop
+4. marks paths as terminal if they can no longer expand
+5. writes a snapshot of the whole current state
+6. updates a current view to point at that snapshot
+7. appends a run log row with counts and stop reason
+
+---
+
+## Key idea: “current state” instead of every partial path forever
+
+This notebook does **not** keep every shorter prefix forever in the current state.
+
+Instead, it keeps the **latest maximal version of each path**.
+
+That means:
+
+- if a path grows from `A -> B` to `A -> B -> C`
+- the current state keeps the longer path
+- the shorter one is no longer part of the latest current snapshot
+
+However, every hop is still preserved in the **snapshots table**, so you can inspect how the state looked at each stage of the run.
+
+---
+
+## Main inputs
+
+### Root table
+The notebook is hard-coded to use:
+
+`eciscor_prod.npdataset.npd_current_pending`
+
+### Time window
+The notebook uses a fixed 7-day window based on the time the notebook starts.
+
+### Safety guards
+The notebook stops automatically if any of these conditions are hit:
+
+- maximum number of hops
+- maximum number of rows in the current state
+- maximum cumulative rows seen across the run
+
+These guards are checked **after** the current state is written, so the latest completed state is still available even if the run stops.
+
+---
+
+## Persistent tables and views created
+
+## Tables
+
+### `cdo.npd_current_pending_lineage_edges_7d`
+Materialized 7-day edge table.
+
+One row per source/target relationship in the last 7 days.
+
+Useful for:
+- validating direct root upstream
+- reusing the 7-day graph without repeatedly reading raw lineage
+- investigating hot edges
+
+### `cdo.npd_current_pending_lineage_objects_7d`
+Materialized object lookup table.
+
+Maps table name to the latest known table type seen in the 7-day window.
+
+Useful for:
+- filling object types back into summaries
+- keeping the working state narrow and faster
+
+### `cdo.npd_current_pending_upstream_working_state_7d`
+Internal working table used by the iterative upstream expansion.
+
+This is overwritten each hop.
+
+Useful for:
+- keeping the iterative process persistent
+- breaking up the logical plan between hops
+
+### `cdo.npd_current_pending_upstream_paths_snapshots_7d`
+Append-only snapshots table.
+
+Each hop appends one full snapshot of the current state.
+
+Useful for:
+- auditing how the run evolved over time
+- seeing where growth/explosions happened
+- keeping the latest completed state even if the run stops
+
+### `cdo.npd_current_pending_upstream_run_log_7d`
+Append-only run log.
+
+One row per written snapshot.
+
+Useful for:
+- tracking row counts by hop
+- tracking distinct leaf counts
+- tracking terminal vs active paths
+- seeing stop reasons
+
+---
+
+## Views
+
+### `cdo.npd_current_pending_upstream_paths_current_7d_v`
+View that points to the **latest snapshot for the current run**.
+
+This is the main “current state” result.
+
+Use this when you want the final current upstream paths for the run.
+
+### `cdo.npd_current_pending_root_upstream_7d_raw_v`
+Direct upstream tables of the root in the 7-day window, including self-links if any existed in the edge stage.
+
+Use this for:
+- validating the root’s first-hop upstream count
+- comparing SQL output to the UI-style direct-upstream result
+
+### `cdo.npd_current_pending_root_upstream_7d_traversal_v`
+Same as the raw root upstream view, but excludes self-links.
+
+This is closer to what the traversal actually uses.
+
+### `cdo.npd_current_pending_upstream_objects_by_hop_7d_v`
+One row per object per hop in the current state.
+
+Use this for:
+- seeing which objects appear at each hop
+- seeing latest seen time into that object
+- seeing how many paths flow through that object
+
+### `cdo.npd_current_pending_upstream_hop_summary_7d_v`
+One row per hop summarizing the current state.
+
+Use this for:
+- counting distinct objects at each hop
+- counting path rows at each hop
+- seeing the object list for each hop
+
+### `cdo.npd_current_pending_upstream_edges_by_hop_7d_v`
+One row per edge per hop in the current state.
+
+Use this for:
+- tracing parent-child relationships
+- finding branching or fan-in points
+- seeing the latest time and event count for an edge
+
+### `cdo.npd_current_pending_upstream_path_summary_7d_v`
+One row per full current path.
+
+Use this for:
+- seeing the exact maximal paths
+- knowing the hop depth of each path
+- seeing which paths are terminal
+
+---
+
+## How the edge stage works
+
+The notebook first builds a 7-day edge table from raw lineage.
+
+For each distinct:
+
+- `source_table_full_name`
+- `source_type`
+- `target_table_full_name`
+- `target_type`
+
+it keeps:
+
+- `latest_seen_time`
+- `events_seen_7d`
+- creators seen on that edge
+- entity types seen on that edge
+
+This means the edge table is a **7-day graph summary**, not raw event-by-event lineage.
+
+That makes it smaller and more reusable than the raw lineage view.
+
+### Why this is helpful
+It reduces repeated work. Instead of repeatedly re-reading and re-grouping raw lineage for each hop, the notebook materializes the graph once and uses that graph for traversal.
+
+---
+
+## How the traversal works
+
+The traversal starts with one row:
+
+- path = `[root_table]`
+- hop count = `0`
+- leaf table = root table
+- terminal = `false`
+
+On each hop, the notebook:
+
+1. finds rows in the edge stage where:
+   - `target_table_full_name = current leaf_table`
+2. removes self-links from traversal
+3. avoids cycles by excluding any source already in the path
+4. grows the path by appending the new upstream source
+5. tracks:
+   - edge latest seen times
+   - edge event counts
+6. determines whether each path:
+   - can still grow
+   - or has become terminal
+
+Then it writes the whole current state as a new snapshot.
+
+---
+
+## What “terminal” means
+
+A path is terminal when the notebook could not find a valid upstream expansion for that path in the 7-day graph.
+
+That can happen for several reasons:
+
+- there is no upstream lineage for that leaf in the 7-day window
+- only self-links existed
+- all possible parents were already in the path and would cause a cycle
+- lineage exists outside the 7-day window, but not inside it
+
+So terminal does **not** always mean “this object has no upstream lineage anywhere.”
+It means:
+
+> this path cannot expand further using the rules and 7-day window of this notebook
+
+---
+
+## Important fields and what they mean
+
+## In the snapshots/current paths table
+
+### `snapshot_hop`
+The iteration number when the snapshot was written.
+
+This is **not** the same thing as the path depth of every row.
+It tells you:
+
+> which round of the algorithm this snapshot came from
+
+### `hop_count`
+The total depth of that specific path.
+
+If a path contains:
+- root only → `hop_count = 0`
+- root + one upstream table → `hop_count = 1`
+- root + two upstream tables → `hop_count = 2`
+
+### `path_tables`
+The full table path stored as an array.
+
+This is the main lineage chain for that row.
+
+### `path_id`
+A hash of the full path.
+
+Used to uniquely identify a path.
+
+### `leaf_table`
+The last table in the path.
+
+This is the table the notebook tries to expand in the next hop.
+
+### `edge_latest_seen_times`
+Array of edge timestamps aligned to the path steps.
+
+### `edge_events_seen_7d_arr`
+Array of event counts aligned to the path steps.
+
+### `is_terminal`
+Whether the path can no longer expand in this run.
+
+---
+
+## In objects-by-hop
+
+### `hop_count`
+The position of the object inside the path.
+
+This is derived by exploding the current full paths.
+
+### `latest_seen_time_to_child`
+The latest time that object contributed to the next downstream object in the path.
+
+### `paths_through_object`
+How many current paths include that object at that hop.
+
+A high value here usually means the object is a shared upstream hub.
+
+---
+
+## In edges-by-hop
+
+### `from_table`
+The upstream object at that hop.
+
+### `to_table`
+The downstream object that `from_table` fed.
+
+### `events_seen_7d`
+How many distinct lineage events this direct edge appeared in during the 7-day window.
+
+### `distinct_paths_through_edge`
+How many current paths include that edge.
+
+High values here often point to “hot” or highly reused edges.
+
+---
+
+## What insights this notebook gives you
+
+This notebook is good for answering:
+
+### 1. What are the root’s direct upstream tables in the last 7 days?
+Use:
+- `root_upstream_7d_raw_v`
+- `root_upstream_7d_traversal_v`
+
+### 2. What objects are at hop 1, hop 2, hop 3, etc.?
+Use:
+- `upstream_objects_by_hop_7d_v`
+- `upstream_hop_summary_7d_v`
+
+### 3. Which parent-child relationships are driving the graph?
+Use:
+- `upstream_edges_by_hop_7d_v`
+
+### 4. Which exact current paths survived to the latest snapshot?
+Use:
+- `upstream_path_summary_7d_v`
+
+### 5. Where did the run start growing fast?
+Use:
+- the snapshots table
+- the run log table
+
+### 6. Where does lineage stop?
+Use:
+- `is_terminal`
+- break analysis queries based on the current paths view and edge stage table
+
+---
+
+## How to use this notebook
+
+## Step 1: Run the whole notebook
+This will:
+
+- build the 7-day edge stage
+- build the 7-day object stage
+- initialize the working state
+- walk upstream hop by hop
+- append snapshots
+- write the run log
+- publish the current view
+- publish derived helper views
+
+## Step 2: Validate hop 1
+Look at the root upstream views first.
+
+You want to confirm that hop 1 matches what you expect for the root table in the 7-day window.
+
+## Step 3: Review hop summaries
+Use the hop summary view to see how many distinct objects and path rows you have per hop.
+
+## Step 4: Review objects and edges
+Use the objects-by-hop and edges-by-hop views to find:
+
+- the biggest branching points
+- the biggest shared hubs
+- the latest seen lineage into each object
+
+## Step 5: Review full paths
+Use the path summary to inspect exact maximal paths.
+
+---
+
+## Example workflow
+
+A normal workflow looks like this:
+
+### Check direct upstream of the root
+Look at:
+- `root_upstream_7d_raw_v`
+
+This tells you how many direct upstream tables the root had in the last 7 days.
+
+### Check hop growth
+Look at:
+- `upstream_hop_summary_7d_v`
+
+This tells you where path counts or object counts grew.
+
+### Find the explosion
+Look at:
+- `upstream_objects_by_hop_7d_v`
+- `upstream_edges_by_hop_7d_v`
+
+This tells you which object or edge is causing many paths to survive or branch.
+
+### Inspect exact paths
+Look at:
+- `upstream_path_summary_7d_v`
+
+This tells you the full path chain for each current path.
+
+---
+
+## How to interpret lower counts vs older notebook versions
+
+This notebook usually shows **lower counts** than earlier append-everything versions.
+
+That is expected because:
+
+- it keeps the working state narrow
+- it uses a de-duped edge graph
+- it keeps only the latest maximal paths in the current view
+- it does not keep every shorter prefix forever in the current state
+
+So if the counts are lower than older versions, that is often expected.
+
+What matters most is whether:
+
+- hop 1 still matches your direct upstream validation
+- the current paths still reflect the branches you care about
+
+---
+
+## Performance strategy used here
+
+This version was built to improve performance by:
+
+### 1. Materializing the 7-day graph once
+Instead of repeatedly querying raw lineage for every hop.
+
+### 2. Keeping the working state narrow
+Only key fields needed for recursion are stored in the working table.
+
+### 3. Breaking the plan every hop
+The notebook writes and rereads the working state table each hop.
+
+This avoids having one giant chained DataFrame plan grow indefinitely.
+
+### 4. Appending snapshots instead of overwriting one giant output table every hop
+This is usually much cheaper than rewriting the full current result table over and over.
+
+### 5. Using a current view
+The current view points to the latest snapshot for the run, so you still get a clean “current state” output.
+
+---
+
+## Limitations
+
+This notebook is intentionally scoped.
+
+### It is upstream only
+It does not build downstream lineage.
+
+### It is table-to-table only
+It does not try to reconstruct notebooks, jobs, dashboards, or masked workspace nodes from the UI.
+
+### It only uses the last 7 days
+Lineage outside the 7-day window is intentionally ignored.
+
+### It depends on what is visible in `information_schema.table_lineage`
+If lineage is missing or masked there, the notebook cannot magically recover it.
+
+### It is graph-based, not row-level provenance
+This notebook shows object-level lineage relationships, not row-level data ancestry.
+
+---
+
+## When to rerun or reset outputs
+
+Because this notebook writes persistent Delta tables, schema changes between notebook versions can cause conflicts.
+
+If you change the output schema, you may need to drop and recreate the output tables and views before rerunning.
+
+That is especially important when changing:
+
+- field types
+- field names
+- arrays stored in the state
+- snapshot columns
+
+---
+
+## Summary
+
+This notebook builds a persistent, queryable, 7-day upstream lineage model for a single root table.
+
+It does this by:
+
+1. building a reusable 7-day edge graph
+2. walking that graph upstream hop by hop
+3. saving a full snapshot after every hop
+4. publishing a current view and helper views for analysis
+
+It is best used when you want:
+
+- a stable, table-based lineage workflow
+- persistent results, not session-only objects
+- a path-aware upstream view that can be analyzed after the run
+- a way to inspect hop growth, branch points, and terminal paths in plain SQL
