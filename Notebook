@@ -1,632 +1,178 @@
-# Databricks notebook source
-# COMMAND ----------
+Here’s a clean “explosion dashboard” query pack.
 
-from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType,
-    StructField,
-    ArrayType,
-    StringType,
-    TimestampType,
-    LongType,
-    BooleanType,
-)
-from datetime import timedelta
+These four give you:
+	1.	the fastest-growing snapshot hop during the run,
+	2.	the biggest branching parent in the current state,
+	3.	the biggest fan-in child in the current state,
+	4.	the hottest edge in the current state.
 
-# ============================================================
-# 0. CONFIG + NAMES
-# ============================================================
-root_table_full_name = "eciscor_prod.npdataset.npd_current_pending"
+They are wired to your current table names.
 
-# Stage tables / views (persistent, not session-only)
-edge_stage_table = "cdo.npd_current_pending_lineage_edges_7d"
-object_stage_table = "cdo.npd_current_pending_lineage_objects_7d"
-working_state_table = "cdo.npd_current_pending_upstream_working_state_7d"
-paths_snapshots_table = "cdo.npd_current_pending_upstream_paths_snapshots_7d"
-run_log_table = "cdo.npd_current_pending_upstream_run_log_7d"
+1) Fastest-growing snapshot hop
 
-current_paths_view = "cdo.npd_current_pending_upstream_paths_current_7d_v"
-root_upstream_raw_view = "cdo.npd_current_pending_root_upstream_7d_raw_v"
-root_upstream_traversal_view = "cdo.npd_current_pending_root_upstream_7d_traversal_v"
-objects_by_hop_view = "cdo.npd_current_pending_upstream_objects_by_hop_7d_v"
-hop_summary_view = "cdo.npd_current_pending_upstream_hop_summary_7d_v"
-edges_by_hop_view = "cdo.npd_current_pending_upstream_edges_by_hop_7d_v"
-path_summary_view = "cdo.npd_current_pending_upstream_path_summary_7d_v"
-
-# Safety guards
-max_upstream_hops = 15
-max_upstream_rows_per_state = 250000
-max_upstream_total_rows_seen = 3000000
-
-# Stable 7-day window for the entire run
-window_end = spark.sql("SELECT current_timestamp() AS ts").first()["ts"]
-window_start = window_end - timedelta(days=7)
-window_start_str = window_start.strftime("%Y-%m-%d %H:%M:%S")
-window_end_str = window_end.strftime("%Y-%m-%d %H:%M:%S")
-
-# Run id
-run_id = spark.sql("SELECT uuid() AS run_id").first()["run_id"]
-
-# Databricks recommends auto shuffle partitions for high-shuffle workloads
-spark.conf.set("spark.sql.shuffle.partitions", "auto")
-
-print(f"Root table: {root_table_full_name}")
-print(f"Run id: {run_id}")
-print(f"Window start: {window_start_str}")
-print(f"Window end:   {window_end_str}")
-print(f"Edge stage table: {edge_stage_table}")
-print(f"Object stage table: {object_stage_table}")
-print(f"Working state table: {working_state_table}")
-print(f"Snapshots table: {paths_snapshots_table}")
-print(f"Run log table: {run_log_table}")
-print(f"Current view: {current_paths_view}")
-
-# COMMAND ----------
-
-# ============================================================
-# 1. STAGE 1: MATERIALIZE THE 7-DAY EDGE TABLE ONCE
-#
-# NOTE:
-# - You only have information_schema.table_lineage.
-# - If you later get system.access.table_lineage, prefer filtering
-#   on event_date first because event_date is the partition column.
-# ============================================================
-edges_7d_df = spark.sql(f"""
-SELECT
-  source_table_full_name,
-  source_type,
-  target_table_full_name,
-  target_type,
-  MAX(event_time) AS latest_seen_time,
-  COUNT(DISTINCT event_id) AS events_seen_7d,
-  COLLECT_SET(COALESCE(created_by, 'UNKNOWN')) AS creators,
-  COLLECT_SET(COALESCE(entity_type, 'UNKNOWN')) AS entity_types
-FROM information_schema.table_lineage
-WHERE source_table_full_name IS NOT NULL
-  AND target_table_full_name IS NOT NULL
-  AND event_time >= TIMESTAMP('{window_start_str}')
-  AND event_time <= TIMESTAMP('{window_end_str}')
-GROUP BY
-  source_table_full_name,
-  source_type,
-  target_table_full_name,
-  target_type
-""")
-
-(
-    edges_7d_df.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(edge_stage_table)
-)
-
-spark.sql(f"ANALYZE TABLE {edge_stage_table} COMPUTE STATISTICS")
-
-edges_7d = spark.read.table(edge_stage_table).cache()
-edge_count = edges_7d.count()
-
-print(f"Materialized 7-day edge rows: {edge_count:,}")
-
-# COMMAND ----------
-
-# ============================================================
-# 2. STAGE 1B: MATERIALIZE A SIMPLE OBJECT TYPE LOOKUP TABLE
-#
-# This lets us keep the working-state rows narrow and fill types later.
-# ============================================================
-object_rows_df = (
-    edges_7d
-    .select(
-        F.col("source_table_full_name").alias("table_full_name"),
-        F.col("source_type").alias("table_type"),
-        F.col("latest_seen_time").alias("seen_time"),
-    )
-    .unionByName(
-        edges_7d.select(
-            F.col("target_table_full_name").alias("table_full_name"),
-            F.col("target_type").alias("table_type"),
-            F.col("latest_seen_time").alias("seen_time"),
-        )
-    )
-)
-
-object_stage_df = (
-    object_rows_df
-    .groupBy("table_full_name")
-    .agg(
-        F.max_by("table_type", "seen_time").alias("table_type"),
-        F.max("seen_time").alias("latest_seen_time")
-    )
-)
-
-(
-    object_stage_df.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(object_stage_table)
-)
-
-spark.sql(f"ANALYZE TABLE {object_stage_table} COMPUTE STATISTICS")
-objects_7d = spark.read.table(object_stage_table).cache()
-
-print(f"Materialized 7-day object rows: {objects_7d.count():,}")
-
-# COMMAND ----------
-
-# ============================================================
-# 3. PERSISTENT ROOT-UPSTREAM VIEWS (for validation)
-# ============================================================
-spark.sql(f"""
-CREATE OR REPLACE VIEW {root_upstream_raw_view} AS
-SELECT
-  source_table_full_name,
-  source_type,
-  latest_seen_time,
-  events_seen_7d,
-  creators,
-  entity_types
-FROM {edge_stage_table}
-WHERE target_table_full_name = '{root_table_full_name}'
-ORDER BY latest_seen_time DESC, source_table_full_name
-""")
-
-spark.sql(f"""
-CREATE OR REPLACE VIEW {root_upstream_traversal_view} AS
-SELECT
-  source_table_full_name,
-  source_type,
-  latest_seen_time,
-  events_seen_7d,
-  creators,
-  entity_types
-FROM {edge_stage_table}
-WHERE target_table_full_name = '{root_table_full_name}'
-  AND source_table_full_name <> target_table_full_name
-ORDER BY latest_seen_time DESC, source_table_full_name
-""")
-
-print("Created persistent validation views for root upstream.")
-
-# COMMAND ----------
-
-# ============================================================
-# 4. INITIALIZE OUTPUT TABLES IF NEEDED
-# ============================================================
-working_schema = StructType([
-    StructField("path_tables", ArrayType(StringType()), True),
-    StructField("edge_latest_seen_times", ArrayType(TimestampType()), True),
-    StructField("edge_events_seen_7d_arr", ArrayType(LongType()), True),
-    StructField("is_terminal", BooleanType(), True),
-    StructField("hop_count", LongType(), True),
-    StructField("path_id", StringType(), True),
-    StructField("leaf_table", StringType(), True),
-])
-
-snapshot_schema = StructType([
-    StructField("run_id", StringType(), True),
-    StructField("root_table_full_name", StringType(), True),
-    StructField("window_start", TimestampType(), True),
-    StructField("window_end", TimestampType(), True),
-    StructField("snapshot_hop", LongType(), True),
-    StructField("hop_count", LongType(), True),
-    StructField("path_id", StringType(), True),
-    StructField("path_tables", ArrayType(StringType()), True),
-    StructField("edge_latest_seen_times", ArrayType(TimestampType()), True),
-    StructField("edge_events_seen_7d_arr", ArrayType(LongType()), True),
-    StructField("leaf_table", StringType(), True),
-    StructField("is_terminal", BooleanType(), True),
-    StructField("written_at", TimestampType(), True),
-])
-
-run_log_schema = StructType([
-    StructField("run_id", StringType(), True),
-    StructField("root_table_full_name", StringType(), True),
-    StructField("window_start", TimestampType(), True),
-    StructField("window_end", TimestampType(), True),
-    StructField("max_hop_in_state", LongType(), True),
-    StructField("state_rows", LongType(), True),
-    StructField("distinct_leaf_objects", LongType(), True),
-    StructField("terminal_paths", LongType(), True),
-    StructField("active_paths", LongType(), True),
-    StructField("stop_reason", StringType(), True),
-    StructField("written_at", TimestampType(), True),
-])
-
-if not spark.catalog.tableExists(working_state_table):
-    spark.createDataFrame([], working_schema).write.format("delta").mode("overwrite").saveAsTable(working_state_table)
-
-if not spark.catalog.tableExists(paths_snapshots_table):
-    spark.createDataFrame([], snapshot_schema).write.format("delta").mode("overwrite").saveAsTable(paths_snapshots_table)
-
-if not spark.catalog.tableExists(run_log_table):
-    spark.createDataFrame([], run_log_schema).write.format("delta").mode("overwrite").saveAsTable(run_log_table)
-
-# COMMAND ----------
-
-# ============================================================
-# 5. HELPERS
-# ============================================================
-def decorate_state(df):
-    """
-    Keep the working state narrow.
-    """
-    return (
-        df
-        .withColumn("hop_count", (F.size("path_tables") - F.lit(1)).cast("long"))
-        .withColumn("path_id", F.sha2(F.array_join(F.col("path_tables"), "||"), 256))
-        .withColumn("leaf_table", F.expr("element_at(path_tables, -1)"))
-        .select(
-            "path_tables",
-            "edge_latest_seen_times",
-            "edge_events_seen_7d_arr",
-            "is_terminal",
-            "hop_count",
-            "path_id",
-            "leaf_table",
-        )
-    )
-
-def seed_working_state():
-    seed = spark.range(1).select(
-        F.array(F.lit(root_table_full_name)).alias("path_tables"),
-        F.expr("array()").cast(ArrayType(TimestampType())).alias("edge_latest_seen_times"),
-        F.expr("array()").cast(ArrayType(LongType())).alias("edge_events_seen_7d_arr"),
-        F.lit(False).cast(BooleanType()).alias("is_terminal"),
-    )
-    state = decorate_state(seed)
-    (
-        state.write
-        .format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(working_state_table)
-    )
-
-def append_paths_snapshot(state_df, snapshot_hop):
-    out = (
-        state_df
-        .withColumn("run_id", F.lit(run_id).cast("string"))
-        .withColumn("root_table_full_name", F.lit(root_table_full_name).cast("string"))
-        .withColumn("window_start", F.lit(window_start).cast("timestamp"))
-        .withColumn("window_end", F.lit(window_end).cast("timestamp"))
-        .withColumn("snapshot_hop", F.lit(snapshot_hop).cast("long"))
-        .withColumn("written_at", F.current_timestamp())
-        .select(
-            "run_id",
-            "root_table_full_name",
-            "window_start",
-            "window_end",
-            "snapshot_hop",
-            "hop_count",
-            "path_id",
-            "path_tables",
-            "edge_latest_seen_times",
-            "edge_events_seen_7d_arr",
-            "leaf_table",
-            "is_terminal",
-            "written_at",
-        )
-    )
-
-    (
-        out.write
-        .format("delta")
-        .mode("append")
-        .saveAsTable(paths_snapshots_table)
-    )
-
-def refresh_current_view(snapshot_hop):
-    spark.sql(f"""
-    CREATE OR REPLACE VIEW {current_paths_view} AS
-    SELECT *
-    FROM {paths_snapshots_table}
-    WHERE run_id = '{run_id}'
-      AND snapshot_hop = {int(snapshot_hop)}
-    """)
-
-def append_run_log_row(
+WITH latest_run AS (
+  SELECT run_id
+  FROM cdo.npd_current_pending_upstream_run_log_7d
+  ORDER BY written_at DESC
+  LIMIT 1
+),
+base AS (
+  SELECT
+    max_hop_in_state AS snapshot_hop,
     state_rows,
     distinct_leaf_objects,
     terminal_paths,
     active_paths,
-    max_hop_in_state,
     stop_reason,
-):
-    log_df = (
-        spark.range(1)
-        .select(
-            F.lit(run_id).cast("string").alias("run_id"),
-            F.lit(root_table_full_name).cast("string").alias("root_table_full_name"),
-            F.lit(window_start).cast("timestamp").alias("window_start"),
-            F.lit(window_end).cast("timestamp").alias("window_end"),
-            F.lit(max_hop_in_state).cast("long").alias("max_hop_in_state"),
-            F.lit(state_rows).cast("long").alias("state_rows"),
-            F.lit(distinct_leaf_objects).cast("long").alias("distinct_leaf_objects"),
-            F.lit(terminal_paths).cast("long").alias("terminal_paths"),
-            F.lit(active_paths).cast("long").alias("active_paths"),
-            F.lit(stop_reason).cast("string").alias("stop_reason"),
-            F.current_timestamp().alias("written_at"),
-        )
-    )
-
-    (
-        log_df.write
-        .format("delta")
-        .mode("append")
-        .saveAsTable(run_log_table)
-    )
-
-# COMMAND ----------
-
-# ============================================================
-# 6. STAGE 2: ITERATIVE UPSTREAM EXPANSION
-#
-# IMPORTANT:
-# - Every hop reads working_state_table fresh, which truncates the plan.
-# - Every completed hop appends a snapshot + run log.
-# - current_paths_view always points at the latest snapshot for this run.
-# ============================================================
-seed_working_state()
-total_rows_seen = 0
-
-while True:
-    current_state = spark.read.table(working_state_table).cache()
-
-    metrics = (
-        current_state
-        .agg(
-            F.count("*").alias("state_rows"),
-            F.countDistinct("leaf_table").alias("distinct_leaf_objects"),
-            F.sum(F.when(F.col("is_terminal"), F.lit(1)).otherwise(F.lit(0))).alias("terminal_paths"),
-            F.max("hop_count").alias("max_hop_in_state"),
-        )
-        .first()
-    )
-
-    state_rows = int(metrics["state_rows"])
-    distinct_leaf_objects = int(metrics["distinct_leaf_objects"])
-    terminal_paths = int(metrics["terminal_paths"]) if metrics["terminal_paths"] is not None else 0
-    active_paths = state_rows - terminal_paths
-    max_hop_in_state = int(metrics["max_hop_in_state"]) if metrics["max_hop_in_state"] is not None else 0
-
-    total_rows_seen += state_rows
-
-    stop_reason = None
-    if active_paths == 0:
-        stop_reason = "NO_MORE_UPSTREAM"
-    elif max_hop_in_state >= max_upstream_hops:
-        stop_reason = f"MAX_HOPS_REACHED_AT_HOP_{max_hop_in_state}"
-    elif state_rows > max_upstream_rows_per_state:
-        stop_reason = f"MAX_ROWS_PER_STATE_EXCEEDED_AT_HOP_{max_hop_in_state}"
-    elif total_rows_seen > max_upstream_total_rows_seen:
-        stop_reason = f"MAX_TOTAL_ROWS_SEEN_EXCEEDED_AT_HOP_{max_hop_in_state}"
-
-    # Persist current state before any stop
-    append_paths_snapshot(current_state, max_hop_in_state)
-    refresh_current_view(max_hop_in_state)
-    append_run_log_row(
-        state_rows=state_rows,
-        distinct_leaf_objects=distinct_leaf_objects,
-        terminal_paths=terminal_paths,
-        active_paths=active_paths,
-        max_hop_in_state=max_hop_in_state,
-        stop_reason=stop_reason,
-    )
-
-    print(
-        f"WROTE SNAPSHOT | hop={max_hop_in_state} | "
-        f"rows={state_rows:,} | distinct_leaf_objects={distinct_leaf_objects:,} | "
-        f"terminal_paths={terminal_paths:,} | active_paths={active_paths:,} | "
-        f"stop_reason={stop_reason}"
-    )
-
-    if stop_reason is not None:
-        current_state.unpersist()
-        break
-
-    active = current_state.filter(~F.col("is_terminal")).cache()
-    terminal = current_state.filter(F.col("is_terminal")).cache()
-
-    # Expand only active paths against the materialized edge table
-    expanded = (
-        active.alias("cur")
-        .join(
-            edges_7d.alias("e"),
-            (F.col("cur.leaf_table") == F.col("e.target_table_full_name")) &
-            (F.col("e.source_table_full_name") != F.col("e.target_table_full_name")),
-            "inner"
-        )
-        .filter(~F.array_contains(F.col("cur.path_tables"), F.col("e.source_table_full_name")))
-        .select(
-            F.col("cur.path_id").alias("parent_path_id"),
-            F.array_append(F.col("cur.path_tables"), F.col("e.source_table_full_name")).alias("path_tables"),
-            F.concat(
-                F.col("cur.edge_latest_seen_times"),
-                F.array(F.col("e.latest_seen_time"))
-            ).alias("edge_latest_seen_times"),
-            F.concat(
-                F.col("cur.edge_events_seen_7d_arr"),
-                F.array(F.col("e.events_seen_7d").cast("long"))
-            ).alias("edge_events_seen_7d_arr"),
-            F.lit(False).cast(BooleanType()).alias("is_terminal"),
-        )
-        .cache()
-    )
-
-    parents_with_children = expanded.select("parent_path_id").distinct().cache()
-
-    newly_terminal = (
-        active.alias("a")
-        .join(
-            parents_with_children.alias("p"),
-            F.col("a.path_id") == F.col("p.parent_path_id"),
-            "left_anti"
-        )
-        .select(
-            "a.path_tables",
-            "a.edge_latest_seen_times",
-            "a.edge_events_seen_7d_arr",
-        )
-        .withColumn("is_terminal", F.lit(True).cast(BooleanType()))
-    )
-
-    children = (
-        decorate_state(
-            expanded.select(
-                "path_tables",
-                "edge_latest_seen_times",
-                "edge_events_seen_7d_arr",
-                "is_terminal",
-            )
-        )
-        .dropDuplicates(["path_id"])
-        .cache()
-    )
-
-    next_state = (
-        terminal
-        .unionByName(decorate_state(newly_terminal), allowMissingColumns=True)
-        .unionByName(children, allowMissingColumns=True)
-        .dropDuplicates(["path_id"])
-        .cache()
-    )
-
-    (
-        next_state.write
-        .format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(working_state_table)
-    )
-
-    current_state.unpersist()
-    active.unpersist()
-    terminal.unpersist()
-    expanded.unpersist()
-    parents_with_children.unpersist()
-    children.unpersist()
-    next_state.unpersist()
-
-# COMMAND ----------
-
-# ============================================================
-# 7. PERSISTENT DERIVED VIEWS
-# ============================================================
-spark.sql(f"""
-CREATE OR REPLACE VIEW {objects_by_hop_view} AS
-WITH exploded AS (
-  SELECT
-    path_id,
-    hop_pos AS hop_count,
-    table_name AS reached_table_full_name,
-    CASE
-      WHEN hop_pos = 0 THEN CAST(NULL AS TIMESTAMP)
-      ELSE element_at(edge_latest_seen_times, hop_pos)
-    END AS latest_seen_time_to_child,
-    CASE
-      WHEN hop_pos = 0 THEN CAST(NULL AS BIGINT)
-      ELSE element_at(edge_events_seen_7d_arr, hop_pos)
-    END AS events_seen_7d_on_edge_to_child
-  FROM {current_paths_view}
-  LATERAL VIEW posexplode(path_tables) p AS hop_pos, table_name
+    written_at,
+    LAG(state_rows) OVER (ORDER BY max_hop_in_state) AS prev_state_rows,
+    LAG(distinct_leaf_objects) OVER (ORDER BY max_hop_in_state) AS prev_leaf_objects
+  FROM cdo.npd_current_pending_upstream_run_log_7d
+  WHERE run_id = (SELECT run_id FROM latest_run)
 )
 SELECT
-  e.hop_count,
-  e.reached_table_full_name,
-  o.table_type AS reached_type,
-  MAX(e.latest_seen_time_to_child) AS latest_seen_time_to_child,
-  MAX(e.events_seen_7d_on_edge_to_child) AS max_events_seen_7d_on_edge_to_child,
-  COUNT(DISTINCT e.path_id) AS paths_through_object
-FROM exploded e
-LEFT JOIN {object_stage_table} o
-  ON e.reached_table_full_name = o.table_full_name
-GROUP BY
-  e.hop_count,
-  e.reached_table_full_name,
-  o.table_type
-""")
+  snapshot_hop,
+  state_rows,
+  distinct_leaf_objects,
+  terminal_paths,
+  active_paths,
+  state_rows - COALESCE(prev_state_rows, 0) AS delta_state_rows,
+  distinct_leaf_objects - COALESCE(prev_leaf_objects, 0) AS delta_leaf_objects,
+  CASE
+    WHEN prev_state_rows IS NULL OR prev_state_rows = 0 THEN NULL
+    ELSE ROUND(state_rows * 1.0 / prev_state_rows, 2)
+  END AS state_row_growth_x,
+  stop_reason,
+  written_at
+FROM base
+ORDER BY
+  delta_state_rows DESC,
+  state_row_growth_x DESC,
+  snapshot_hop;
 
-spark.sql(f"""
-CREATE OR REPLACE VIEW {hop_summary_view} AS
+2) Biggest branching parent
+
 SELECT
   hop_count,
-  COUNT(DISTINCT reached_table_full_name) AS distinct_objects_at_hop,
-  SUM(paths_through_object) AS path_rows_at_hop,
-  MAX(latest_seen_time_to_child) AS latest_seen_time_any_object_at_hop,
-  ARRAY_SORT(COLLECT_SET(reached_table_full_name)) AS objects_at_hop
-FROM {objects_by_hop_view}
-GROUP BY hop_count
-""")
+  from_table,
+  from_type,
+  COUNT(DISTINCT to_table) AS distinct_children,
+  SUM(distinct_paths_through_edge) AS total_paths_through_children,
+  MAX(events_seen_7d) AS max_events_seen_7d,
+  MAX(latest_seen_time) AS latest_seen_time
+FROM cdo.npd_current_pending_upstream_edges_by_hop_7d_v
+GROUP BY
+  hop_count,
+  from_table,
+  from_type
+ORDER BY
+  distinct_children DESC,
+  total_paths_through_children DESC,
+  latest_seen_time DESC,
+  from_table
+LIMIT 100;
 
-spark.sql(f"""
-CREATE OR REPLACE VIEW {edges_by_hop_view} AS
-WITH exploded_edges AS (
-  SELECT
-    path_id,
-    edge_pos + 1 AS hop_count,
-    element_at(path_tables, edge_pos + 2) AS from_table,
-    element_at(path_tables, edge_pos + 1) AS to_table,
-    latest_seen_time,
-    element_at(edge_events_seen_7d_arr, edge_pos + 1) AS events_seen_7d
-  FROM {current_paths_view}
-  LATERAL VIEW posexplode(edge_latest_seen_times) p AS edge_pos, latest_seen_time
+3) Biggest fan-in child
+
+SELECT
+  hop_count,
+  to_table,
+  to_type,
+  COUNT(DISTINCT from_table) AS distinct_parents,
+  SUM(distinct_paths_through_edge) AS total_paths_into_table,
+  MAX(events_seen_7d) AS max_events_seen_7d,
+  MAX(latest_seen_time) AS latest_seen_time
+FROM cdo.npd_current_pending_upstream_edges_by_hop_7d_v
+GROUP BY
+  hop_count,
+  to_table,
+  to_type
+ORDER BY
+  distinct_parents DESC,
+  total_paths_into_table DESC,
+  latest_seen_time DESC,
+  to_table
+LIMIT 100;
+
+4) Hottest edge
+
+SELECT
+  hop_count,
+  from_table,
+  from_type,
+  to_table,
+  to_type,
+  events_seen_7d,
+  latest_seen_time,
+  distinct_paths_through_edge
+FROM cdo.npd_current_pending_upstream_edges_by_hop_7d_v
+ORDER BY
+  events_seen_7d DESC,
+  distinct_paths_through_edge DESC,
+  latest_seen_time DESC,
+  hop_count,
+  from_table,
+  to_table
+LIMIT 100;
+
+Bonus: biggest exploding leaf at each snapshot hop
+
+This one is great when query 1 shows a bad hop and you want to know which leaf tables dominated that snapshot.
+
+WITH latest_run AS (
+  SELECT run_id
+  FROM cdo.npd_current_pending_upstream_run_log_7d
+  ORDER BY written_at DESC
+  LIMIT 1
 )
 SELECT
-  ee.hop_count,
-  ee.from_table,
-  ofrom.table_type AS from_type,
-  ee.to_table,
-  oto.table_type AS to_type,
-  MAX(ee.latest_seen_time) AS latest_seen_time,
-  MAX(ee.events_seen_7d) AS events_seen_7d,
-  ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(e.creators)))) AS creators,
-  ARRAY_SORT(ARRAY_DISTINCT(FLATTEN(COLLECT_LIST(e.entity_types)))) AS entity_types,
-  COUNT(DISTINCT ee.path_id) AS distinct_paths_through_edge
-FROM exploded_edges ee
-LEFT JOIN {edge_stage_table} e
-  ON ee.from_table = e.source_table_full_name
- AND ee.to_table = e.target_table_full_name
-LEFT JOIN {object_stage_table} ofrom
-  ON ee.from_table = ofrom.table_full_name
-LEFT JOIN {object_stage_table} oto
-  ON ee.to_table = oto.table_full_name
-GROUP BY
-  ee.hop_count,
-  ee.from_table,
-  ofrom.table_type,
-  ee.to_table,
-  oto.table_type
-""")
-
-spark.sql(f"""
-CREATE OR REPLACE VIEW {path_summary_view} AS
-SELECT
-  path_id,
-  hop_count AS max_hop_count,
-  CASE
-    WHEN size(edge_latest_seen_times) = 0 THEN CAST(NULL AS TIMESTAMP)
-    ELSE array_max(edge_latest_seen_times)
-  END AS latest_seen_time_on_path,
-  path_tables,
+  snapshot_hop,
   leaf_table,
-  is_terminal
-FROM {current_paths_view}
-""")
+  COUNT(*) AS path_rows_for_leaf
+FROM cdo.npd_current_pending_upstream_paths_snapshots_7d
+WHERE run_id = (SELECT run_id FROM latest_run)
+GROUP BY
+  snapshot_hop,
+  leaf_table
+ORDER BY
+  snapshot_hop,
+  path_rows_for_leaf DESC,
+  leaf_table;
 
-# COMMAND ----------
+Bonus: strongest surviving branch prefixes
 
-print("✅ Created persistent outputs:")
-print(f"  edge stage table:      {edge_stage_table}")
-print(f"  object stage table:    {object_stage_table}")
-print(f"  working state table:   {working_state_table}")
-print(f"  snapshots table:       {paths_snapshots_table}")
-print(f"  run log table:         {run_log_table}")
-print(f"  current view:          {current_paths_view}")
-print(f"  root upstream raw:     {root_upstream_raw_view}")
-print(f"  root upstream trav:    {root_upstream_traversal_view}")
-print(f"  objects by hop:        {objects_by_hop_view}")
-print(f"  hop summary:           {hop_summary_view}")
-print(f"  edges by hop:          {edges_by_hop_view}")
-print(f"  path summary:          {path_summary_view}")
+This helps find the early branches that lead to the most surviving paths.
+
+First 2 hops:
+
+SELECT
+  array_join(slice(path_tables, 1, 2), ' -> ') AS first_2_hops,
+  COUNT(*) AS surviving_paths,
+  COUNT(DISTINCT leaf_table) AS distinct_leaf_tables
+FROM cdo.npd_current_pending_upstream_paths_current_7d_v
+GROUP BY
+  array_join(slice(path_tables, 1, 2), ' -> ')
+ORDER BY
+  surviving_paths DESC,
+  distinct_leaf_tables DESC
+LIMIT 100;
+
+First 3 hops:
+
+SELECT
+  array_join(slice(path_tables, 1, 3), ' -> ') AS first_3_hops,
+  COUNT(*) AS surviving_paths,
+  COUNT(DISTINCT leaf_table) AS distinct_leaf_tables
+FROM cdo.npd_current_pending_upstream_paths_current_7d_v
+GROUP BY
+  array_join(slice(path_tables, 1, 3), ' -> ')
+ORDER BY
+  surviving_paths DESC,
+  distinct_leaf_tables DESC
+LIMIT 100;
+
+The fastest triage sequence is:
+	•	run 1 to find the bad snapshot hop,
+	•	run the bonus leaf query for that hop,
+	•	run 2 and 3 to identify the parent/child hubs,
+	•	run 4 to spot the specific hot edges.
