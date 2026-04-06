@@ -1,178 +1,303 @@
-Here’s a clean “explosion dashboard” query pack.
+Yes — and the first thing to separate is:
+	•	true breaks = is_terminal = true
+	•	not expanded yet = is_terminal = false
 
-These four give you:
-	1.	the fastest-growing snapshot hop during the run,
-	2.	the biggest branching parent in the current state,
-	3.	the biggest fan-in child in the current state,
-	4.	the hottest edge in the current state.
+If your run stopped because of a guard, some paths did not break; they just were not expanded yet.
 
-They are wired to your current table names.
+Use this query pack.
 
-1) Fastest-growing snapshot hop
-
-WITH latest_run AS (
-  SELECT run_id
-  FROM cdo.npd_current_pending_upstream_run_log_7d
-  ORDER BY written_at DESC
-  LIMIT 1
-),
-base AS (
-  SELECT
-    max_hop_in_state AS snapshot_hop,
-    state_rows,
-    distinct_leaf_objects,
-    terminal_paths,
-    active_paths,
-    stop_reason,
-    written_at,
-    LAG(state_rows) OVER (ORDER BY max_hop_in_state) AS prev_state_rows,
-    LAG(distinct_leaf_objects) OVER (ORDER BY max_hop_in_state) AS prev_leaf_objects
-  FROM cdo.npd_current_pending_upstream_run_log_7d
-  WHERE run_id = (SELECT run_id FROM latest_run)
-)
-SELECT
-  snapshot_hop,
-  state_rows,
-  distinct_leaf_objects,
-  terminal_paths,
-  active_paths,
-  state_rows - COALESCE(prev_state_rows, 0) AS delta_state_rows,
-  distinct_leaf_objects - COALESCE(prev_leaf_objects, 0) AS delta_leaf_objects,
-  CASE
-    WHEN prev_state_rows IS NULL OR prev_state_rows = 0 THEN NULL
-    ELSE ROUND(state_rows * 1.0 / prev_state_rows, 2)
-  END AS state_row_growth_x,
-  stop_reason,
-  written_at
-FROM base
-ORDER BY
-  delta_state_rows DESC,
-  state_row_growth_x DESC,
-  snapshot_hop;
-
-2) Biggest branching parent
+1) Did lineage actually break, or did the run just stop first?
 
 SELECT
-  hop_count,
-  from_table,
-  from_type,
-  COUNT(DISTINCT to_table) AS distinct_children,
-  SUM(distinct_paths_through_edge) AS total_paths_through_children,
-  MAX(events_seen_7d) AS max_events_seen_7d,
-  MAX(latest_seen_time) AS latest_seen_time
-FROM cdo.npd_current_pending_upstream_edges_by_hop_7d_v
-GROUP BY
-  hop_count,
-  from_table,
-  from_type
-ORDER BY
-  distinct_children DESC,
-  total_paths_through_children DESC,
-  latest_seen_time DESC,
-  from_table
-LIMIT 100;
+  is_terminal,
+  COUNT(*) AS path_rows,
+  COUNT(DISTINCT leaf_table) AS distinct_leaf_tables,
+  MIN(hop_count) AS min_hop,
+  MAX(hop_count) AS max_hop
+FROM cdo.npd_current_pending_upstream_paths_current_7d_v
+GROUP BY is_terminal
+ORDER BY is_terminal DESC;
 
-3) Biggest fan-in child
+How to read it:
+	•	is_terminal = true → true lineage breaks/endpoints in the 7-day graph
+	•	is_terminal = false → still-active paths that were left unfinished because the run stopped
+
+2) Where do true breaks happen by hop?
 
 SELECT
-  hop_count,
-  to_table,
-  to_type,
-  COUNT(DISTINCT from_table) AS distinct_parents,
-  SUM(distinct_paths_through_edge) AS total_paths_into_table,
-  MAX(events_seen_7d) AS max_events_seen_7d,
-  MAX(latest_seen_time) AS latest_seen_time
-FROM cdo.npd_current_pending_upstream_edges_by_hop_7d_v
-GROUP BY
-  hop_count,
-  to_table,
-  to_type
-ORDER BY
-  distinct_parents DESC,
-  total_paths_into_table DESC,
-  latest_seen_time DESC,
-  to_table
-LIMIT 100;
+  hop_count AS break_hop,
+  COUNT(*) AS terminal_path_rows,
+  COUNT(DISTINCT leaf_table) AS terminal_leaf_tables
+FROM cdo.npd_current_pending_upstream_paths_current_7d_v
+WHERE is_terminal = true
+GROUP BY hop_count
+ORDER BY break_hop;
 
-4) Hottest edge
+This shows which hop levels have the most breaks.
+
+3) What are the most common broken leaf tables?
 
 SELECT
-  hop_count,
-  from_table,
-  from_type,
-  to_table,
-  to_type,
-  events_seen_7d,
-  latest_seen_time,
-  distinct_paths_through_edge
-FROM cdo.npd_current_pending_upstream_edges_by_hop_7d_v
-ORDER BY
-  events_seen_7d DESC,
-  distinct_paths_through_edge DESC,
-  latest_seen_time DESC,
-  hop_count,
-  from_table,
-  to_table
-LIMIT 100;
-
-Bonus: biggest exploding leaf at each snapshot hop
-
-This one is great when query 1 shows a bad hop and you want to know which leaf tables dominated that snapshot.
-
-WITH latest_run AS (
-  SELECT run_id
-  FROM cdo.npd_current_pending_upstream_run_log_7d
-  ORDER BY written_at DESC
-  LIMIT 1
-)
-SELECT
-  snapshot_hop,
+  hop_count AS break_hop,
   leaf_table,
-  COUNT(*) AS path_rows_for_leaf
-FROM cdo.npd_current_pending_upstream_paths_snapshots_7d
-WHERE run_id = (SELECT run_id FROM latest_run)
+  COUNT(*) AS terminal_path_rows,
+  MAX(
+    CASE
+      WHEN size(edge_latest_seen_times) = 0 THEN CAST(NULL AS TIMESTAMP)
+      ELSE array_max(edge_latest_seen_times)
+    END
+  ) AS latest_seen_time_on_path
+FROM cdo.npd_current_pending_upstream_paths_current_7d_v
+WHERE is_terminal = true
 GROUP BY
-  snapshot_hop,
+  hop_count,
   leaf_table
 ORDER BY
-  snapshot_hop,
-  path_rows_for_leaf DESC,
-  leaf_table;
+  terminal_path_rows DESC,
+  break_hop,
+  leaf_table
+LIMIT 200;
 
-Bonus: strongest surviving branch prefixes
+This tells you which leaf tables are most often the endpoint of a broken path.
 
-This helps find the early branches that lead to the most surviving paths.
+4) Why did each path break?
 
-First 2 hops:
+This is the main diagnostic query.
+
+WITH terminal_paths AS (
+  SELECT
+    path_id,
+    hop_count AS break_hop,
+    leaf_table,
+    path_tables,
+    window_start,
+    window_end
+  FROM cdo.npd_current_pending_upstream_paths_current_7d_v
+  WHERE is_terminal = true
+),
+parents_7d AS (
+  SELECT
+    t.path_id,
+    COUNT(DISTINCT e.source_table_full_name) AS parents_in_7d
+  FROM terminal_paths t
+  LEFT JOIN cdo.npd_current_pending_lineage_edges_7d e
+    ON t.leaf_table = e.target_table_full_name
+   AND e.source_table_full_name <> e.target_table_full_name
+  GROUP BY t.path_id
+),
+eligible_new_parents_7d AS (
+  SELECT
+    t.path_id,
+    COUNT(DISTINCT e.source_table_full_name) AS eligible_new_parents_in_7d
+  FROM terminal_paths t
+  LEFT JOIN cdo.npd_current_pending_lineage_edges_7d e
+    ON t.leaf_table = e.target_table_full_name
+   AND e.source_table_full_name <> e.target_table_full_name
+   AND NOT array_contains(t.path_tables, e.source_table_full_name)
+  GROUP BY t.path_id
+),
+parents_before_window AS (
+  SELECT
+    t.path_id,
+    COUNT(DISTINCT l.source_table_full_name) AS parents_before_window
+  FROM terminal_paths t
+  LEFT JOIN information_schema.table_lineage l
+    ON t.leaf_table = l.target_table_full_name
+   AND l.source_table_full_name IS NOT NULL
+   AND l.target_table_full_name IS NOT NULL
+   AND l.source_table_full_name <> l.target_table_full_name
+   AND l.event_time < t.window_start
+  GROUP BY t.path_id
+),
+self_links_7d AS (
+  SELECT
+    t.path_id,
+    COUNT(*) AS self_links_7d
+  FROM terminal_paths t
+  LEFT JOIN cdo.npd_current_pending_lineage_edges_7d e
+    ON t.leaf_table = e.target_table_full_name
+   AND e.source_table_full_name = e.target_table_full_name
+  GROUP BY t.path_id
+),
+write_only_7d AS (
+  SELECT
+    t.path_id,
+    COUNT(DISTINCT l.event_id) AS write_only_events_7d
+  FROM terminal_paths t
+  LEFT JOIN information_schema.table_lineage l
+    ON t.leaf_table = l.target_table_full_name
+   AND l.source_table_full_name IS NULL
+   AND l.target_table_full_name IS NOT NULL
+   AND l.event_time >= t.window_start
+   AND l.event_time <= t.window_end
+  GROUP BY t.path_id
+)
+SELECT
+  t.break_hop,
+  t.leaf_table,
+  COALESCE(p.parents_in_7d, 0) AS parents_in_7d,
+  COALESCE(enp.eligible_new_parents_in_7d, 0) AS eligible_new_parents_in_7d,
+  COALESCE(pbw.parents_before_window, 0) AS parents_before_window,
+  COALESCE(sl.self_links_7d, 0) AS self_links_7d,
+  COALESCE(wo.write_only_events_7d, 0) AS write_only_events_7d,
+  CASE
+    WHEN COALESCE(enp.eligible_new_parents_in_7d, 0) > 0 THEN 'SHOULD_HAVE_EXPANDED_CHECK_LOGIC'
+    WHEN COALESCE(p.parents_in_7d, 0) > 0
+         AND COALESCE(enp.eligible_new_parents_in_7d, 0) = 0 THEN 'CYCLE_OR_ALREADY_VISITED'
+    WHEN COALESCE(sl.self_links_7d, 0) > 0
+         AND COALESCE(p.parents_in_7d, 0) = 0 THEN 'SELF_LINK_ONLY'
+    WHEN COALESCE(pbw.parents_before_window, 0) > 0 THEN 'UPSTREAM_OUTSIDE_7D_WINDOW'
+    WHEN COALESCE(wo.write_only_events_7d, 0) > 0 THEN 'WRITE_ONLY_OR_UNINFERRED_IN_7D'
+    ELSE 'NO_VISIBLE_UPSTREAM'
+  END AS break_reason,
+  t.path_id,
+  t.path_tables
+FROM terminal_paths t
+LEFT JOIN parents_7d p
+  ON t.path_id = p.path_id
+LEFT JOIN eligible_new_parents_7d enp
+  ON t.path_id = enp.path_id
+LEFT JOIN parents_before_window pbw
+  ON t.path_id = pbw.path_id
+LEFT JOIN self_links_7d sl
+  ON t.path_id = sl.path_id
+LEFT JOIN write_only_7d wo
+  ON t.path_id = wo.path_id
+ORDER BY
+  t.break_hop DESC,
+  break_reason,
+  t.leaf_table;
+
+How to read the break_reason values:
+	•	CYCLE_OR_ALREADY_VISITED → upstream exists in 7 days, but only through objects already on the path
+	•	SELF_LINK_ONLY → only self-links were found, and we exclude those from traversal
+	•	UPSTREAM_OUTSIDE_7D_WINDOW → lineage exists, but only before the 7-day cutoff
+	•	WRITE_ONLY_OR_UNINFERRED_IN_7D → target had write activity, but no usable source->target edge in the 7-day window
+	•	NO_VISIBLE_UPSTREAM → nothing visible in lineage for that leaf
+	•	SHOULD_HAVE_EXPANDED_CHECK_LOGIC → this should usually be zero; if not, there is probably a logic bug in the traversal
+
+5) Summarize break reasons
+
+WITH terminal_diagnostics AS (
+  WITH terminal_paths AS (
+    SELECT
+      path_id,
+      hop_count AS break_hop,
+      leaf_table,
+      path_tables,
+      window_start,
+      window_end
+    FROM cdo.npd_current_pending_upstream_paths_current_7d_v
+    WHERE is_terminal = true
+  ),
+  parents_7d AS (
+    SELECT
+      t.path_id,
+      COUNT(DISTINCT e.source_table_full_name) AS parents_in_7d
+    FROM terminal_paths t
+    LEFT JOIN cdo.npd_current_pending_lineage_edges_7d e
+      ON t.leaf_table = e.target_table_full_name
+     AND e.source_table_full_name <> e.target_table_full_name
+    GROUP BY t.path_id
+  ),
+  eligible_new_parents_7d AS (
+    SELECT
+      t.path_id,
+      COUNT(DISTINCT e.source_table_full_name) AS eligible_new_parents_in_7d
+    FROM terminal_paths t
+    LEFT JOIN cdo.npd_current_pending_lineage_edges_7d e
+      ON t.leaf_table = e.target_table_full_name
+     AND e.source_table_full_name <> e.target_table_full_name
+     AND NOT array_contains(t.path_tables, e.source_table_full_name)
+    GROUP BY t.path_id
+  ),
+  parents_before_window AS (
+    SELECT
+      t.path_id,
+      COUNT(DISTINCT l.source_table_full_name) AS parents_before_window
+    FROM terminal_paths t
+    LEFT JOIN information_schema.table_lineage l
+      ON t.leaf_table = l.target_table_full_name
+     AND l.source_table_full_name IS NOT NULL
+     AND l.target_table_full_name IS NOT NULL
+     AND l.source_table_full_name <> l.target_table_full_name
+     AND l.event_time < t.window_start
+    GROUP BY t.path_id
+  ),
+  self_links_7d AS (
+    SELECT
+      t.path_id,
+      COUNT(*) AS self_links_7d
+    FROM terminal_paths t
+    LEFT JOIN cdo.npd_current_pending_lineage_edges_7d e
+      ON t.leaf_table = e.target_table_full_name
+     AND e.source_table_full_name = e.target_table_full_name
+    GROUP BY t.path_id
+  ),
+  write_only_7d AS (
+    SELECT
+      t.path_id,
+      COUNT(DISTINCT l.event_id) AS write_only_events_7d
+    FROM terminal_paths t
+    LEFT JOIN information_schema.table_lineage l
+      ON t.leaf_table = l.target_table_full_name
+     AND l.source_table_full_name IS NULL
+     AND l.target_table_full_name IS NOT NULL
+     AND l.event_time >= t.window_start
+     AND l.event_time <= t.window_end
+    GROUP BY t.path_id
+  )
+  SELECT
+    t.break_hop,
+    CASE
+      WHEN COALESCE(enp.eligible_new_parents_in_7d, 0) > 0 THEN 'SHOULD_HAVE_EXPANDED_CHECK_LOGIC'
+      WHEN COALESCE(p.parents_in_7d, 0) > 0
+           AND COALESCE(enp.eligible_new_parents_in_7d, 0) = 0 THEN 'CYCLE_OR_ALREADY_VISITED'
+      WHEN COALESCE(sl.self_links_7d, 0) > 0
+           AND COALESCE(p.parents_in_7d, 0) = 0 THEN 'SELF_LINK_ONLY'
+      WHEN COALESCE(pbw.parents_before_window, 0) > 0 THEN 'UPSTREAM_OUTSIDE_7D_WINDOW'
+      WHEN COALESCE(wo.write_only_events_7d, 0) > 0 THEN 'WRITE_ONLY_OR_UNINFERRED_IN_7D'
+      ELSE 'NO_VISIBLE_UPSTREAM'
+    END AS break_reason
+  FROM terminal_paths t
+  LEFT JOIN parents_7d p
+    ON t.path_id = p.path_id
+  LEFT JOIN eligible_new_parents_7d enp
+    ON t.path_id = enp.path_id
+  LEFT JOIN parents_before_window pbw
+    ON t.path_id = pbw.path_id
+  LEFT JOIN self_links_7d sl
+    ON t.path_id = sl.path_id
+  LEFT JOIN write_only_7d wo
+    ON t.path_id = wo.path_id
+)
+SELECT
+  break_hop,
+  break_reason,
+  COUNT(*) AS terminal_paths
+FROM terminal_diagnostics
+GROUP BY
+  break_hop,
+  break_reason
+ORDER BY
+  break_hop,
+  terminal_paths DESC,
+  break_reason;
+
+6) Show unfinished paths too
+
+This is useful when a safety guard stopped the run.
 
 SELECT
-  array_join(slice(path_tables, 1, 2), ' -> ') AS first_2_hops,
-  COUNT(*) AS surviving_paths,
-  COUNT(DISTINCT leaf_table) AS distinct_leaf_tables
+  hop_count,
+  leaf_table,
+  path_id,
+  path_tables
 FROM cdo.npd_current_pending_upstream_paths_current_7d_v
-GROUP BY
-  array_join(slice(path_tables, 1, 2), ' -> ')
-ORDER BY
-  surviving_paths DESC,
-  distinct_leaf_tables DESC
-LIMIT 100;
+WHERE is_terminal = false
+ORDER BY hop_count DESC, leaf_table;
 
-First 3 hops:
-
-SELECT
-  array_join(slice(path_tables, 1, 3), ' -> ') AS first_3_hops,
-  COUNT(*) AS surviving_paths,
-  COUNT(DISTINCT leaf_table) AS distinct_leaf_tables
-FROM cdo.npd_current_pending_upstream_paths_current_7d_v
-GROUP BY
-  array_join(slice(path_tables, 1, 3), ' -> ')
-ORDER BY
-  surviving_paths DESC,
-  distinct_leaf_tables DESC
-LIMIT 100;
-
-The fastest triage sequence is:
-	•	run 1 to find the bad snapshot hop,
-	•	run the bonus leaf query for that hop,
-	•	run 2 and 3 to identify the parent/child hubs,
-	•	run 4 to spot the specific hot edges.
+If you want, I can also give you one query that highlights only the most suspicious breaks — for example:
+	•	SHOULD_HAVE_EXPANDED_CHECK_LOGIC
+	•	UPSTREAM_OUTSIDE_7D_WINDOW
+	•	WRITE_ONLY_OR_UNINFERRED_IN_7D
