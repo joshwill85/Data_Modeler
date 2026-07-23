@@ -1,1 +1,226 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # AI cost + best available identity
+# MAGIC Read-only test. No `system.ai_gateway` dependency and no permanent objects.
 
+# COMMAND ----------
+DAYS = 30
+
+result = spark.sql(f"""
+WITH billing AS (
+  SELECT
+    u.record_id,
+    u.workspace_id,
+    u.usage_date,
+    u.usage_start_time,
+    u.usage_end_time,
+    u.billing_origin_product,
+    u.sku_name,
+    u.usage_unit,
+    u.usage_quantity,
+    TRY_CAST(u.usage_quantity * p.pricing.effective_list.default AS DECIMAL(18,6)) AS list_cost,
+    p.currency_code,
+    u.usage_metadata.job_id AS job_id,
+    u.usage_metadata.job_run_id AS job_run_id,
+    u.usage_metadata.job_name AS billing_job_name,
+    u.usage_metadata.notebook_id AS notebook_id,
+    u.usage_metadata.notebook_path AS notebook_path,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    u.usage_metadata.cluster_id AS cluster_id,
+    u.usage_metadata.endpoint_id AS endpoint_id,
+    u.usage_metadata.endpoint_name AS endpoint_name,
+    u.product_features.ai_functions.ai_function AS ai_function,
+    u.product_features.ai_gateway.feature_type AS ai_gateway_feature,
+    u.product_features.model_serving.offering_type AS model_serving_offering,
+    u.custom_tags
+  FROM system.billing.usage u
+  LEFT JOIN system.billing.list_prices p
+    ON u.account_id = p.account_id
+   AND u.cloud = p.cloud
+   AND u.sku_name = p.sku_name
+   AND u.usage_unit = p.usage_unit
+   AND u.usage_end_time >= p.price_start_time
+   AND (p.price_end_time IS NULL OR u.usage_end_time < p.price_end_time)
+  WHERE u.usage_date >= DATE_SUB(CURRENT_DATE(), {DAYS})
+    AND u.billing_origin_product IN ('AI_GATEWAY', 'MODEL_SERVING', 'AI_FUNCTIONS')
+),
+jobs AS (
+  SELECT workspace_id, CAST(job_id AS STRING) AS job_id, name,
+         run_as_user_name, creator_user_name
+  FROM system.lakeflow.jobs
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, job_id ORDER BY change_time DESC
+  ) = 1
+),
+clusters AS (
+  SELECT workspace_id, cluster_id, cluster_name, owned_by
+  FROM system.compute.clusters
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC
+  ) = 1
+),
+warehouses AS (
+  SELECT workspace_id, warehouse_id, warehouse_name
+  FROM system.compute.warehouses
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC
+  ) = 1
+),
+served AS (
+  SELECT workspace_id, served_entity_id, endpoint_id, endpoint_name,
+         created_by, served_entity_name, entity_name
+  FROM system.serving.served_entities
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, served_entity_id ORDER BY change_time DESC
+  ) = 1
+),
+endpoint_dim AS (
+  SELECT workspace_id, endpoint_id,
+         COLLECT_SET(created_by) AS endpoint_created_by,
+         COLLECT_SET(COALESCE(entity_name, served_entity_name)) AS served_entities
+  FROM served
+  GROUP BY workspace_id, endpoint_id
+),
+queries AS (
+  SELECT
+    workspace_id,
+    statement_id,
+    start_time,
+    COALESCE(end_time, start_time) AS end_time,
+    executed_by,
+    executed_as,
+    CAST(compute.warehouse_id AS STRING) AS warehouse_id,
+    CAST(query_source.notebook_id AS STRING) AS notebook_id,
+    CAST(query_source.job_info.job_id AS STRING) AS job_id,
+    CAST(query_source.job_info.job_run_id AS STRING) AS job_run_id,
+    statement_text RLIKE '(?i)ai_[a-z0-9_]+\\s*\\(' AS looks_like_ai
+  FROM system.query.history
+  WHERE start_time >= CURRENT_TIMESTAMP() - INTERVAL {DAYS} DAYS
+),
+query_who AS (
+  SELECT
+    b.record_id,
+    COLLECT_SET(CASE WHEN
+      q.looks_like_ai OR
+      (b.job_run_id IS NOT NULL AND q.job_run_id = b.job_run_id) OR
+      (b.job_id IS NOT NULL AND q.job_id = b.job_id) OR
+      (b.notebook_id IS NOT NULL AND q.notebook_id = b.notebook_id)
+      THEN q.executed_by END) AS likely_query_users,
+    COLLECT_SET(CASE WHEN
+      q.looks_like_ai OR
+      (b.job_run_id IS NOT NULL AND q.job_run_id = b.job_run_id) OR
+      (b.job_id IS NOT NULL AND q.job_id = b.job_id) OR
+      (b.notebook_id IS NOT NULL AND q.notebook_id = b.notebook_id)
+      THEN q.executed_as END) AS likely_effective_principals,
+    COLLECT_SET(CASE WHEN q.looks_like_ai THEN q.statement_id END) AS ai_statement_ids,
+    COLLECT_SET(q.executed_by) AS users_in_matching_window,
+    COLLECT_SET(q.notebook_id) AS query_notebook_ids,
+    COLLECT_SET(q.job_id) AS query_job_ids
+  FROM billing b
+  JOIN queries q
+    ON b.workspace_id = q.workspace_id
+   AND q.start_time < b.usage_end_time
+   AND q.end_time >= b.usage_start_time
+   AND (
+        (b.job_run_id IS NOT NULL AND q.job_run_id = b.job_run_id) OR
+        (b.job_id IS NOT NULL AND q.job_id = b.job_id) OR
+        (b.notebook_id IS NOT NULL AND q.notebook_id = b.notebook_id) OR
+        (b.warehouse_id IS NOT NULL AND q.warehouse_id = b.warehouse_id)
+   )
+  GROUP BY b.record_id
+),
+endpoint_who AS (
+  SELECT
+    b.record_id,
+    COLLECT_SET(e.requester) AS endpoint_requesters,
+    COUNT(*) AS request_count,
+    SUM(COALESCE(e.input_token_count, 0) + COALESCE(e.output_token_count, 0)) AS tokens,
+    COLLECT_SET(TO_JSON(e.usage_context)) AS usage_contexts
+  FROM billing b
+  JOIN system.serving.endpoint_usage e
+    ON b.workspace_id = e.workspace_id
+   AND e.request_time >= b.usage_start_time
+   AND e.request_time < b.usage_end_time
+  JOIN served s
+    ON e.workspace_id = s.workspace_id
+   AND e.served_entity_id = s.served_entity_id
+   AND (
+        (b.endpoint_id IS NOT NULL AND b.endpoint_id = s.endpoint_id) OR
+        (b.endpoint_id IS NULL AND b.endpoint_name = s.endpoint_name)
+   )
+  GROUP BY b.record_id
+),
+enriched AS (
+  SELECT
+    b.*,
+    COALESCE(j.name, b.billing_job_name) AS job_name,
+    j.run_as_user_name AS job_run_as,
+    j.creator_user_name AS job_creator,
+    c.cluster_name,
+    c.owned_by AS cluster_owner,
+    w.warehouse_name,
+    d.endpoint_created_by,
+    d.served_entities,
+    q.likely_query_users,
+    q.likely_effective_principals,
+    q.ai_statement_ids,
+    q.users_in_matching_window,
+    q.query_notebook_ids,
+    q.query_job_ids,
+    e.endpoint_requesters,
+    e.request_count,
+    e.tokens,
+    e.usage_contexts
+  FROM billing b
+  LEFT JOIN jobs j
+    ON b.workspace_id = j.workspace_id AND b.job_id = j.job_id
+  LEFT JOIN clusters c
+    ON b.workspace_id = c.workspace_id AND b.cluster_id = c.cluster_id
+  LEFT JOIN warehouses w
+    ON b.workspace_id = w.workspace_id AND b.warehouse_id = w.warehouse_id
+  LEFT JOIN endpoint_dim d
+    ON b.workspace_id = d.workspace_id AND b.endpoint_id = d.endpoint_id
+  LEFT JOIN query_who q ON b.record_id = q.record_id
+  LEFT JOIN endpoint_who e ON b.record_id = e.record_id
+)
+SELECT
+  *,
+  ARRAY_DISTINCT(FILTER(CONCAT(
+    COALESCE(likely_query_users, CAST(array() AS ARRAY<STRING>)),
+    COALESCE(likely_effective_principals, CAST(array() AS ARRAY<STRING>)),
+    COALESCE(endpoint_requesters, CAST(array() AS ARRAY<STRING>)),
+    FILTER(ARRAY(job_run_as, job_creator, cluster_owner), x -> x IS NOT NULL),
+    COALESCE(endpoint_created_by, CAST(array() AS ARRAY<STRING>))
+  ), x -> x IS NOT NULL AND x <> '__REDACTED__')) AS who_candidates,
+  CASE
+    WHEN billing_origin_product IN ('MODEL_SERVING', 'AI_GATEWAY')
+         AND SIZE(COALESCE(endpoint_requesters, CAST(array() AS ARRAY<STRING>))) = 1
+      THEN ELEMENT_AT(endpoint_requesters, 1)
+    WHEN SIZE(COALESCE(likely_query_users, CAST(array() AS ARRAY<STRING>))) = 1
+      THEN ELEMENT_AT(likely_query_users, 1)
+    WHEN job_run_as IS NOT NULL THEN job_run_as
+    WHEN cluster_owner IS NOT NULL THEN cluster_owner
+    WHEN SIZE(COALESCE(users_in_matching_window, CAST(array() AS ARRAY<STRING>))) = 1
+      THEN ELEMENT_AT(users_in_matching_window, 1)
+    WHEN SIZE(COALESCE(endpoint_created_by, CAST(array() AS ARRAY<STRING>))) = 1
+      THEN ELEMENT_AT(endpoint_created_by, 1)
+  END AS best_who,
+  CASE
+    WHEN billing_origin_product IN ('MODEL_SERVING', 'AI_GATEWAY')
+         AND SIZE(COALESCE(endpoint_requesters, CAST(array() AS ARRAY<STRING>))) = 1
+      THEN 'ENDPOINT_REQUESTER'
+    WHEN SIZE(COALESCE(likely_query_users, CAST(array() AS ARRAY<STRING>))) = 1
+      THEN 'QUERY_EXECUTOR'
+    WHEN job_run_as IS NOT NULL THEN 'JOB_RUN_AS'
+    WHEN cluster_owner IS NOT NULL THEN 'CLUSTER_OWNER'
+    WHEN SIZE(COALESCE(users_in_matching_window, CAST(array() AS ARRAY<STRING>))) = 1
+      THEN 'SOLE_USER_IN_MATCHING_WINDOW'
+    WHEN SIZE(COALESCE(endpoint_created_by, CAST(array() AS ARRAY<STRING>))) = 1
+      THEN 'ENDPOINT_CREATOR'
+    ELSE 'MULTIPLE_OR_UNRESOLVED'
+  END AS best_who_source
+FROM enriched
+ORDER BY usage_start_time DESC, list_cost DESC
+""")
+
+display(result)
